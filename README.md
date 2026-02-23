@@ -88,13 +88,34 @@ seo-bot/
 │   ├── __init__.py       # Package initialization
 │   ├── config.py         # Agent configuration
 │   └── seo_agent.py      # Main SEOAgent class
+├── memory/               # Session memory (persistent context)
+│   ├── CLAUDE.md         # Site overview, keywords, gaps
+│   ├── seo-strategy.md    # Detailed strategy (evolves)
+│   └── seo-context.md    # Sprint state, tickets
 ├── Skills/               # SEO skills (symlinked to .claude/skills)
 ├── .claude/
+│   ├── CLAUDE.md -> ../memory/CLAUDE.md  # Symlink for auto-loading
 │   └── skills -> ../Skills  # Symlink for Skills
 ├── main.py               # CLI entry point
 ├── requirements.txt       # Dependencies
 └── README.md            # This file
 ```
+
+## Memory System
+
+The agent uses file-based memory for persistent context across sessions:
+
+1. **`memory/CLAUDE.md`** - Site overview, target keywords, content gaps, what NOT to do
+2. **`memory/seo-strategy.md`** - Detailed strategy that evolves over time
+3. **`memory/seo-context.md`** - Current sprint state: active tickets, completed work
+
+**Session workflow:**
+1. Agent reads `memory/CLAUDE.md` for SEO context
+2. Agent executes the task
+3. Agent updates `memory/seo-context.md` with what was done
+4. Next session continues from persisted state
+
+**To get started:** Fill out `memory/CLAUDE.md` with your site details.
 
 ## Available Skills
 

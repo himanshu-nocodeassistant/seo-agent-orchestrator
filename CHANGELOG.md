@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.0] - 2026-02-24
+
+### Added
+- Memory-based workflow for persistent context across sessions
+- `memory/CLAUDE.md` - Site overview, target keywords, content gaps template
+- `memory/seo-strategy.md` - Detailed strategy that evolves over time
+- `memory/seo-context.md` - Sprint state tracking (tickets, pending actions)
+- Symlinked `memory/CLAUDE.md` to `.claude/CLAUDE.md` for auto-loading
+- Auto-update of seo-context.md after each task
+
+### Features
+- Agent loads memory context at session start
+- Claude is instructed to update context file with tickets created
+- Last session info tracked for continuity
+
 ## [1.0.0] - 2026-02-24
 
 ### Added
