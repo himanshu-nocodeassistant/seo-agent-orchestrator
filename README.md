@@ -1,0 +1,168 @@
+# SEO Autonomous Agent
+
+An autonomous agent that performs SEO tasks using Claude Code via OAuth authentication.
+
+## Overview
+
+This project provides an autonomous SEO agent built with Python that leverages Claude Code's AI capabilities to perform various SEO-related tasks. The agent uses your Claude Pro subscription via OAuth - no API key required.
+
+## Features
+
+- **Claude OAuth** - Uses your Claude Pro subscription (no API key needed)
+- **9 SEO Skills** - Built-in skills for:
+  - SEO Audit
+  - Content Strategy
+  - Copywriting
+  - Copy Editing
+  - Brand Voice
+  - Competitor Alternatives
+  - Programmatic SEO
+  - Schema Markup
+  - Analytics Tracking
+
+## Requirements
+
+- Python 3.11+ (or Python 3.9+ with system Python)
+- Claude Code CLI installed
+- Claude Pro subscription (for OAuth)
+
+## Installation
+
+1. **Install Claude Code CLI** (if not already installed):
+   ```bash
+   npm install -g @anthropic-ai/claude-code
+   ```
+
+2. **Verify Claude Code works**:
+   ```bash
+   claude --help
+   ```
+
+3. **Run the agent**:
+   ```bash
+   python3.11 main.py "Your SEO task here"
+   ```
+
+   Or use the system Python:
+   ```bash
+   python3 main.py "Your SEO task here"
+   ```
+
+## Usage
+
+### Command Line Mode
+
+Run a single task:
+```bash
+python3.11 main.py "Perform an SEO audit on example.com"
+python3.11 main.py "What SEO skills are available?"
+python3.11 main.py "Create a content strategy for a tech blog"
+```
+
+### Interactive Mode
+
+Start an interactive session:
+```bash
+python3.11 main.py
+```
+
+Commands:
+- `exit` or `quit` - Exit the program
+- `interrupt` or `stop` - Stop the current task
+
+## Configuration
+
+Edit `agent/config.py` to customize:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `model` | `"sonnet"` | Claude model (default, sonnet, opus, haiku) |
+| `permission_mode` | `"acceptEdits"` | Permission mode for Claude |
+| `allowed_tools` | See config | Tools the agent can use |
+
+## Project Structure
+
+```
+seo-bot/
+├── agent/
+│   ├── __init__.py       # Package initialization
+│   ├── config.py         # Agent configuration
+│   └── seo_agent.py      # Main SEOAgent class
+├── Skills/               # SEO skills (symlinked to .claude/skills)
+├── .claude/
+│   └── skills -> ../Skills  # Symlink for Skills
+├── main.py               # CLI entry point
+├── requirements.txt       # Dependencies
+└── README.md            # This file
+```
+
+## Available Skills
+
+The agent has access to these SEO skills:
+
+1. **SEO Audit** - Audit a site's SEO health
+2. **Content Strategy** - Plan and structure content
+3. **Copywriting** - Write SEO-optimized copy
+4. **Copy Editing** - Edit and refine existing copy
+5. **Brand Voice** - Define and apply brand voice guidelines
+6. **Competitor Alternatives** - Analyze competitors and positioning
+7. **Programmatic SEO** - Scale SEO with programmatic approaches
+8. **Schema Markup** - Implement structured data
+9. **Analytics Tracking** - Set up and interpret analytics
+
+## API Usage Examples
+
+### Basic Task Execution
+
+```python
+import asyncio
+from agent import SEOAgent, AgentConfig
+
+async def main():
+    config = AgentConfig()
+    agent = SEOAgent(config)
+    
+    result = await agent.execute_task("Perform SEO audit on example.com")
+    print(result)
+
+asyncio.run(main())
+```
+
+### Interactive Session
+
+```python
+import asyncio
+from agent import SEOAgent, AgentConfig
+
+async def main():
+    config = AgentConfig()
+    
+    async with SEOAgent(config) as agent:
+        while True:
+            user_input = input("You: ")
+            if user_input.lower() in ["exit", "quit"]:
+                break
+            
+            response = await agent.chat(user_input)
+            print(f"Claude: {response}")
+
+asyncio.run(main())
+```
+
+## Troubleshooting
+
+### Claude CLI not found
+If you see "Claude CLI not found", install Claude Code:
+```bash
+npm install -g @anthropic-ai/claude-code
+```
+
+### Permission errors
+Ensure Claude Code has the necessary permissions in your Claude settings.
+
+### Rate limiting
+If you encounter rate limits, wait a moment and try again.
+
+## License
+
+MIT

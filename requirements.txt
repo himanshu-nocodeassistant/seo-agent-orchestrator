@@ -1,0 +1,2 @@
+# SEO Autonomous Agent Dependencies
+# No external dependencies needed - uses Claude Code CLI via subprocess
