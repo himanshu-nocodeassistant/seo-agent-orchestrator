@@ -14,6 +14,21 @@ This project contains an autonomous SEO agent built with Python using Claude Cod
 - `agent/config.py` - Configuration dataclass
 - `main.py` - CLI entry point
 - `Skills/` - 9 SEO skills (symlinked to `.claude/skills`)
+- `memory/` - Session memory (CLAUDE.md, seo-strategy.md, seo-context.md)
+
+## Memory System
+
+The agent uses file-based memory for persistent context:
+
+- **`memory/CLAUDE.md`** - Site overview, target keywords, content gaps, what NOT to do. Loaded at session start.
+- **`memory/seo-strategy.md`** - Detailed strategy that evolves over time.
+- **`memory/seo-context.md`** - Current sprint state: active tickets, completed work, pending actions.
+
+**Session workflow:**
+1. Agent reads `memory/CLAUDE.md` for SEO context
+2. Agent executes task
+3. Agent updates `memory/seo-context.md` with what was done
+4. Next session continues from persisted state
 
 ## Documentation Rules
 

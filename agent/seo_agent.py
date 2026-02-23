@@ -4,11 +4,16 @@ SEO Autonomous Agent using Claude Code CLI via subprocess.
 This module provides the SEOAgent class that wraps Claude Code CLI
 for performing autonomous SEO tasks. Uses OAuth authentication
 via Claude Code (no API key required).
+
+Memory System:
+- Reads memory/CLAUDE.md at session start for SEO context
+- Updates memory/seo-context.md after each task
 """
 
 import asyncio
 import json
 import subprocess
+from datetime import datetime
 from typing import AsyncIterator, Optional
 import logging
 from pathlib import Path
@@ -17,6 +22,12 @@ from .config import AgentConfig
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Memory file paths (relative to project root)
+MEMORY_DIR = "memory"
+MEMORY_CLAUDE = "memory/CLAUDE.md"
+MEMORY_STRATEGY = "memory/seo-strategy.md"
+MEMORY_CONTEXT = "memory/seo-context.md"
 
 
 class SEOAgent:
@@ -30,7 +41,101 @@ class SEOAgent:
         """Initialize the SEO Agent with configuration."""
         self.config = config or AgentConfig()
         self.session_id: Optional[str] = None
+        self.memory_context: dict = {}
         
+    def _get_memory_path(self, filename: str) -> Path:
+        """Get absolute path to a memory file."""
+        return Path(self.config.cwd) / filename
+    
+    def load_memory_context(self) -> str:
+        """
+        Load SEO context from memory files at session start.
+        
+        Returns:
+            Combined context string to prepend to prompts
+        """
+        context_parts = []
+        
+        # Load main memory file
+        memory_file = self._get_memory_path(MEMORY_CLAUDE)
+        if memory_file.exists():
+            try:
+                content = memory_file.read_text()
+                context_parts.append(f"## SEO Context\n{content}")
+                logger.info(f"Loaded memory context from {MEMORY_CLAUDE}")
+            except Exception as e:
+                logger.warning(f"Failed to load {MEMORY_CLAUDE}: {e}")
+        
+        # Load current sprint state
+        context_file = self._get_memory_path(MEMORY_CONTEXT)
+        if context_file.exists():
+            try:
+                content = context_file.read_text()
+                context_parts.append(f"## Current Sprint State\n{content}")
+                logger.info(f"Loaded sprint context from {MEMORY_CONTEXT}")
+            except Exception as e:
+                logger.warning(f"Failed to load {MEMORY_CONTEXT}: {e}")
+        
+        if context_parts:
+            return "\n\n".join(context_parts) + "\n\n"
+        return ""
+    
+    def update_context_after_task(self, task: str, result: str) -> None:
+        """
+        Update seo-context.md after completing a task.
+        
+        Args:
+            task: The task that was executed
+            result: Summary of what was done
+        """
+        context_file = self._get_memory_path(MEMORY_CONTEXT)
+        
+        try:
+            if context_file.exists():
+                content = context_file.read_text()
+            else:
+                content = "# SEO Context - Sprint State\n\nNo context file found."
+            
+            # Find the "Last Session" section and update it
+            today = datetime.now().strftime("%Y-%m-%d")
+            
+            # Truncate task and result
+            task_summary = task[:80].replace('\n', ' ')
+            result_summary = result[:150].replace('\n', ' ')
+            
+            new_entry = f"""## Last Session
+- **Date:** {today}
+- **Task:** {task_summary}
+- **Outcome:** {result_summary}
+"""
+            
+            # Remove any existing "## Last Session" section and everything after "---"
+            # Keep everything before the session workflow section
+            if "## Session Workflow" in content:
+                content = content.split("## Session Workflow")[0]
+            
+            # Append new entry and footer
+            footer = """
+
+---
+
+## Session Workflow
+
+After each task, update this file with:
+1. New tickets created
+2. Completed tickets
+3. What was done in the session
+4. Any pending follow-ups
+"""
+            
+            content = content.rstrip() + "\n\n" + new_entry + footer
+            
+            context_file.write_text(content)
+            logger.info(f"Updated {MEMORY_CONTEXT} after task completion")
+            
+        except Exception as e:
+            logger.warning(f"Failed to update {MEMORY_CONTEXT}: {e}")
+    
     def _run_claude(self, prompt: str, extra_args: list = None) -> str:
         """Run Claude CLI with the given prompt."""
         cmd = [
@@ -69,14 +174,42 @@ class SEOAgent:
         Returns:
             The result from Claude
         """
+        # Load memory context at session start
+        memory_context = self.load_memory_context()
+        
+        # Build prompt with memory context
+        if memory_context:
+            full_prompt = f"""{memory_context}
+
+## Task
+
+{prompt}
+
+## Important: Update Context After Task
+
+After completing this task, you MUST update the file `memory/seo-context.md` to reflect:
+1. What was accomplished
+2. Any new tickets created
+3. Any pending follow-up actions
+
+Use the Edit tool to update memory/seo-context.md before ending your response.
+"""
+        else:
+            full_prompt = prompt
+        
         # Run synchronously in a thread to not block
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             None, 
             self._run_claude, 
-            prompt,
+            full_prompt,
             ["--add-dir", self.config.cwd]
         )
+        
+        # Update context after task completion
+        if result and not result.startswith("Error:"):
+            self.update_context_after_task(prompt, result)
+        
         return result
     
     async def chat(self, message: str) -> str:
