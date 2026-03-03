@@ -21,6 +21,7 @@ This project contains an autonomous SEO agent built with Python using Claude Age
 
 - **Python**: 3.11+
 - **SDK**: claude-agent-sdk>=0.1.44
+- **HTTP Client**: aiohttp>=3.9.0 (for Webflow API)
 - **Testing**: pytest>=9.0.0, pytest-asyncio>=1.3.0
 
 ## Memory System
@@ -90,6 +91,66 @@ Edit `agent/config.py` to customize:
 - `permission_mode`: Permission mode (acceptEdits, etc.)
 - `allowed_tools`: Tools the agent can use (Read, Write, Edit, Bash, Glob, Grep, Skill)
 - `setting_sources`: Sources for settings (user, project)
+
+## Webflow CMS Integration
+
+The agent can manage Webflow CMS collections (create, edit, publish posts). Uses Webflow Data API v2.
+
+### Environment Variables
+```bash
+WEBFLOW_ACCESS_TOKEN=your_api_token
+WEBFLOW_SITE_ID=your_site_id
+WEBFLOW_COLLECTION_ID=your_collection_id
+```
+
+### Programmatic Configuration
+```python
+from agent import AgentConfig, WebflowConfig
+
+config = AgentConfig(
+    webflow_config=WebflowConfig(
+        access_token="your_token",
+        site_id="your_site_id", 
+        collection_id="your_collection_id"
+    )
+)
+```
+
+### API Details
+- **Base URL**: `https://api.webflow.com/v2`
+- **Pagination**: Uses limit/offset (max 100 items per request)
+- **Live Items**: Uses `/items/live` endpoint to fetch published items
+
+### Available Webflow Tools
+- `list_cms_items` - List items in collection (supports limit/offset pagination)
+- `get_cms_item` - Get single item by ID
+- `create_cms_item` - Create new post (name, slug, content)
+- `update_cms_item` - Update existing post
+- `publish_cms_item` - Publish to live site
+- `get_collection_info` - Get collection schema
+
+### Module Structure
+```
+agent/webflow/
+├── __init__.py    # Exports
+├── config.py      # WebflowConfig dataclass
+├── client.py     # WebflowAPIClient (raw API)
+├── tools.py      # @tool decorated functions
+└── server.py     # MCP server factory
+```
+
+### Pagination Example
+To get more than 100 items, loop with incremental offsets:
+```python
+offset = 0
+while True:
+    result = await client.list_items(limit=100, offset=offset)
+    items = result.get('items', [])
+    if not items:
+        break
+    # process items
+    offset += 100
+```
 
 ## Testing
 

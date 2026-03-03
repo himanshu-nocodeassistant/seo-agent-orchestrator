@@ -1,18 +1,45 @@
-# PLAN.md - SDK Integration for SEO Agent
+# PLAN.md - Webflow API Integration for SEO Agent
 
 ## Problem Statement
 
-The current implementation uses `subprocess.run()` to call Claude CLI directly, which causes the error:
-> "Execution failed: ProcessTransport is not ready for writing"
-
-This error occurs because the Claude Agent SDK is not being used correctly.
+The SEO Agent needs to integrate with Webflow CMS to manage collection items (create, edit posts, titles, descriptions, etc.). The user wants:
+- Direct API integration using Python
+- Modular architecture for easy management
+- Red/Green TDD approach
+- Clean, readable codebase
 
 ## Solution
 
-Rewrite `agent/seo_agent.py` to properly use the Claude Agent SDK:
-- Use `query()` function for single task execution (`create_and_run`)
-- Use `ClaudeSDKClient` for interactive mode (`chat()` method)
-- Preserve existing memory/context functionality
+Create a modular Python integration using Webflow's Data API v2.0, exposing operations as Claude Agent SDK custom tools.
+
+---
+
+## CMS Operations Required
+
+| Operation | Description |
+|-----------|-------------|
+| **List Items** | Fetch all posts/items in a collection |
+| **Get Item** | Get single item details by ID |
+| **Create Item** | Create new post with title, slug, content, etc. |
+| **Update Item** | Edit existing post fields |
+| **Publish Item** | Publish item to live site |
+
+---
+
+## Modular Architecture
+
+```
+agent/
+├── __init__.py           # Export WebflowClient, WebflowTools
+├── config.py              # AgentConfig (add Webflow config)
+├── seo_agent.py          # Main agent (integrate Webflow tools)
+├── webflow/
+│   ├── __init__.py       # Export all components
+│   ├── client.py         # WebflowAPIClient - raw API calls
+│   ├── tools.py          # @tool decorators for SDK tools
+│   ├── server.py         # create_sdk_mcp_server setup
+│   └── config.py         # WebflowConfig dataclass
+```
 
 ---
 
@@ -20,121 +47,101 @@ Rewrite `agent/seo_agent.py` to properly use the Claude Agent SDK:
 
 ### Phase 1: RED (Write Failing Tests First)
 
-#### Test 1: SDK Import Test
-- [ ] **Test**: Verify `claude_agent_sdk` can be imported
-- [ ] **Expected**: Import succeeds without errors
+#### Test 1: Webflow API Client
+- [ ] **Test**: Can import and instantiate WebflowAPIClient
+- [ ] **Expected**: Client initialized with token, site_id, collection_id
 
-#### Test 2: Single Task Execution (`create_and_run`)
-- [ ] **Test**: Run `python main.py "Hello, what is 2+2?"`
-- [ ] **Expected**: 
-  - [ ] ✅ Returns a valid response
-  - [ ] ✅ No "ProcessTransport" error
-  - [ ] ✅ Context is loaded from memory files
+#### Test 2: List Collection Items
+- [ ] **Test**: Call `list_items()` with valid credentials
+- [ ] **Expected**: Returns list of items from collection
 
-#### Test 3: Interactive Mode
-- [ ] **Test**: Run `python main.py` and send "Hello"
-- [ ] **Expected**:
-  - [ ] ✅ Agent responds without error
-  - [ ] ✅ Conversation continues properly
+#### Test 3: Create Item
+- [ ] **Test**: Call `create_item()` with title, slug, content
+- [ ] **Expected**: New item created in collection
+
+#### Test 4: Update Item  
+- [ ] **Test**: Call `update_item()` with item_id and fields
+- [ ] **Expected**: Item updated with new values
+
+#### Test 5: Publish Item
+- [ ] **Test**: Call `publish_item()` with item_id
+- [ ] **Expected**: Item published to live site
+
+#### Test 6: Custom Tool Integration
+- [ ] **Test**: Webflow tools registered with SDK
+- [ ] **Expected**: Tools accessible as `mcp__webflow__*`
 
 ---
 
 ### Phase 2: GREEN (Implement Solution)
 
-#### Step 1: Update imports in `agent/seo_agent.py`
-- [ ] Import `query`, `ClaudeSDKClient`, `ClaudeAgentOptions` from `claude_agent_sdk`
-- [ ] Import message types: `AssistantMessage`, `TextBlock`, `ResultMessage`
+#### Step 1: Create Webflow Config
+- [ ] Create `agent/webflow/config.py` with WebflowConfig dataclass
+- [ ] Fields: access_token, site_id, collection_id, base_url
 
-#### Step 2: Rewrite `execute_task()` method
-- [ ] Replace subprocess call with `query()` function
-- [ ] Map `AgentConfig` fields to `ClaudeAgentOptions`
-- [ ] Handle streaming messages properly
+#### Step 2: Create API Client
+- [ ] Create `agent/webflow/client.py` with WebflowAPIClient class
+- [ ] Methods: list_items, get_item, create_item, update_item, publish_item
+- [ ] Use aiohttp for async HTTP requests
 
-#### Step 3: Rewrite `chat()` method for interactive mode
-- [ ] Implement `ClaudeSDKClient` context manager
-- [ ] Use `client.query()` to send messages
-- [ ] Use `client.receive_response()` to get responses
+#### Step 3: Create SDK Tools
+- [ ] Create `agent/webflow/tools.py` with @tool decorators
+- [ ] Tools: list_cms_items, get_cms_item, create_cms_item, update_cms_item, publish_cms_item
 
-#### Step 4: Update `agent/config.py` if needed
-- [ ] Ensure all required SDK options are supported
-- [ ] Add any missing field mappings
+#### Step 4: Create MCP Server
+- [ ] Create `agent/webflow/server.py` with create_webflow_server()
+- [ ] Register all tools with create_sdk_mcp_server
 
-#### Step 5: Preserve Memory System
-- [ ] Keep `load_memory_context()` functionality
-- [ ] Keep `update_context_after_task()` functionality
-- [ ] Verify memory files are read/written correctly
+#### Step 5: Integrate with Agent
+- [ ] Update `agent/__init__.py` to export Webflow components
+- [ ] Update `agent/config.py` to include Webflow settings
+- [ ] Update `agent/seo_agent.py` to accept and use Webflow MCP server
+
+#### Step 6: Update main.py
+- [ ] Pass Webflow configuration to AgentConfig
 
 ---
 
 ### Phase 3: REFACTOR (After Tests Pass)
 
-- [ ] Clean up any unused code
-- [ ] Add proper error handling
+- [ ] Add error handling for API failures
 - [ ] Add logging for debugging
-- [ ] Document any API changes
+- [ ] Validate environment variables
+- [ ] Document usage instructions
 
 ---
 
-## Implementation Notes
+## API Reference
 
-### Key Code Changes
+Based on [Webflow Data API v2.0](https://developers.webflow.com/data/v2.0.0/reference):
 
-**Before (broken):**
-```python
-def _run_claude(self, prompt: str, extra_args: list = None) -> str:
-    cmd = [self.config.cli_path, "--print", "--verbose", ...]
-    result = subprocess.run(cmd, ...)
+### Endpoints
+
+```
+Base URL: https://api.webflow.com
+
+GET    /collections/{collection_id}/items         - List items
+GET    /collections/{collection_id}/items/{id}   - Get item
+POST   /collections/{collection_id}/items         - Create item
+PATCH  /collections/{collection_id}/items         - Update item
+POST   /collections/{collection_id}/items/publish - Publish item
 ```
 
-**After (fixed):**
-```python
-from claude_agent_sdk import query, ClaudeAgentOptions, ClaudeSDKClient
-from claude_agent_sdk.types import AssistantMessage, TextBlock, ResultMessage
-
-async def execute_task(self, prompt: str) -> str:
-    options = ClaudeAgentOptions(
-        cwd=self.config.cwd,
-        permission_mode=self.config.permission_mode,
-        allowed_tools=self.config.allowed_tools,
-        setting_sources=self.config.setting_sources,
-        model=self.config.model,
-    )
-    
-    full_prompt = self._build_prompt_with_context(prompt)
-    
-    result_text = ""
-    async for message in query(prompt=full_prompt, options=options):
-        if isinstance(message, AssistantMessage):
-            for block in message.content:
-                if isinstance(block, TextBlock):
-                    result_text += block.text
-        elif isinstance(message, ResultMessage):
-            if message.result:
-                result_text += message.result
-    
-    return result_text
+### Headers
 ```
-
----
-
-## Verification Commands
-
-```bash
-# Test 1: Single task
-python main.py "What is 1+1?"
-
-# Test 2: Interactive mode
-# (run without arguments, then type "Hello")
-python main.py
+Authorization: Bearer {access_token}
+Content-Type: application/json
 ```
 
 ---
 
 ## Success Criteria
 
-1. ✅ No "ProcessTransport is not ready for writing" error
-2. ✅ Single task execution works: `python main.py "task"`
-3. ✅ Interactive mode works: `python main.py` + chat
-4. ✅ Memory context is loaded before tasks
-5. ✅ Memory context is updated after tasks
-6. ✅ All existing functionality preserved
+1. ✅ Webflow client can authenticate with API token
+2. ✅ List items returns collection items
+3. ✅ Create item adds new post to collection
+4. ✅ Update item modifies existing post
+5. ✅ Publish item pushes to live site
+6. ✅ Custom tools exposed via Claude Agent SDK
+7. ✅ Modular, readable codebase
+8. ✅ Tests pass for all operations

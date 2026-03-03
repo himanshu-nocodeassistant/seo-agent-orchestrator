@@ -25,10 +25,10 @@ async def main():
     print("\nUsing Claude Code OAuth (no API key required)")
     print()
     
-    # Create agent configuration
-    config = AgentConfig(
-        cwd="/Users/himanshusharma/Code/Codex/seo-bot",
-    )
+    # Create agent configuration (auto-detects Webflow from env vars)
+    config = AgentConfig.from_env()
+    # Ensure working directory is set
+    config.cwd = "/Users/himanshusharma/Code/Codex/seo-bot"
     
     # Check for command line arguments
     if len(sys.argv) > 1:

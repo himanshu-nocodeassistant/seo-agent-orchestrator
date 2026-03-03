@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.1] - 2026-03-03
+
+### Fixed
+- Webflow API integration now uses v2 API (`https://api.webflow.com/v2`)
+- Changed `list_items` endpoint from `/items` to `/items/live` to fetch published items
+- Updated CLAUDE.md with Webflow pagination docs and API details
+
+### Changed
+- Base URL in `agent/webflow/config.py` updated to v2
+
 ## [1.2.0] - 2026-03-03
 
 ### Changed

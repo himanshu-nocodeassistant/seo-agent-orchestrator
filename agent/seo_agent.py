@@ -172,6 +172,7 @@ Use the Edit tool to update memory/seo-context.md before ending your response.
             model=self.config.model,
             max_turns=self.config.max_turns,
             max_budget_usd=self.config.max_budget_usd,
+            mcp_servers=self.config.mcp_servers,
         )
     
     async def execute_task(self, prompt: str) -> str:
