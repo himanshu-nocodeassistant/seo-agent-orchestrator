@@ -1,10 +1,10 @@
 # SEO Bot - Autonomous Agent Project
 
-This project contains an autonomous SEO agent built with Python using Claude Agent SDK.
+This project contains an autonomous SEO agent built with Python using Claude Agent Overview
 
-## Project Overview
+- ** SDK.
 
-- **Language**: Python
+## ProjectLanguage**: Python
 - **AI Backend**: Claude Agent SDK (uses Claude Code CLI via SDK)
 - **Purpose**: Autonomous SEO tasks (audit, content strategy, copywriting, etc.)
 
@@ -92,6 +92,26 @@ Edit `agent/config.py` to customize:
 - `allowed_tools`: Tools the agent can use (Read, Write, Edit, Bash, Glob, Grep, Skill)
 - `setting_sources`: Sources for settings (user, project)
 
+## Available Tools
+
+### Default Tools
+The agent has these tools available by default:
+- Read, Write, Edit, Bash, Glob, Grep - File operations
+- Skill - Execute SEO skills
+- WebSearch, WebFetch - Web browsing
+
+### Webflow CMS Tools
+**Automatically available when environment variables are set.** When `WEBFLOW_ACCESS_TOKEN`, `WEBFLOW_SITE_ID`, and `WEBFLOW_COLLECTION_ID` are configured, these tools are automatically added to `allowed_tools`:
+
+- `mcp__webflow__list_cms_items` - List items in collection (supports limit/offset pagination)
+- `mcp__webflow__get_cms_item` - Get single item by ID
+- `mcp__webflow__create_cms_item` - Create new post (name, slug, content)
+- `mcp__webflow__update_cms_item` - Update existing post
+- `mcp__webflow__publish_cms_item` - Publish to live site
+- `mcp__webflow__get_collection_info` - Get collection schema
+
+The agent can use these tools to manage Webflow CMS content when Webflow is configured.
+
 ## Webflow CMS Integration
 
 The agent can manage Webflow CMS collections (create, edit, publish posts). Uses Webflow Data API v2.
@@ -120,14 +140,6 @@ config = AgentConfig(
 - **Base URL**: `https://api.webflow.com/v2`
 - **Pagination**: Uses limit/offset (max 100 items per request)
 - **Live Items**: Uses `/items/live` endpoint to fetch published items
-
-### Available Webflow Tools
-- `list_cms_items` - List items in collection (supports limit/offset pagination)
-- `get_cms_item` - Get single item by ID
-- `create_cms_item` - Create new post (name, slug, content)
-- `update_cms_item` - Update existing post
-- `publish_cms_item` - Publish to live site
-- `get_collection_info` - Get collection schema
 
 ### Module Structure
 ```
