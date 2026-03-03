@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.0] - 2026-04-03
+
+### Added
+- Kanban UI - visual task management interface
+- FastAPI server with REST API for task management (`agent/api/main.py`)
+- Task CRUD endpoints (GET/POST/PATCH/DELETE /tasks)
+- Execute task endpoint using SEOAgent
+- Comments endpoint for task collaboration
+- SEO Audit endpoint (`POST /runs/{run_id}/seo-audit`)
+- Health check endpoint (`GET /health`)
+- Kanban HTML with same styling as seo-agent (DM Sans, Tailwind)
+- No authentication required (unlike seo-agent)
+
+### Features
+- 4-column Kanban board (Pending, In Progress, Completed, Blocked)
+- Stats bar with task counts
+- Task cards with priority, execution type, due dates
+- Task detail modal with status controls
+- Comments system
+- Execute tasks via SEOAgent
+- Run Audit button
+
+### Technical
+- Added FastAPI, SQLAlchemy, Uvicorn dependencies
+- SQLite database for task storage
+- branch: feature/kanban-ui
+
 ## [1.2.1] - 2026-03-03
 
 ### Fixed

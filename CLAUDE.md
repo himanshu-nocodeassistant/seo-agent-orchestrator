@@ -22,6 +22,8 @@ This project contains an autonomous SEO agent built with Python using Claude Age
 - **Python**: 3.11+
 - **SDK**: claude-agent-sdk>=0.1.44
 - **HTTP Client**: aiohttp>=3.9.0 (for Webflow API)
+- **Web Server**: FastAPI, Uvicorn (for Kanban UI)
+- **Database**: SQLite with SQLAlchemy ORM
 - **Testing**: pytest>=9.0.0, pytest-asyncio>=1.3.0
 
 ## Memory System
@@ -162,6 +164,51 @@ while True:
         break
     # process items
     offset += 100
+```
+
+## Kanban UI
+
+The project includes a visual Kanban board for task management.
+
+### Running the Server
+
+```bash
+# Start the Kanban server
+uvicorn agent.api.main:app --reload --port 8000
+```
+
+Then open http://localhost:8000/kanban
+
+### API Endpoints
+
+- `GET /kanban` - Serve Kanban HTML UI
+- `GET /health` - Health check
+- `GET /tasks` - List all tasks with counts
+- `POST /tasks` - Create new task
+- `GET /tasks/{id}` - Get task by ID
+- `PATCH /tasks/{id}` - Update task
+- `DELETE /tasks/{id}` - Delete task
+- `POST /tasks/{id}/execute` - Execute task via SEOAgent
+- `GET /tasks/{id}/comments` - Get task comments
+- `POST /tasks/{id}/comments` - Add comment
+- `POST /runs/{run_id}/seo-audit` - Run SEO audit
+
+### Task Statuses
+
+- `pending` - Tasks waiting to be worked on
+- `in_progress` - Tasks currently being executed
+- `completed` - Tasks finished successfully
+- `blocked` - Tasks that encountered errors
+
+### Database
+
+Uses SQLite (`kanban.db`) with SQLAlchemy ORM. The database is created automatically on first run.
+
+### Module Structure
+```
+agent/api/
+├── __init__.py    # Module init
+└── main.py        # FastAPI app with all endpoints and embedded Kanban HTML
 ```
 
 ## Testing

@@ -1,45 +1,18 @@
-# PLAN.md - Webflow API Integration for SEO Agent
+# PLAN.md - SEO Bot Kanban UI
 
 ## Problem Statement
 
-The SEO Agent needs to integrate with Webflow CMS to manage collection items (create, edit posts, titles, descriptions, etc.). The user wants:
-- Direct API integration using Python
-- Modular architecture for easy management
+Replicate the kanban UI from seo-agent in seo-bot to provide a visual task management interface. The user wants:
+- Same styling as seo-agent (Tailwind, DM Sans/Mono fonts)
+- FastAPI backend for task CRUD operations
+- Integration with existing SEOAgent and Skills
 - Red/Green TDD approach
-- Clean, readable codebase
+
+---
 
 ## Solution
 
-Create a modular Python integration using Webflow's Data API v2.0, exposing operations as Claude Agent SDK custom tools.
-
----
-
-## CMS Operations Required
-
-| Operation | Description |
-|-----------|-------------|
-| **List Items** | Fetch all posts/items in a collection |
-| **Get Item** | Get single item details by ID |
-| **Create Item** | Create new post with title, slug, content, etc. |
-| **Update Item** | Edit existing post fields |
-| **Publish Item** | Publish item to live site |
-
----
-
-## Modular Architecture
-
-```
-agent/
-├── __init__.py           # Export WebflowClient, WebflowTools
-├── config.py              # AgentConfig (add Webflow config)
-├── seo_agent.py          # Main agent (integrate Webflow tools)
-├── webflow/
-│   ├── __init__.py       # Export all components
-│   ├── client.py         # WebflowAPIClient - raw API calls
-│   ├── tools.py          # @tool decorators for SDK tools
-│   ├── server.py         # create_sdk_mcp_server setup
-│   └── config.py         # WebflowConfig dataclass
-```
+Create a FastAPI server with task management endpoints and copy the kanban.html UI from seo-agent with modifications to work with seo-bot's API.
 
 ---
 
@@ -47,101 +20,137 @@ agent/
 
 ### Phase 1: RED (Write Failing Tests First)
 
-#### Test 1: Webflow API Client
-- [ ] **Test**: Can import and instantiate WebflowAPIClient
-- [ ] **Expected**: Client initialized with token, site_id, collection_id
+#### Test 1: Task API - List Tasks
+- [ ] **Test**: GET /tasks returns list of tasks
+- [ ] **Expected**: Returns JSON with tasks array and counts
 
-#### Test 2: List Collection Items
-- [ ] **Test**: Call `list_items()` with valid credentials
-- [ ] **Expected**: Returns list of items from collection
+#### Test 2: Task API - Create Task
+- [ ] **Test**: POST /tasks with title, description, priority
+- [ ] **Expected**: New task created with generated ID
 
-#### Test 3: Create Item
-- [ ] **Test**: Call `create_item()` with title, slug, content
-- [ ] **Expected**: New item created in collection
+#### Test 3: Task API - Update Task
+- [ ] **Test**: PATCH /tasks/{id} with status change
+- [ ] **Expected**: Task status updated
 
-#### Test 4: Update Item  
-- [ ] **Test**: Call `update_item()` with item_id and fields
-- [ ] **Expected**: Item updated with new values
+#### Test 4: Task API - Delete Task
+- [ ] **Test**: DELETE /tasks/{id}
+- [ ] **Expected**: Task deleted successfully
 
-#### Test 5: Publish Item
-- [ ] **Test**: Call `publish_item()` with item_id
-- [ ] **Expected**: Item published to live site
+#### Test 5: Task API - Execute Task
+- [ ] **Test**: POST /tasks/{id}/execute
+- [ ] **Expected**: Task executed via SEOAgent, result stored
 
-#### Test 6: Custom Tool Integration
-- [ ] **Test**: Webflow tools registered with SDK
-- [ ] **Expected**: Tools accessible as `mcp__webflow__*`
+#### Test 6: Kanban HTML - Serve Static File
+- [ ] **Test**: GET /kanban returns the HTML page
+- [ ] **Expected**: HTML page loads correctly
 
 ---
 
 ### Phase 2: GREEN (Implement Solution)
 
-#### Step 1: Create Webflow Config
-- [ ] Create `agent/webflow/config.py` with WebflowConfig dataclass
-- [ ] Fields: access_token, site_id, collection_id, base_url
+#### Step 1: Create Task Model
+- [ ] Create `agent/db.py` with SQLite task storage
+- [ ] Task model: id, title, description, status, priority, assignee, due_date, execution_type, notes, created_at, updated_at
 
-#### Step 2: Create API Client
-- [ ] Create `agent/webflow/client.py` with WebflowAPIClient class
-- [ ] Methods: list_items, get_item, create_item, update_item, publish_item
-- [ ] Use aiohttp for async HTTP requests
+#### Step 2: Create FastAPI Server
+- [ ] Create `agent/api/main.py` with FastAPI app
+- [ ] Add CORS middleware
+- [ ] Create task endpoints
 
-#### Step 3: Create SDK Tools
-- [ ] Create `agent/webflow/tools.py` with @tool decorators
-- [ ] Tools: list_cms_items, get_cms_item, create_cms_item, update_cms_item, publish_cms_item
+#### Step 3: Create Task Routes
+- [ ] GET /tasks - list all tasks with filters
+- [ ] POST /tasks - create new task
+- [ ] GET /tasks/{id} - get single task
+- [ ] PATCH /tasks/{id} - update task
+- [ ] DELETE /tasks/{id} - delete task
+- [ ] POST /tasks/{id}/execute - execute task via SEOAgent
 
-#### Step 4: Create MCP Server
-- [ ] Create `agent/webflow/server.py` with create_webflow_server()
-- [ ] Register all tools with create_sdk_mcp_server
+#### Step 4: Create Kanban HTML
+- [ ] Copy kanban.html from seo-agent
+- [ ] Update API_BASE to point to seo-bot's API
+- [ ] Keep exact same styling
+- [ ] Run Audit button triggers SEO audit via skills
 
-#### Step 5: Integrate with Agent
-- [ ] Update `agent/__init__.py` to export Webflow components
-- [ ] Update `agent/config.py` to include Webflow settings
-- [ ] Update `agent/seo_agent.py` to accept and use Webflow MCP server
-
-#### Step 6: Update main.py
-- [ ] Pass Webflow configuration to AgentConfig
+#### Step 5: Integrate with SEOAgent
+- [ ] Connect /execute endpoint to existing SEOAgent
+- [ ] Use existing Skills for task execution
 
 ---
 
 ### Phase 3: REFACTOR (After Tests Pass)
 
-- [ ] Add error handling for API failures
-- [ ] Add logging for debugging
-- [ ] Validate environment variables
-- [ ] Document usage instructions
+- [ ] Add comments to API endpoints
+- [ ] Add error handling
+- [ ] Test the full flow: create task → execute → view result
+- [ ] Verify kanban UI works end-to-end
 
 ---
 
-## API Reference
-
-Based on [Webflow Data API v2.0](https://developers.webflow.com/data/v2.0.0/reference):
-
-### Endpoints
+## API Endpoints
 
 ```
-Base URL: https://api.webflow.com
-
-GET    /collections/{collection_id}/items         - List items
-GET    /collections/{collection_id}/items/{id}   - Get item
-POST   /collections/{collection_id}/items         - Create item
-PATCH  /collections/{collection_id}/items         - Update item
-POST   /collections/{collection_id}/items/publish - Publish item
+GET    /tasks              - List all tasks (with status counts)
+POST   /tasks              - Create new task
+GET    /tasks/{id}         - Get task by ID
+PATCH  /tasks/{id}        - Update task
+DELETE /tasks/{id}        - Delete task
+POST   /tasks/{id}/execute - Execute task via SEOAgent
+GET    /tasks/{id}/comments - Get task comments
+POST   /tasks/{id}/comments - Add comment to task
+POST   /runs/{run_id}/seo-audit - Run SEO audit
+GET    /kanban             - Serve kanban UI
 ```
 
-### Headers
+---
+
+## Task Model Schema
+
+```python
+class TaskStatus(str, Enum):
+    pending = "pending"
+    in_progress = "in_progress"
+    completed = "completed"
+    blocked = "blocked"
+
+class Task:
+    id: int
+    title: str
+    description: Optional[str]
+    status: TaskStatus
+    priority: int  # 0-3 (0 highest)
+    assignee: Optional[str]
+    due_date: Optional[str]
+    execution_type: Optional[str]  # webflow_publish, blog_write, etc.
+    requires_approval: bool
+    approved_at: Optional[str]
+    notes: Optional[str]
+    model: Optional[str]
+    parent_task_id: Optional[int]
+    comment_count: int
+    created_at: str
+    updated_at: str
 ```
-Authorization: Bearer {access_token}
-Content-Type: application/json
-```
+
+---
+
+## Execution Types (from Skills)
+
+| Type | Description |
+|------|-------------|
+| webflow_publish | Publish to Webflow CMS |
+| blog_write | Write blog content |
+| internal_links | Add internal links |
+| research | Research task |
+| seo_audit | Run SEO audit |
+| manual | Manual task |
 
 ---
 
 ## Success Criteria
 
-1. ✅ Webflow client can authenticate with API token
-2. ✅ List items returns collection items
-3. ✅ Create item adds new post to collection
-4. ✅ Update item modifies existing post
-5. ✅ Publish item pushes to live site
-6. ✅ Custom tools exposed via Claude Agent SDK
-7. ✅ Modular, readable codebase
-8. ✅ Tests pass for all operations
+1. ✅ FastAPI server starts and serves API
+2. ✅ Tasks can be created, read, updated, deleted
+3. ✅ Tasks can be executed via SEOAgent
+4. ✅ Kanban HTML loads with same styling as seo-agent
+5. ✅ Run Audit triggers SEO audit skill
+6. ✅ All tests pass
