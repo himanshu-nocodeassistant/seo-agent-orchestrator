@@ -4,10 +4,11 @@ This file provides context for every SEO agent session. Claude Code loads this a
 
 ## Site Overview
 
-- **Site name:** [YOUR SITE NAME]
-- **URL:** [https://example.com]
-- **Industry:** [e.g., SaaS, E-commerce, Local business]
-- **Primary audience:** [Who are you trying to reach?]
+- **Site name:** NocodeAssistant
+- **URL:** https://nocodeassistant.agency
+- **Industry:** Software development agency, Consulting
+- **Primary audience:** COO, CEO, Founders and owners of SMB. 5-80 employees, $3M-$30M revenue. Drowning in spreadsheets and disconnected tools. Growing faster than their systems.
+- **Project size:** $8K-$50K
 
 ## Target Keywords (Priority Order)
 
@@ -30,3 +31,6 @@ This file provides context for every SEO agent session. Claude Code loads this a
 ## Current Sprint Focus
 
 See `seo-context.md` for active tickets and current work.
+
+## Important
+- Never commit, merge or push to Github without approval

@@ -1,7 +1,7 @@
 """
-SEO Autonomous Agent using Claude Code CLI via subprocess.
+SEO Autonomous Agent using Claude Agent SDK.
 
-This module provides the SEOAgent class that wraps Claude Code CLI
+This module provides the SEOAgent class that wraps Claude Agent SDK
 for performing autonomous SEO tasks. Uses OAuth authentication
 via Claude Code (no API key required).
 
@@ -12,11 +12,13 @@ Memory System:
 
 import asyncio
 import json
-import subprocess
 from datetime import datetime
 from typing import AsyncIterator, Optional
 import logging
 from pathlib import Path
+
+from claude_agent_sdk import query, ClaudeSDKClient, ClaudeAgentOptions
+from claude_agent_sdk.types import AssistantMessage, TextBlock, ResultMessage
 
 from .config import AgentConfig
 
@@ -32,9 +34,10 @@ MEMORY_CONTEXT = "memory/seo-context.md"
 
 class SEOAgent:
     """
-    Autonomous SEO Agent that uses Claude Code CLI to perform SEO tasks.
+    Autonomous SEO Agent that uses Claude Agent SDK to perform SEO tasks.
     
-    Uses Claude Code CLI via subprocess for reliable OAuth authentication.
+    Uses Claude Agent SDK for reliable OAuth authentication and proper
+    communication with Claude Code.
     """
     
     def __init__(self, config: Optional[AgentConfig] = None):
@@ -42,6 +45,7 @@ class SEOAgent:
         self.config = config or AgentConfig()
         self.session_id: Optional[str] = None
         self.memory_context: dict = {}
+        self._client: Optional[ClaudeSDKClient] = None
         
     def _get_memory_path(self, filename: str) -> Path:
         """Get absolute path to a memory file."""
@@ -136,50 +140,12 @@ After each task, update this file with:
         except Exception as e:
             logger.warning(f"Failed to update {MEMORY_CONTEXT}: {e}")
     
-    def _run_claude(self, prompt: str, extra_args: list = None) -> str:
-        """Run Claude CLI with the given prompt."""
-        cmd = [
-            self.config.cli_path,
-            "--print",  # Non-interactive output
-            "--verbose",
-            "--no-chrome",
-            "--model", self.config.model,  # Use configured model
-            prompt
-        ]
-        
-        if extra_args:
-            cmd.extend(extra_args)
-        
-        result = subprocess.run(
-            cmd,
-            cwd=self.config.cwd,
-            capture_output=True,
-            text=True,
-            timeout=300
-        )
-        
-        if result.returncode != 0:
-            logger.error(f"Claude CLI error: {result.stderr}")
-            return f"Error: {result.stderr}"
-        
-        return result.stdout
-    
-    async def execute_task(self, prompt: str) -> str:
-        """
-        Execute a single SEO task.
-        
-        Args:
-            prompt: The task description for Claude
-            
-        Returns:
-            The result from Claude
-        """
-        # Load memory context at session start
+    def _build_prompt_with_context(self, prompt: str) -> str:
+        """Build prompt with memory context."""
         memory_context = self.load_memory_context()
         
-        # Build prompt with memory context
         if memory_context:
-            full_prompt = f"""{memory_context}
+            return f"""{memory_context}
 
 ## Task
 
@@ -194,27 +160,56 @@ After completing this task, you MUST update the file `memory/seo-context.md` to 
 
 Use the Edit tool to update memory/seo-context.md before ending your response.
 """
-        else:
-            full_prompt = prompt
-        
-        # Run synchronously in a thread to not block
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None, 
-            self._run_claude, 
-            full_prompt,
-            ["--add-dir", self.config.cwd]
+        return prompt
+    
+    def _create_sdk_options(self) -> ClaudeAgentOptions:
+        """Create ClaudeAgentOptions from AgentConfig."""
+        return ClaudeAgentOptions(
+            cwd=self.config.cwd,
+            permission_mode=self.config.permission_mode,
+            allowed_tools=self.config.allowed_tools,
+            setting_sources=self.config.setting_sources,
+            model=self.config.model,
+            max_turns=self.config.max_turns,
+            max_budget_usd=self.config.max_budget_usd,
         )
+    
+    async def execute_task(self, prompt: str) -> str:
+        """
+        Execute a single SEO task using the SDK.
+        
+        Args:
+            prompt: The task description for Claude
+            
+        Returns:
+            The result from Claude
+        """
+        full_prompt = self._build_prompt_with_context(prompt)
+        options = self._create_sdk_options()
+        
+        result_text = ""
+        
+        async for message in query(prompt=full_prompt, options=options):
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        result_text += block.text
+            elif isinstance(message, ResultMessage):
+                if message.result:
+                    result_text += message.result
+                # Capture session ID from result message
+                if message.session_id:
+                    self.session_id = message.session_id
         
         # Update context after task completion
-        if result and not result.startswith("Error:"):
-            self.update_context_after_task(prompt, result)
+        if result_text:
+            self.update_context_after_task(prompt, result_text)
         
-        return result
+        return result_text
     
     async def chat(self, message: str) -> str:
         """
-        Send a message in the current conversation.
+        Send a message in the current conversation using ClaudeSDKClient.
         
         Args:
             message: The message to send
@@ -222,20 +217,61 @@ Use the Edit tool to update memory/seo-context.md before ending your response.
         Returns:
             Claude's response
         """
-        return await self.execute_task(message)
+        # Create a new client for each chat message if not already created
+        if self._client is None:
+            self._client = ClaudeSDKClient(self._create_sdk_options())
+            await self._client.connect()
+        
+        # Send the message
+        await self._client.query(message)
+        
+        # Collect response
+        result_text = ""
+        async for message in self._client.receive_response():
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        result_text += block.text
+            elif isinstance(message, ResultMessage):
+                if message.result:
+                    result_text += message.result
+        
+        return result_text
     
     async def execute_task_streaming(self, prompt: str) -> AsyncIterator[str]:
         """
         Execute a task and yield results as they arrive.
         
-        Note: This uses polling for simplicity.
+        Args:
+            prompt: The task description for Claude
+            
+        Yields:
+            Results as they arrive
         """
-        result = await self.execute_task(prompt)
-        yield result
+        full_prompt = self._build_prompt_with_context(prompt)
+        options = self._create_sdk_options()
+        
+        async for message in query(prompt=full_prompt, options=options):
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        yield block.text
+            elif isinstance(message, ResultMessage):
+                if message.result:
+                    yield message.result
     
     async def interrupt(self) -> None:
-        """Interrupt the current task (not applicable for subprocess)."""
-        logger.info("Interrupt not supported in subprocess mode")
+        """Interrupt the current task using ClaudeSDKClient."""
+        if self._client:
+            await self._client.interrupt()
+            logger.info("Task interrupted via SDK")
+    
+    async def disconnect(self) -> None:
+        """Disconnect the SDK client."""
+        if self._client:
+            await self._client.disconnect()
+            self._client = None
+            logger.info("Disconnected from Claude SDK")
     
     async def __aenter__(self):
         """Async context manager entry."""
@@ -243,7 +279,7 @@ Use the Edit tool to update memory/seo-context.md before ending your response.
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Async context manager exit."""
-        pass
+        await self.disconnect()
     
     @classmethod
     async def create_and_run(cls, prompt: str, config: Optional[AgentConfig] = None) -> str:
@@ -258,10 +294,8 @@ Use the Edit tool to update memory/seo-context.md before ending your response.
             The result from Claude
         """
         agent = cls(config)
-        return await agent.execute_task(prompt)
+        try:
+            return await agent.execute_task(prompt)
+        finally:
+            await agent.disconnect()
 
-
-# Alias for backwards compatibility
-class ClaudeSDKClient:
-    """Compatibility wrapper - not used in subprocess mode."""
-    pass

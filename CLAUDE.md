@@ -70,3 +70,6 @@ Edit `agent/config.py` to customize:
 - `model`: Claude model (default, sonnet, opus, haiku)
 - `permission_mode`: Permission mode
 - `allowed_tools`: Tools the agent can use
+
+## Important
+- Never push, merge or commit to Github without my express approval
