@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.0] - 2026-03-03
+
+### Changed
+- Replaced subprocess-based Claude Code CLI calls with Claude Agent SDK
+- SDK provides better async support and cleaner API
+- Added claude-agent-sdk>=0.1.44 to requirements.txt
+
+### Added
+- Comprehensive pytest test suite with 25 tests
+- Tests for Memory System, Skills, Interrupt Feature, Session Continuity
+- Integration tests for full interactive sessions
+- tests/ directory with test_seo_agent.py
+- Testing dependencies: pytest>=9.0.0, pytest-asyncio>=1.3.0
+
+### Fixed
+- Resolved "ProcessTransport is not ready for writing" error
+- Proper async generator mocking in tests
+
 ## [1.1.0] - 2026-02-24
 
 ### Added
