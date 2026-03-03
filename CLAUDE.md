@@ -13,8 +13,8 @@ This project contains an autonomous SEO agent built with Python using Claude Age
 - `agent/seo_agent.py` - Main SEOAgent class using Claude Agent SDK
 - `agent/config.py` - Configuration dataclass (AgentConfig)
 - `main.py` - CLI entry point
-- `Skills/` - 9 SEO skills (.skill files are ZIP archives containing SKILL.md)
-- `memory/` - Session memory (CLAUDE.md, seo-strategy.md, seo-context.md)
+- `Skills/` - SEO skills (.skill files are ZIP archives containing SKILL.md)
+- `memory/` - Session memory (CLAUDE.md, seo-strategy.md, seo-context.md, seo-tasks.md)
 - `tests/` - Test suite with pytest
 
 ## Technology Stack
@@ -30,6 +30,7 @@ The agent uses file-based memory for persistent context:
 - **`memory/CLAUDE.md`** - Site overview, target keywords, content gaps, what NOT to do. Loaded at session start.
 - **`memory/seo-strategy.md`** - Detailed strategy that evolves over time.
 - **`memory/seo-context.md`** - Current sprint state: active tickets, completed work, pending actions.
+- **`memory/seo-tasks.md`** - Generated task lists from audits with priorities and subtasks.
 
 **Session workflow:**
 1. Agent reads `memory/CLAUDE.md` for SEO context
@@ -58,15 +59,16 @@ Per the documentation-guide.md, always maintain:
 ## Available Skills
 
 The agent has access to these SEO skills (.skill files are ZIP archives):
-- SEO Audit
-- Content Strategy
-- Copywriting
-- Copy Editing
-- Brand Voice
-- Competitor Alternatives
-- Programmatic SEO
-- Schema Markup
-- Analytics Tracking
+- **SEO Audit** - Comprehensive website SEO analysis (automatically triggers Task Breakdown)
+- **Content Strategy** - Content planning and optimization
+- **Copywriting** - Writing SEO-optimized content
+- **Copy Editing** - Editing existing content
+- **Brand Voice** - Maintaining consistent brand tone
+- **Competitor Alternatives** - Finding competitor weaknesses
+- **Programmatic SEO** - Automated SEO at scale
+- **Schema Markup** - Adding structured data
+- **Analytics Tracking** - Setting up tracking
+- **Task Breakdown** - Break audit findings into actionable tasks (one-output-per-task)
 
 ## Usage
 
@@ -105,3 +107,5 @@ python -m pytest tests/test_seo_agent.py -m integration -v
 
 ## Important
 - Never push, merge or commit to Github without my express approval
+- Always update docs per @documentation-guide.md
+- Follow red/green TDD
