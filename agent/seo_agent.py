@@ -19,6 +19,7 @@ from pathlib import Path
 
 from claude_agent_sdk import query, ClaudeSDKClient, ClaudeAgentOptions
 from claude_agent_sdk.types import AssistantMessage, TextBlock, ResultMessage
+from claude_agent_sdk._errors import MessageParseError
 
 from .config import AgentConfig
 
@@ -190,17 +191,22 @@ Use the Edit tool to update memory/seo-context.md before ending your response.
         
         result_text = ""
         
-        async for message in query(prompt=full_prompt, options=options):
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        result_text += block.text
-            elif isinstance(message, ResultMessage):
-                if message.result:
-                    result_text += message.result
-                # Capture session ID from result message
-                if message.session_id:
-                    self.session_id = message.session_id
+        try:
+            async for message in query(prompt=full_prompt, options=options):
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, TextBlock):
+                            result_text += block.text
+                elif isinstance(message, ResultMessage):
+                    if message.result:
+                        result_text += message.result
+                    # Capture session ID from result message
+                    if message.session_id:
+                        self.session_id = message.session_id
+        except MessageParseError as e:
+            # The SDK raises MessageParseError for unknown message types such as
+            # rate_limit_event. Log and continue with whatever was collected so far.
+            logger.warning(f"SDK message parse error (likely rate limit event): {e}")
         
         # Update context after task completion
         if result_text:
@@ -252,14 +258,17 @@ Use the Edit tool to update memory/seo-context.md before ending your response.
         full_prompt = self._build_prompt_with_context(prompt)
         options = self._create_sdk_options()
         
-        async for message in query(prompt=full_prompt, options=options):
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        yield block.text
-            elif isinstance(message, ResultMessage):
-                if message.result:
-                    yield message.result
+        try:
+            async for message in query(prompt=full_prompt, options=options):
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, TextBlock):
+                            yield block.text
+                elif isinstance(message, ResultMessage):
+                    if message.result:
+                        yield message.result
+        except MessageParseError as e:
+            logger.warning(f"SDK message parse error in streaming (likely rate limit event): {e}")
     
     async def interrupt(self) -> None:
         """Interrupt the current task using ClaudeSDKClient."""
