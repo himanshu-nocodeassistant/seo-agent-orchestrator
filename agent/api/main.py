@@ -838,11 +838,19 @@ async def execute_task(task_id: int):
 
             config = AgentConfig.from_env()
             config.cwd = "/Users/himanshusharma/Code/Codex/seo-bot"
+            # Don't load project/user settings — they put the agent into interactive
+            # SEO assistant mode. The task prompt is self-contained.
+            config.setting_sources = []
+            config.system_prompt = (
+                "You are an autonomous SEO agent. Execute the given task completely "
+                "and autonomously. Use the tools available to you. Report what you did "
+                "and the outcome clearly at the end."
+            )
 
             prompt = build_execution_prompt(task)
 
             result = await SEOAgent.create_and_run(prompt, config)
-            
+
             # Update task with result
             task.status = "completed"
             task.notes = result
@@ -971,6 +979,12 @@ async def run_seo_audit(run_id: str, days: int = 28, max_rows: int = 1000):
 
             config = AgentConfig.from_env()
             config.cwd = "/Users/himanshusharma/Code/Codex/seo-bot"
+            config.setting_sources = []
+            config.system_prompt = (
+                "You are an autonomous SEO agent. Execute the given task completely "
+                "and autonomously. Use the tools available to you. Report what you did "
+                "and the outcome clearly at the end."
+            )
 
             prompt = f"Run a comprehensive SEO audit analyzing data from the last {days} days. Focus on identifying issues and opportunities."
 

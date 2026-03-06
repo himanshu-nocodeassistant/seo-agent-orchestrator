@@ -21,6 +21,32 @@ from claude_agent_sdk import query, ClaudeSDKClient, ClaudeAgentOptions
 from claude_agent_sdk.types import AssistantMessage, TextBlock, ResultMessage
 from claude_agent_sdk._errors import MessageParseError
 
+# Monkey-patch the SDK internal client so unknown message types (e.g. rate_limit_event)
+# are silently skipped. The SDK calls parse_message() inside _internal/client.py and
+# _internal/query.py which import it directly — so we must patch both the module
+# attribute AND the reference inside the already-imported client module.
+try:
+    import claude_agent_sdk._internal.message_parser as _mp
+    import claude_agent_sdk._internal.client as _mc
+
+    _original_parse = _mp.parse_message
+
+    def _safe_parse_message(data):
+        try:
+            return _original_parse(data)
+        except MessageParseError as e:
+            if "Unknown message type" in str(e):
+                logging.getLogger(__name__).warning(
+                    f"Skipping unknown SDK message type '{data.get('type')}'"
+                )
+                return None
+            raise
+
+    _mp.parse_message = _safe_parse_message
+    _mc.parse_message = _safe_parse_message  # patch the already-imported reference
+except Exception:
+    pass
+
 from .config import AgentConfig
 
 logging.basicConfig(level=logging.INFO)
@@ -170,6 +196,7 @@ Use the Edit tool to update memory/seo-context.md before ending your response.
             permission_mode=self.config.permission_mode,
             allowed_tools=self.config.allowed_tools,
             setting_sources=self.config.setting_sources,
+            system_prompt=self.config.system_prompt,
             model=self.config.model,
             max_turns=self.config.max_turns,
             max_budget_usd=self.config.max_budget_usd,
@@ -193,6 +220,9 @@ Use the Edit tool to update memory/seo-context.md before ending your response.
         
         try:
             async for message in query(prompt=full_prompt, options=options):
+                if message is None:
+                    # Skipped by safe_parse_message patch (unknown type e.g. rate_limit_event)
+                    continue
                 if isinstance(message, AssistantMessage):
                     for block in message.content:
                         if isinstance(block, TextBlock):
@@ -204,9 +234,7 @@ Use the Edit tool to update memory/seo-context.md before ending your response.
                     if message.session_id:
                         self.session_id = message.session_id
         except MessageParseError as e:
-            # The SDK raises MessageParseError for unknown message types such as
-            # rate_limit_event. Log and continue with whatever was collected so far.
-            logger.warning(f"SDK message parse error (likely rate limit event): {e}")
+            logger.warning(f"SDK message parse error: {e}")
         
         # Update context after task completion
         if result_text:
