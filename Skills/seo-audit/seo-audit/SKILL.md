@@ -321,6 +321,17 @@ Before auditing, understand:
 
 ## Output Format
 
+### 🚨 CRITICAL: Save Report to Google Docs
+
+After completing the audit, you MUST create a Google Doc to save the report:
+
+1. Use the `create_google_doc` tool to create a new document
+2. Include all audit findings in the document
+3. Format with clear headings and sections
+4. Share the document URL with the user
+
+**Never** just display the audit in chat. Always create a Google Doc so the client has a permanent record.
+
 ### Audit Report Structure
 
 **Executive Summary**

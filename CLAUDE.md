@@ -166,6 +166,56 @@ while True:
     offset += 100
 ```
 
+## Google Docs Integration
+
+The agent can create and manage Google Docs for SEO audit reports, blog content, and other documents.
+
+### Environment Variables
+```bash
+GOOGLE_DOCS_CREDENTIALS_PATH=Google SA Credentials/tinyclaw-487419-d5ab318833bb.json
+# OR use the standard Google application credentials path:
+GOOGLE_APPLICATION_CREDENTIALS=Google SA Credentials/tinyclaw-487419-d5ab318833bb.json
+```
+
+### Programmatic Configuration
+```python
+from agent import AgentConfig, GoogleDocsConfig
+
+config = AgentConfig(
+    google_docs_config=GoogleDocsConfig(
+        credentials_path="Google SA Credentials/tinyclaw-487419-d5ab318833bb.json"
+    )
+)
+```
+
+### Available Tools
+**Automatically available when credentials path is set.** The following tools are added to `allowed_tools`:
+
+- `mcp__google_docs__create_google_doc` - Create a new Google Doc
+- `mcp__google_docs__get_google_doc` - Get document by ID
+- `mcp__google_docs__append_to_google_doc` - Append content to document
+- `mcp__google_docs__update_google_doc_title` - Update document title
+
+### Security - No Delete Capability
+**IMPORTANT:** By design, Google Docs cannot be deleted through this integration. The agent can only:
+- ✅ Create new documents
+- ✅ Read documents
+- ✅ Append content to documents
+- ✅ Update document titles
+- ❌ Delete documents (intentionally disabled)
+
+This ensures audit reports and blog content are preserved and cannot be accidentally removed.
+
+### Module Structure
+```
+agent/google_docs/
+├── __init__.py    # Exports
+├── config.py      # GoogleDocsConfig dataclass
+├── client.py      # GoogleDocsAPIClient
+├── tools.py       # @tool decorated functions
+└── server.py      # MCP server factory
+```
+
 ## Kanban UI
 
 The project includes a visual Kanban board for task management.

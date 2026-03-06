@@ -9,7 +9,7 @@ This project provides an autonomous SEO agent built with Python that leverages C
 ## Features
 
 - **Claude OAuth** - Uses your Claude Pro subscription (no API key needed)
-- **9 SEO Skills** - Built-in skills for:
+- **10 SEO Skills** - Built-in skills for:
   - SEO Audit
   - Content Strategy
   - Copywriting
@@ -19,6 +19,9 @@ This project provides an autonomous SEO agent built with Python that leverages C
   - Programmatic SEO
   - Schema Markup
   - Analytics Tracking
+  - Google Docs (save reports & content)
+- **Google Docs Integration** - Automatically saves audit reports and blog posts to Google Docs
+- **Webflow CMS** - Publish content directly to Webflow
 
 ## Requirements
 

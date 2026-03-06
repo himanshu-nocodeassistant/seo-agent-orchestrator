@@ -2,6 +2,36 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.4.0] - 2026-06-03
+
+### Added
+- Google Docs Integration - save SEO audit reports and blog content to Google Docs
+- `agent/google_docs/` module with config, client, tools, server
+- Google Docs MCP tools:
+  - `create_google_doc` - Create new document
+  - `get_google_doc` - Read document by ID
+  - `append_to_google_doc` - Append content to document
+  - `update_google_doc_title` - Update document title
+- google-docs skill - Agent now mandatory saves SEO outputs to Google Docs
+- 43 new tests for Google Docs integration
+
+### Features
+- No delete capability (by design for security)
+- Auto-configured via `GOOGLE_DOCS_CREDENTIALS_PATH` environment variable
+- Uses existing Google Service Account credentials
+
+### Security
+- Delete operations intentionally disabled - documents cannot be deleted
+- Preserves audit reports and blog content
+
+### Updated Skills
+- seo-audit skill now requires saving reports to Google Docs
+
+### Dependencies
+- Added google-api-python-client>=2.100.0
+- Added google-auth-httplib2>=0.1.0
+- Added google-auth-oauthlib>=0.8.0
+
 ## [1.3.0] - 2026-04-03
 
 ### Added
