@@ -828,12 +828,17 @@ async def execute_task(task_id: int):
         
         # Execute the task via SEOAgent
         try:
+            import os
             from agent.seo_agent import SEOAgent
             from agent.config import AgentConfig
-            
+
+            # Claude Code blocks nested sessions via the CLAUDECODE env var.
+            # Unset it so the sub-agent process can start cleanly.
+            os.environ.pop("CLAUDECODE", None)
+
             config = AgentConfig.from_env()
             config.cwd = "/Users/himanshusharma/Code/Codex/seo-bot"
-            
+
             prompt = build_execution_prompt(task)
 
             result = await SEOAgent.create_and_run(prompt, config)
@@ -958,8 +963,11 @@ async def run_seo_audit(run_id: str, days: int = 28, max_rows: int = 1000):
         
         # Execute SEO audit
         try:
+            import os
             from agent.seo_agent import SEOAgent
             from agent.config import AgentConfig
+
+            os.environ.pop("CLAUDECODE", None)
 
             config = AgentConfig.from_env()
             config.cwd = "/Users/himanshusharma/Code/Codex/seo-bot"
