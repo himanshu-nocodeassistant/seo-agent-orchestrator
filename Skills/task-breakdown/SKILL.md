@@ -73,9 +73,34 @@ Write to `memory/seo-tasks.md` with:
 - Task table(s)
 - Dependencies noted
 
+## Execution Type Mapping
+
+When creating tasks via the Kanban API, set `execution_type` based on the task category.
+This determines which automated workflow runs when someone clicks Execute on the task card.
+
+| Task Category | execution_type |
+|---|---|
+| Rewrite or optimize a meta title / SEO title | `rewrite_title` |
+| Write or rewrite a meta description | `rewrite_meta_desc` |
+| Rewrite an H1 heading | `rewrite_h1` |
+| Write alt text for images | `alt_text` |
+| Add / fix JSON-LD schema markup | `update_schema` |
+| Write a new blog post | `blog_write` |
+| Edit or rewrite existing blog content | `rewrite_blog_content` |
+| Publish a CMS item to the live site | `webflow_publish` |
+| Add internal links between pages | `internal_links` |
+| Keyword research or competitor research | `research` |
+| Tasks needing Webflow Designer (custom code, static pages, templates, favicon) | `manual` |
+
+**Important**: Use `"manual"` only for tasks that genuinely cannot be automated via the
+Webflow CMS API — for example, editing static page templates, injecting custom code,
+or uploading files. All other tasks should use the specific execution type above so the
+Execute button is shown and the agent can act on them autonomously.
+
 ## Important
 
 - NEVER create a task that produces multiple outputs
 - ALWAYS break complex tasks into single-output subtasks
 - Subtasks should be orderable - complete them in priority order
 - Update memory/seo-tasks.md after creating tasks
+- ALWAYS set the correct `execution_type` when creating Kanban tasks (see table above)

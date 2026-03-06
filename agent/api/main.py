@@ -20,6 +20,24 @@ from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
+# ============================================================================
+# EXECUTION TYPE TAXONOMY
+# ============================================================================
+
+# Execution types that support autonomous agent execution via the Execute button
+EXECUTABLE_TYPES = {
+    "research", "rewrite_title", "rewrite_meta_desc", "rewrite_h1",
+    "update_schema", "blog_write", "rewrite_blog_content",
+    "webflow_publish", "internal_links", "alt_text",
+}
+
+# Execution types that require Webflow CMS API access
+WEBFLOW_DEPENDENT_TYPES = {
+    "rewrite_title", "rewrite_meta_desc", "rewrite_h1",
+    "blog_write", "rewrite_blog_content", "webflow_publish", "internal_links",
+}
+
+
 # Database setup
 DATABASE_URL = "sqlite:///./kanban.db"
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
@@ -379,6 +397,421 @@ def delete_task(task_id: int):
         db.close()
 
 
+def _webflow_available() -> bool:
+    """Check if Webflow API credentials are configured."""
+    import os
+    return bool(os.environ.get("WEBFLOW_ACCESS_TOKEN"))
+
+
+def _webflow_degradation_note() -> str:
+    """Return a note to append when Webflow is not configured."""
+    return """
+IMPORTANT: Webflow is not configured (WEBFLOW_ACCESS_TOKEN not set).
+You cannot make live CMS changes. Instead:
+1. Complete all research and content generation steps.
+2. Produce the final output (new title, meta description, content, etc.) clearly in your report.
+3. Format it so the user can manually paste it into Webflow.
+4. Do NOT attempt to call any mcp__webflow__ tools.
+"""
+
+
+def build_execution_prompt(task) -> str:
+    """
+    Build a workflow-aware prompt for the agent based on the task's execution_type.
+
+    Returns a rich prompt with step-by-step workflow instructions tailored
+    to the execution type so the agent can act end-to-end autonomously.
+
+    Args:
+        task: TaskModel database object with title, description, execution_type
+
+    Returns:
+        Complete prompt string with context and ordered workflow steps
+    """
+    base = f"Task: {task.title}\n"
+    if task.description:
+        base += f"Details: {task.description}\n"
+
+    etype = task.execution_type
+    webflow_ok = _webflow_available()
+    degradation = _webflow_degradation_note() if not webflow_ok else ""
+
+    if etype == "rewrite_title":
+        return base + f"""
+You are executing an SEO task: research keywords and rewrite the page/post title in Webflow CMS.
+
+WORKFLOW — execute every step in order:
+
+Step 1 — Find the item in Webflow CMS
+Use mcp__webflow__list_cms_items (limit=100, offset=0) to list all CMS items.
+If there are more than 100 items, paginate with offset=100, offset=200, etc.
+Find the item whose "name" field best matches the page referenced in the task title/description.
+Use mcp__webflow__get_cms_item to fetch the full item. Note the item_id, current "name", and "seo-title".
+If the page is a static Webflow page (homepage, /weweb-agency, /bubble-agency, /faq) — it won't appear
+in CMS items. In that case, skip Webflow tool calls and produce copy-paste instructions for
+manual update in the Webflow Designer.
+
+Step 2 — Keyword research
+Use WebSearch to find SEO keywords for this topic:
+- Search: "best keywords for [topic] [current year]"
+- Search: "[topic] site keyword competition"
+- Review top competitor titles from search results
+Identify: primary keyword (highest commercial intent), secondary keywords, competitor title formats.
+
+Step 3 — Generate 3 title options
+Rules:
+- 50–60 characters including spaces
+- Primary keyword near the beginning
+- Brand name at the end: "Keyword Phrase | NocodeAssistant"
+- Specific to the target audience: SMB founders/COOs/CEOs, $3M-$30M revenue, 5-80 employees
+- No filler qualifiers ("Trusted", "Best", "Leading")
+
+Step 4 — Select and update in Webflow
+Pick the strongest title. Use mcp__webflow__update_cms_item with:
+  item_id: [from Step 1]
+  name: [chosen title]
+  seo-title: [same title, or a slightly different version if the display name and SEO title should differ]
+
+Step 5 — Publish
+Use mcp__webflow__publish_cms_item with the item_id.
+
+Step 6 — Report clearly:
+- Old title: [what it was]
+- New title: [what you set]
+- Keyword rationale: [why this keyword, search intent, competitive context]
+- Webflow item ID updated: [id]
+{degradation}"""
+
+    elif etype == "rewrite_meta_desc":
+        return base + f"""
+You are executing an SEO task: research and rewrite the meta description for a page in Webflow CMS.
+
+WORKFLOW — execute every step in order:
+
+Step 1 — Find the item in Webflow CMS
+Use mcp__webflow__list_cms_items to find the item matching this page.
+Use mcp__webflow__get_cms_item to get the full item. Note the current "seo-desc" value.
+If it's a static page, produce copy-paste instructions for manual Webflow Designer update.
+
+Step 2 — Research
+Use WebSearch to understand what competitors use in meta descriptions for this topic:
+- Search: "[topic] [page type] meta description examples"
+- Identify: primary keyword, user intent, strongest value propositions for SMB operators.
+
+Step 3 — Write the meta description
+Rules:
+- 150–160 characters exactly (count carefully)
+- Primary keyword appears naturally in the first half
+- Clear value proposition for SMB founders/COOs
+- Ends with an implicit or explicit call to action
+- No keyword stuffing; reads naturally
+
+Step 4 — Update in Webflow
+Use mcp__webflow__update_cms_item:
+  item_id: [from Step 1]
+  seo-desc: [new description]
+
+Step 5 — Publish
+Use mcp__webflow__publish_cms_item.
+
+Step 6 — Report:
+- Old description: [what it was]
+- New description: [what you set]
+- Character count: [exact count]
+- Primary keyword used: [keyword]
+{degradation}"""
+
+    elif etype == "rewrite_h1":
+        return base + f"""
+You are executing an SEO task: rewrite the H1 heading for a page and update it in Webflow CMS.
+
+WORKFLOW — execute every step in order:
+
+Step 1 — Fetch the current page
+Use WebFetch on the URL referenced in the task to see the current H1.
+Also use mcp__webflow__list_cms_items to find the Webflow item.
+Use mcp__webflow__get_collection_info to check what fields are available (the H1 may map
+to the "name" field or a dedicated headline field).
+
+Step 2 — Research search intent
+Use WebSearch: "what do people search for [topic]" and "[topic] user intent"
+The H1 must match the expectation a user has after clicking from the SERP.
+
+Step 3 — Write 2 H1 options
+Rules:
+- Under 70 characters
+- Contains the primary keyword
+- Specific to this page (not reusable across other pages)
+- Direct and clear — no filler, speaks to SMB operators
+
+Step 4 — Update in Webflow
+Use mcp__webflow__update_cms_item with the appropriate field (likely "name").
+
+Step 5 — Publish
+Use mcp__webflow__publish_cms_item.
+
+Step 6 — Report:
+- Old H1: [what it was]
+- New H1: [what you set]
+- Keyword + intent rationale
+{degradation}"""
+
+    elif etype == "blog_write":
+        return base + f"""
+You are executing an SEO task: research, write, and publish a new blog post to Webflow CMS.
+
+WORKFLOW — execute every step in order:
+
+Step 1 — Keyword research
+Use WebSearch to identify:
+- The primary keyword and monthly search volume for this topic
+- The top 5 ranking pages (their titles, H1s, approximate word counts)
+- Secondary keywords and related questions (People Also Ask)
+Search: "[topic] keyword research", "[topic] how to", "[topic] guide"
+
+Step 2 — Outline
+Create a full post outline:
+- SEO title (50-60 chars, keyword-first, ends with "| NocodeAssistant")
+- Meta description (150-160 chars)
+- H1 (matches or is very close to the SEO title)
+- H2 sections with supporting H3s where needed
+- Target word count: 800-1500 words for this SMB audience
+
+Step 3 — Write the post
+Use the Skill tool to invoke the copywriting skill.
+Write the full post following the outline. Must include:
+- Primary keyword in first 100 words
+- Keyword density ~1-2% (natural usage)
+- 2-3 internal links to other nocodeassistant.agency pages
+- CTA at the end pointing to the agency's services
+
+Step 4 — Create in Webflow
+Use mcp__webflow__create_cms_item with these fields:
+  name: [SEO title]
+  slug: [kebab-case-url-slug with primary keyword]
+  content: [full post content]
+  seo-title: [SEO title]
+  seo-desc: [meta description]
+  excerpt: [2-sentence summary for post cards]
+  display-date: [today's date in ISO format]
+
+Step 5 — Publish
+Use mcp__webflow__publish_cms_item with the new item's ID.
+
+Step 6 — Report:
+- Title: [title]
+- URL slug: [slug]
+- Word count: [count]
+- Primary keyword targeted: [keyword]
+- Webflow item ID: [id]
+{degradation}"""
+
+    elif etype == "rewrite_blog_content":
+        return base + f"""
+You are executing an SEO task: rewrite and republish existing blog content for better SEO.
+
+WORKFLOW — execute every step in order:
+
+Step 1 — Fetch the existing post
+Use mcp__webflow__list_cms_items to find the post by title match.
+Use mcp__webflow__get_cms_item to get the full content.
+Note the current title, seo-title, seo-desc, and content.
+
+Step 2 — Audit the current content
+Use WebFetch on the live page URL to see how it renders.
+Analyze: current keyword targeting, word count, structure, missing sections, outdated info.
+
+Step 3 — Keyword research
+Use WebSearch to find what's ranking for this topic now.
+Confirm or update the keyword target.
+
+Step 4 — Rewrite
+Use the Skill tool: invoke "copy-editing" skill for targeted improvements, or "copywriting"
+skill for a full rewrite if the content is poor.
+Apply: better keyword targeting, improved structure, updated information, internal links.
+
+Step 5 — Update in Webflow
+Use mcp__webflow__update_cms_item with:
+  item_id: [from Step 1]
+  content: [rewritten content]
+  name: [updated title if changed]
+  seo-title: [updated SEO title]
+  seo-desc: [updated meta description]
+  excerpt: [updated excerpt if changed]
+
+Step 6 — Publish
+Use mcp__webflow__publish_cms_item.
+
+Step 7 — Report:
+- What changed: content, title, meta desc
+- Old keyword target vs new keyword target
+- Key improvements made
+{degradation}"""
+
+    elif etype == "webflow_publish":
+        return base + f"""
+You are executing an SEO task: publish a Webflow CMS item to the live site.
+
+WORKFLOW — execute every step in order:
+
+Step 1 — Find the item
+Use mcp__webflow__list_cms_items to find the item referenced in this task.
+If the task description specifies field updates (title, meta desc, etc.), note them.
+
+Step 2 — Update if needed
+If the task description specifies field changes, use mcp__webflow__update_cms_item first
+with the requested field updates.
+
+Step 3 — Publish
+Use mcp__webflow__publish_cms_item with the item's ID.
+
+Step 4 — Confirm and report:
+- Item name: [name]
+- Item ID: [id]
+- Fields updated (if any): [list]
+- Published: yes
+{degradation}"""
+
+    elif etype == "internal_links":
+        return base + f"""
+You are executing an SEO task: add internal links between blog posts and pages in Webflow CMS.
+
+Note: Internal links can only be added to CMS rich-text "content" fields via the API.
+Static Webflow pages require manual editing in the Designer.
+
+WORKFLOW — execute every step in order:
+
+Step 1 — Get all CMS content
+Use mcp__webflow__list_cms_items (paginate with offset if >100 items).
+Build a map of each item: title, slug, topic/theme.
+
+Step 2 — Identify link opportunities
+For the page(s) mentioned in the task, identify which other site pages are topically related
+and would benefit from a link to or from this page.
+Prioritize: pages with overlapping topics, service pages, case studies relevant to the post.
+
+Step 3 — Update content with internal links
+For each item that needs a link added or received, use mcp__webflow__update_cms_item
+to update the "content" field, inserting the anchor text and link naturally in the text.
+Format: add the link as an HTML anchor tag within the rich text content.
+
+Step 4 — Publish updated items
+Use mcp__webflow__publish_cms_item for each updated item.
+
+Step 5 — Report:
+- Items updated: [list with IDs]
+- Links added: [source page → target page, anchor text]
+- Any static pages that need manual linking (provide copy-paste instructions)
+{degradation}"""
+
+    elif etype == "research":
+        return base + """
+You are executing an SEO research task. This is research-only — no CMS changes.
+
+WORKFLOW — execute every step in order:
+
+Step 1 — Understand the research question
+Parse the task title and description to identify what needs researching
+(keywords, competitors, content gaps, audience intent, etc.)
+
+Step 2 — Conduct research
+Use WebSearch and WebFetch to gather data:
+- Keyword research: search volume, difficulty, intent
+- Competitor analysis: who ranks, what they cover, their titles and structure
+- Industry sources: relevant data points, statistics, trends
+Search broadly first, then narrow in on the most relevant findings.
+
+Step 3 — Synthesize findings
+Produce a structured report with:
+- Primary keyword recommendations (with estimated search volume if findable)
+- Competitor analysis (who ranks, why they rank, gaps you can exploit)
+- Specific actionable recommendations for nocodeassistant.agency
+- Suggested next tasks with their execution types (e.g., rewrite_title, blog_write)
+
+Step 4 — Save findings to task notes.
+No CMS changes needed for this task type."""
+
+    elif etype == "alt_text":
+        return base + """
+You are executing an SEO task: write descriptive alt text for images on a page.
+
+Note: Webflow's CMS API does not expose individual image alt text fields for all image types.
+This task will produce copy-paste-ready alt text recommendations for manual implementation.
+
+WORKFLOW — execute every step in order:
+
+Step 1 — Fetch the page
+Use WebFetch on the URL referenced in the task.
+Find all images with empty alt="" or missing alt attributes.
+Categorize them: logos, testimonials/portraits, rating stars, content images, decorative.
+
+Step 2 — Write alt text per category
+Rules by image type:
+- Client logos: "[Company Name] logo"
+- Testimonial portraits: "[Person Name], [Job Title] at [Company Name]"
+- G2 / rating stars: "G2 rating 4.8 out of 5 stars" (or aria-hidden if purely decorative)
+- Content images: descriptive text of what the image shows and its purpose
+- Decorative dividers/backgrounds: leave as alt="" (correct) or add aria-hidden="true"
+
+Step 3 — Produce a report
+Format as a table:
+| Image Description / URL | Recommended Alt Text |
+|---|---|
+...
+
+Also provide Webflow-specific instructions for where to add alt text:
+- CMS images: in the CMS item's image field settings
+- Designer images: select image → click Settings → Alt Text field
+
+Step 4 — Save report to task notes. No automated CMS changes for this task type."""
+
+    elif etype == "update_schema":
+        return base + """
+You are executing an SEO task: generate JSON-LD structured data for a page.
+
+Note: Webflow's CMS API does not expose custom code injection fields.
+This task generates the correct JSON-LD and provides copy-paste instructions for
+Webflow's Page Settings > Custom Code > Head Code section.
+
+WORKFLOW — execute every step in order:
+
+Step 1 — Fetch the current page
+Use WebFetch on the URL referenced in the task.
+Check what JSON-LD schemas already exist (look for <script type="application/ld+json">).
+Note the page type: blog post, service page, FAQ, homepage, etc.
+
+Step 2 — Research the correct schema type
+Based on the page type, use WebFetch to check the schema.org spec for:
+- BlogPosting or Article (blog posts)
+- Service (service pages)
+- FAQPage (FAQ pages)
+- Organization (homepage/about)
+- BreadcrumbList (navigation)
+Search: "schema.org [schema type] required properties"
+
+Step 3 — Generate the JSON-LD
+Write the complete, valid JSON-LD block.
+Use https://schema.org (not http://).
+Include all recommended fields (not just required).
+Validate mentally against the schema.org spec.
+
+Step 4 — Produce implementation instructions
+Write step-by-step Webflow instructions:
+1. Go to Webflow Designer → select the page → Page Settings (⚙ icon)
+2. Scroll to "Custom Code" → "Head Code" section
+3. Paste the following block:
+[paste the complete JSON-LD <script> block]
+
+Step 5 — Save to task notes. No automated CMS changes."""
+
+    else:
+        # Default: flat prompt for unknown or manual types
+        prompt = task.title
+        if task.description:
+            prompt += f"\n\n{task.description}"
+        return prompt
+
+
 @app.post("/tasks/{task_id}/execute", response_model=TaskResponse)
 async def execute_task(task_id: int):
     """Execute a task via SEOAgent."""
@@ -395,18 +828,29 @@ async def execute_task(task_id: int):
         
         # Execute the task via SEOAgent
         try:
+            import os
             from agent.seo_agent import SEOAgent
             from agent.config import AgentConfig
-            
+
+            # Claude Code blocks nested sessions via the CLAUDECODE env var.
+            # Unset it so the sub-agent process can start cleanly.
+            os.environ.pop("CLAUDECODE", None)
+
             config = AgentConfig.from_env()
             config.cwd = "/Users/himanshusharma/Code/Codex/seo-bot"
-            
-            prompt = f"{task.title}"
-            if task.description:
-                prompt += f"\n\n{task.description}"
-            
+            # Don't load project/user settings — they put the agent into interactive
+            # SEO assistant mode. The task prompt is self-contained.
+            config.setting_sources = []
+            config.system_prompt = (
+                "You are an autonomous SEO agent. Execute the given task completely "
+                "and autonomously. Use the tools available to you. Report what you did "
+                "and the outcome clearly at the end."
+            )
+
+            prompt = build_execution_prompt(task)
+
             result = await SEOAgent.create_and_run(prompt, config)
-            
+
             # Update task with result
             task.status = "completed"
             task.notes = result
@@ -527,28 +971,70 @@ async def run_seo_audit(run_id: str, days: int = 28, max_rows: int = 1000):
         
         # Execute SEO audit
         try:
+            import os
             from agent.seo_agent import SEOAgent
             from agent.config import AgentConfig
-            
+
+            os.environ.pop("CLAUDECODE", None)
+
             config = AgentConfig.from_env()
             config.cwd = "/Users/himanshusharma/Code/Codex/seo-bot"
-            
+            config.setting_sources = []
+            config.system_prompt = (
+                "You are an autonomous SEO agent. Execute the given task completely "
+                "and autonomously. Use the tools available to you. Report what you did "
+                "and the outcome clearly at the end."
+            )
+
             prompt = f"Run a comprehensive SEO audit analyzing data from the last {days} days. Focus on identifying issues and opportunities."
-            
+
             result = await SEOAgent.create_and_run(prompt, config)
-            
+
             # Update task
             task.status = "completed"
             task.notes = result
             task.updated_at = datetime.utcnow().isoformat()
             db.commit()
-            
+
+            # Auto-trigger task breakdown: parse audit findings into Kanban tasks
+            breakdown_prompt = f"""The SEO audit has just completed. Here are the findings:
+
+{result}
+
+Now use the Task Breakdown skill to break these findings into actionable tasks.
+
+After creating the task breakdown, create each task in the Kanban board by calling the local API:
+- POST http://localhost:8000/tasks
+- Body: {{"title": "...", "description": "...", "priority": <0=critical,1=high,2=medium,3=low>, "execution_type": "<see mapping below>"}}
+
+Map priorities as: 🔴 Critical → 0, 🟠 High → 1, 🟡 Medium → 2, 🟢 Low → 3
+
+Map execution_type based on the task category:
+- Title tag rewrites (meta title / SEO title) → "rewrite_title"
+- Meta description writes or rewrites → "rewrite_meta_desc"
+- H1 heading rewrites → "rewrite_h1"
+- Alt text for images → "alt_text"
+- Schema markup / JSON-LD structured data → "update_schema"
+- Writing new blog posts → "blog_write"
+- Editing or rewriting existing blog content → "rewrite_blog_content"
+- Publishing a CMS item to live → "webflow_publish"
+- Adding internal links between pages → "internal_links"
+- Keyword research or competitor research → "research"
+- Tasks requiring Webflow Designer access (custom code, static page templates, favicon, global settings) → "manual"
+
+Use the Bash tool to make curl requests for each task. Create one Kanban card per actionable task (not subtasks — only parent tasks or standalone tasks).
+"""
+            try:
+                await SEOAgent.create_and_run(breakdown_prompt, config)
+            except Exception as e:
+                logger.warning(f"Task breakdown failed: {e}")
+
         except Exception as e:
             task.status = "blocked"
             task.notes = f"Audit error: {str(e)}"
             task.updated_at = datetime.utcnow().isoformat()
             db.commit()
-        
+
         return {"message": "Audit complete", "tasks": [task.id]}
     finally:
         db.close()
@@ -836,7 +1322,7 @@ KANBAN_HTML = """
                     <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
                     Refresh
                 </button>
-                <button onclick="runAudit()" class="btn btn-success">
+                <button id="audit-btn" onclick="runAudit()" class="btn btn-success">
                     <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
                     <span id="audit-btn-label">Run Audit</span>
                 </button>
@@ -986,6 +1472,22 @@ KANBAN_HTML = """
                         </select>
                     </div>
                 </div>
+                <div>
+                    <label class="field-label" for="cf-execution_type">Execution Type</label>
+                    <select id="cf-execution_type" name="execution_type" class="field-input">
+                        <option value="manual">👤 Manual (no Execute button)</option>
+                        <option value="research">🔍 Research</option>
+                        <option value="rewrite_title">🏷 Rewrite Title</option>
+                        <option value="rewrite_meta_desc">📝 Rewrite Meta Description</option>
+                        <option value="rewrite_h1">🔡 Rewrite H1</option>
+                        <option value="update_schema">🧩 Update Schema / JSON-LD</option>
+                        <option value="blog_write">✍️ Write Blog Post</option>
+                        <option value="rewrite_blog_content">✏️ Rewrite Blog Content</option>
+                        <option value="webflow_publish">🌐 Publish to Webflow</option>
+                        <option value="internal_links">🔗 Add Internal Links</option>
+                        <option value="alt_text">🖼 Write Alt Text</option>
+                    </select>
+                </div>
                 <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
                     <div>
                         <label class="field-label" for="cf-assignee">Assignee</label>
@@ -1040,8 +1542,18 @@ function updateStats(d) {
 }
 
 const EXEC_LABELS = {
-    webflow_publish: '🌐 Webflow', blog_write: '✍️ Blog', internal_links: '🔗 Links',
-    research: '🔍 Research', manual: '👤 Manual', seo_audit: '📊 Audit',
+    webflow_publish: '🌐 Publish',
+    blog_write: '✍️ Blog Write',
+    internal_links: '🔗 Int. Links',
+    research: '🔍 Research',
+    manual: '👤 Manual',
+    seo_audit: '📊 Audit',
+    rewrite_title: '🏷 Title',
+    rewrite_meta_desc: '📝 Meta Desc',
+    rewrite_h1: '🔡 H1',
+    update_schema: '🧩 Schema',
+    rewrite_blog_content: '✏️ Rewrite',
+    alt_text: '🖼 Alt Text',
 };
 const PRIORITY_PILLS = { 0: 'pill-priority-0', 1: 'pill-priority-1', 2: 'pill-priority-2', 3: 'pill-priority-3' };
 const PRIORITY_LABELS = { 0: 'P0 Critical', 1: 'P1 High', 2: 'P2 Medium', 3: 'P3 Low' };
