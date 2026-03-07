@@ -21,68 +21,88 @@ Create a FastAPI server with task management endpoints and copy the kanban.html 
 ### Phase 1: RED (Write Failing Tests First)
 
 #### Test 1: Task API - List Tasks
-- [ ] **Test**: GET /tasks returns list of tasks
-- [ ] **Expected**: Returns JSON with tasks array and counts
+- [x] **Test**: GET /tasks returns list of tasks
+- [x] **Expected**: Returns JSON with tasks array and counts
 
 #### Test 2: Task API - Create Task
-- [ ] **Test**: POST /tasks with title, description, priority
-- [ ] **Expected**: New task created with generated ID
+- [x] **Test**: POST /tasks with title, description, priority
+- [x] **Expected**: New task created with generated ID
 
 #### Test 3: Task API - Update Task
-- [ ] **Test**: PATCH /tasks/{id} with status change
-- [ ] **Expected**: Task status updated
+- [x] **Test**: PATCH /tasks/{id} with status change
+- [x] **Expected**: Task status updated
 
 #### Test 4: Task API - Delete Task
-- [ ] **Test**: DELETE /tasks/{id}
-- [ ] **Expected**: Task deleted successfully
+- [x] **Test**: DELETE /tasks/{id}
+- [x] **Expected**: Task deleted successfully
 
 #### Test 5: Task API - Execute Task
-- [ ] **Test**: POST /tasks/{id}/execute
-- [ ] **Expected**: Task executed via SEOAgent, result stored
+- [x] **Test**: POST /tasks/{id}/execute
+- [x] **Expected**: Task executed via SEOAgent, result stored
 
 #### Test 6: Kanban HTML - Serve Static File
-- [ ] **Test**: GET /kanban returns the HTML page
-- [ ] **Expected**: HTML page loads correctly
+- [x] **Test**: GET /kanban returns the HTML page
+- [x] **Expected**: HTML page loads correctly
 
 ---
 
 ### Phase 2: GREEN (Implement Solution)
 
 #### Step 1: Create Task Model
-- [ ] Create `agent/db.py` with SQLite task storage
-- [ ] Task model: id, title, description, status, priority, assignee, due_date, execution_type, notes, created_at, updated_at
+- [x] Create `agent/db.py` with SQLite task storage
+- [x] Task model: id, title, description, status, priority, assignee, due_date, execution_type, notes, created_at, updated_at
 
 #### Step 2: Create FastAPI Server
-- [ ] Create `agent/api/main.py` with FastAPI app
-- [ ] Add CORS middleware
-- [ ] Create task endpoints
+- [x] Create `agent/api/main.py` with FastAPI app
+- [x] Add CORS middleware
+- [x] Create task endpoints
 
 #### Step 3: Create Task Routes
-- [ ] GET /tasks - list all tasks with filters
-- [ ] POST /tasks - create new task
-- [ ] GET /tasks/{id} - get single task
-- [ ] PATCH /tasks/{id} - update task
-- [ ] DELETE /tasks/{id} - delete task
-- [ ] POST /tasks/{id}/execute - execute task via SEOAgent
+- [x] GET /tasks - list all tasks with filters
+- [x] POST /tasks - create new task
+- [x] GET /tasks/{id} - get single task
+- [x] PATCH /tasks/{id} - update task
+- [x] DELETE /tasks/{id} - delete task
+- [x] POST /tasks/{id}/execute - execute task via SEOAgent
 
 #### Step 4: Create Kanban HTML
-- [ ] Copy kanban.html from seo-agent
-- [ ] Update API_BASE to point to seo-bot's API
-- [ ] Keep exact same styling
-- [ ] Run Audit button triggers SEO audit via skills
+- [x] Copy kanban.html from seo-agent
+- [x] Update API_BASE to point to seo-bot's API
+- [x] Keep exact same styling
+- [x] Run Audit button triggers SEO audit via skills
 
 #### Step 5: Integrate with SEOAgent
-- [ ] Connect /execute endpoint to existing SEOAgent
-- [ ] Use existing Skills for task execution
+- [x] Connect /execute endpoint to existing SEOAgent
+- [x] Use existing Skills for task execution
 
 ---
 
 ### Phase 3: REFACTOR (After Tests Pass)
 
-- [ ] Add comments to API endpoints
-- [ ] Add error handling
-- [ ] Test the full flow: create task → execute → view result
-- [ ] Verify kanban UI works end-to-end
+- [x] Add comments to API endpoints
+- [x] Add error handling
+- [x] Test the full flow: create task → execute → view result
+- [x] Verify kanban UI works end-to-end
+
+---
+
+### Phase 4: Comments Upgrade (NEW)
+
+Added agent comments functionality to track task execution progress:
+
+- [x] Add helper functions for adding comments
+  - `add_task_comment()` - generic comment adder
+  - `add_task_started_comment()` - task started by agent
+  - `add_task_completed_comment()` - task completed with result
+  - `add_task_failed_comment()` - task failed with error
+  - `add_google_doc_comment()` - Google Doc created (for future use)
+  - `add_subtasks_created_comment()` - subtasks created (for future use)
+
+- [x] Modify `/tasks/{id}/execute` endpoint to add comments:
+  - Adds "🤖 Task started by agent" when execution begins
+  - Adds "✅ Task completed" with result summary on success
+  - Adds "❌ Task failed" with error message on failure
+  - Increments comment_count on each comment
 
 ---
 
@@ -154,3 +174,4 @@ class Task:
 4. ✅ Kanban HTML loads with same styling as seo-agent
 5. ✅ Run Audit triggers SEO audit skill
 6. ✅ All tests pass
+7. ✅ Agent adds comments on task execution (started/completed/failed)

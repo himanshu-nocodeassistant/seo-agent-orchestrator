@@ -188,6 +188,82 @@ def get_db_session():
 
 
 # ============================================================================
+# COMMENT HELPER FUNCTIONS
+# ============================================================================
+
+def add_task_comment(db, task_id: int, body: str, author: str = "agent") -> CommentModel:
+    """
+    Add a comment to a task and increment comment_count.
+    
+    Args:
+        db: Database session
+        task_id: ID of the task to comment on
+        body: Comment text
+        author: Author of the comment ("agent" or "user")
+    
+    Returns:
+        The created CommentModel instance
+    """
+    task = db.query(TaskModel).filter(TaskModel.id == task_id).first()
+    if not task:
+        return None
+    
+    now = datetime.utcnow().isoformat()
+    db_comment = CommentModel(
+        task_id=task_id,
+        author=author,
+        body=body,
+        created_at=now,
+    )
+    db.add(db_comment)
+    
+    # Increment comment count
+    task.comment_count += 1
+    
+    db.commit()
+    db.refresh(db_comment)
+    
+    return db_comment
+
+
+def add_task_started_comment(db, task_id: int, task_title: str) -> CommentModel:
+    """Add a comment when task execution starts."""
+    comment_body = f"🤖 Task started by agent"
+    return add_task_comment(db, task_id, comment_body, "agent")
+
+
+def add_task_completed_comment(db, task_id: int, result_summary: str = None) -> CommentModel:
+    """Add a comment when task completes."""
+    if result_summary:
+        # Truncate result for comment
+        summary = result_summary[:200] + "..." if len(result_summary) > 200 else result_summary
+        comment_body = f"✅ Task completed\n\n{summary}"
+    else:
+        comment_body = "✅ Task completed"
+    return add_task_comment(db, task_id, comment_body, "agent")
+
+
+def add_task_failed_comment(db, task_id: int, error_message: str) -> CommentModel:
+    """Add a comment when task fails."""
+    # Truncate error message
+    error = error_message[:300] + "..." if len(error_message) > 300 else error_message
+    comment_body = f"❌ Task failed\n\nError: {error}"
+    return add_task_comment(db, task_id, comment_body, "agent")
+
+
+def add_google_doc_comment(db, task_id: int, doc_url: str) -> CommentModel:
+    """Add a comment with Google Doc link when doc is created."""
+    comment_body = f"📄 Google Doc created\n\n{doc_url}"
+    return add_task_comment(db, task_id, comment_body, "agent")
+
+
+def add_subtasks_created_comment(db, task_id: int, subtask_count: int) -> CommentModel:
+    """Add a comment when subtasks are created."""
+    comment_body = f"📋 {subtask_count} subtask(s) created"
+    return add_task_comment(db, task_id, comment_body, "agent")
+
+
+# ============================================================================
 # FASTAPI APP
 # ============================================================================
 
@@ -826,6 +902,9 @@ async def execute_task(task_id: int):
         task.updated_at = datetime.utcnow().isoformat()
         db.commit()
         
+        # Add "task started" comment
+        add_task_started_comment(db, task_id, task.title)
+        
         # Execute the task via SEOAgent
         try:
             import os
@@ -857,12 +936,21 @@ async def execute_task(task_id: int):
             task.updated_at = datetime.utcnow().isoformat()
             db.commit()
             
+            # Add "task completed" comment
+            add_task_completed_comment(db, task_id, result)
+            
         except Exception as e:
             # Mark as blocked on error
             task.status = "blocked"
             task.notes = f"Error: {str(e)}"
             task.updated_at = datetime.utcnow().isoformat()
             db.commit()
+            
+            # Add "task failed" comment
+            add_task_failed_comment(db, task_id, str(e))
+        
+        # Refresh task to get updated comment_count
+        db.refresh(task)
         
         return {
             "id": task.id,
