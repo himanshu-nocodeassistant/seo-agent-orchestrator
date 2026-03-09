@@ -601,7 +601,12 @@ def list_tasks(limit: int = 200):
     """List all tasks with counts."""
     db = get_db_session()
     try:
-        tasks = db.query(TaskModel).limit(limit).all()
+        tasks = (
+            db.query(TaskModel)
+            .order_by(TaskModel.updated_at.desc())
+            .limit(limit)
+            .all()
+        )
         
         # Convert to response format
         task_list = []
@@ -817,27 +822,21 @@ def build_execution_prompt(task) -> str:
 
     if etype == "rewrite_title":
         return base + f"""
-You are executing an SEO task: research keywords and rewrite the page/post title in Webflow CMS.
+You are executing an SEO task: research keywords and rewrite the page/post title.
+
+Primary goal: produce a high-quality final title draft first.
+Secondary goal: apply/publish in Webflow if tooling is available.
 
 WORKFLOW — execute every step in order:
 
-Step 1 — Find the item in Webflow CMS
-Use mcp__webflow__list_cms_items (limit=100, offset=0) to list all CMS items.
-If there are more than 100 items, paginate with offset=100, offset=200, etc.
-Find the item whose "name" field best matches the page referenced in the task title/description.
-Use mcp__webflow__get_cms_item to fetch the full item. Note the item_id, current "name", and "seo-title".
-If the page is a static Webflow page (homepage, /weweb-agency, /bubble-agency, /faq) — it won't appear
-in CMS items. In that case, skip Webflow tool calls and produce copy-paste instructions for
-manual update in the Webflow Designer.
-
-Step 2 — Keyword research
+Step 1 — Keyword research
 Use WebSearch to find SEO keywords for this topic:
 - Search: "best keywords for [topic] [current year]"
 - Search: "[topic] site keyword competition"
 - Review top competitor titles from search results
 Identify: primary keyword (highest commercial intent), secondary keywords, competitor title formats.
 
-Step 3 — Generate 3 title options
+Step 2 — Generate 3 title options
 Rules:
 - 50–60 characters including spaces
 - Primary keyword near the beginning
@@ -845,39 +844,50 @@ Rules:
 - Specific to the target audience: SMB founders/COOs/CEOs, $3M-$30M revenue, 5-80 employees
 - No filler qualifiers ("Trusted", "Best", "Leading")
 
-Step 4 — Select and update in Webflow
+Step 3 — Finalize draft for manual use
+Pick the strongest title and present it clearly as:
+- Final title draft
+- 2 backup options
+- keyword rationale
+
+Step 4 — Optional Webflow update
+Use mcp__webflow__list_cms_items (limit=100, offset=0) to list all CMS items.
+If there are more than 100 items, paginate with offset=100, offset=200, etc.
+Find the item whose "name" field best matches the page referenced in the task title/description.
+Use mcp__webflow__get_cms_item to fetch the full item. Note the item_id, current "name", and "seo-title".
+If the page is a static Webflow page (homepage, /weweb-agency, /bubble-agency, /faq), skip tool calls and give manual paste steps.
+
+If item found, then update:
 Pick the strongest title. Use mcp__webflow__update_cms_item with:
-  item_id: [from Step 1]
+  item_id: [from lookup]
   name: [chosen title]
   seo-title: [same title, or a slightly different version if the display name and SEO title should differ]
 
-Step 5 — Publish
-Use mcp__webflow__publish_cms_item with the item_id.
+Step 5 — Optional publish
+If the update succeeded, use mcp__webflow__publish_cms_item with the item_id.
 
 Step 6 — Report clearly:
-- Old title: [what it was]
-- New title: [what you set]
+- Final draft title: [final draft]
+- Backup options: [2]
 - Keyword rationale: [why this keyword, search intent, competitive context]
-- Webflow item ID updated: [id]
+- Webflow update status: [updated/published OR manual-only]
 {degradation}"""
 
     elif etype == "rewrite_meta_desc":
         return base + f"""
-You are executing an SEO task: research and rewrite the meta description for a page in Webflow CMS.
+You are executing an SEO task: research and rewrite the meta description for a page.
+
+Primary goal: produce a final meta description draft first.
+Secondary goal: apply/publish in Webflow if tooling is available.
 
 WORKFLOW — execute every step in order:
 
-Step 1 — Find the item in Webflow CMS
-Use mcp__webflow__list_cms_items to find the item matching this page.
-Use mcp__webflow__get_cms_item to get the full item. Note the current "seo-desc" value.
-If it's a static page, produce copy-paste instructions for manual Webflow Designer update.
-
-Step 2 — Research
+Step 1 — Research
 Use WebSearch to understand what competitors use in meta descriptions for this topic:
 - Search: "[topic] [page type] meta description examples"
 - Identify: primary keyword, user intent, strongest value propositions for SMB operators.
 
-Step 3 — Write the meta description
+Step 2 — Write the meta description
 Rules:
 - 150–160 characters exactly (count carefully)
 - Primary keyword appears naturally in the first half
@@ -885,32 +895,42 @@ Rules:
 - Ends with an implicit or explicit call to action
 - No keyword stuffing; reads naturally
 
-Step 4 — Update in Webflow
+Step 3 — Finalize draft for manual use
+Present:
+- Final meta description draft
+- Character count
+- Primary keyword used
+
+Step 4 — Optional Webflow update
+Use mcp__webflow__list_cms_items to find the item matching this page.
+Use mcp__webflow__get_cms_item to get the full item. Note the current "seo-desc" value.
+If it's a static page, provide copy-paste steps for Webflow Designer.
+
+If item found, update:
 Use mcp__webflow__update_cms_item:
-  item_id: [from Step 1]
+  item_id: [from lookup]
   seo-desc: [new description]
 
-Step 5 — Publish
-Use mcp__webflow__publish_cms_item.
+Step 5 — Optional publish
+If update succeeded, use mcp__webflow__publish_cms_item.
 
 Step 6 — Report:
-- Old description: [what it was]
-- New description: [what you set]
+- Final draft: [meta description]
 - Character count: [exact count]
-- Primary keyword used: [keyword]
+- Webflow update status: [updated/published OR manual-only]
 {degradation}"""
 
     elif etype == "rewrite_h1":
         return base + f"""
-You are executing an SEO task: rewrite the H1 heading for a page and update it in Webflow CMS.
+You are executing an SEO task: rewrite the H1 heading for a page.
+
+Primary goal: produce final H1 draft options first.
+Secondary goal: apply/publish in Webflow if tooling is available.
 
 WORKFLOW — execute every step in order:
 
 Step 1 — Fetch the current page
 Use WebFetch on the URL referenced in the task to see the current H1.
-Also use mcp__webflow__list_cms_items to find the Webflow item.
-Use mcp__webflow__get_collection_info to check what fields are available (the H1 may map
-to the "name" field or a dedicated headline field).
 
 Step 2 — Research search intent
 Use WebSearch: "what do people search for [topic]" and "[topic] user intent"
@@ -923,21 +943,37 @@ Rules:
 - Specific to this page (not reusable across other pages)
 - Direct and clear — no filler, speaks to SMB operators
 
-Step 4 — Update in Webflow
+Step 4 — Finalize draft for manual use
+Pick the strongest option and present:
+- Final H1 draft
+- Backup H1 option
+- rationale
+
+Step 5 — Optional Webflow update
+Use mcp__webflow__list_cms_items to find the Webflow item.
+Use mcp__webflow__get_collection_info to check what fields are available (H1 may map to
+"name" or a dedicated headline field).
+If static page/manual-only, provide copy-paste steps.
+
+If item found, update:
 Use mcp__webflow__update_cms_item with the appropriate field (likely "name").
 
-Step 5 — Publish
-Use mcp__webflow__publish_cms_item.
+Step 6 — Optional publish
+If update succeeded, use mcp__webflow__publish_cms_item.
 
-Step 6 — Report:
+Step 7 — Report:
 - Old H1: [what it was]
-- New H1: [what you set]
+- Final draft H1: [selected draft]
 - Keyword + intent rationale
+- Webflow update status: [updated/published OR manual-only]
 {degradation}"""
 
     elif etype == "blog_write":
         return base + f"""
-You are executing an SEO task: research, write, and publish a new blog post to Webflow CMS.
+You are executing an SEO task: research and write a new blog post.
+
+Primary goal: produce a publish-ready blog draft first.
+Secondary goal: create/publish in Webflow if tooling is available.
 
 WORKFLOW — execute every step in order:
 
@@ -964,7 +1000,15 @@ Write the full post following the outline. Must include:
 - 2-3 internal links to other nocodeassistant.agency pages
 - CTA at the end pointing to the agency's services
 
-Step 4 — Create in Webflow
+Step 4 — Finalize draft for manual publishing
+Present clearly:
+- SEO title
+- Meta description
+- Slug suggestion
+- Full post content
+- Excerpt
+
+Step 5 — Optional Webflow create
 Use mcp__webflow__create_cms_item with these fields:
   name: [SEO title]
   slug: [kebab-case-url-slug with primary keyword]
@@ -974,57 +1018,68 @@ Use mcp__webflow__create_cms_item with these fields:
   excerpt: [2-sentence summary for post cards]
   display-date: [today's date in ISO format]
 
-Step 5 — Publish
-Use mcp__webflow__publish_cms_item with the new item's ID.
+Step 6 — Optional publish
+If create succeeded, use mcp__webflow__publish_cms_item with the new item's ID.
 
-Step 6 — Report:
+Step 7 — Report:
 - Title: [title]
 - URL slug: [slug]
 - Word count: [count]
 - Primary keyword targeted: [keyword]
-- Webflow item ID: [id]
+- Webflow status: [created/published OR manual-only]
 {degradation}"""
 
     elif etype == "rewrite_blog_content":
         return base + f"""
-You are executing an SEO task: rewrite and republish existing blog content for better SEO.
+You are executing an SEO task: rewrite existing blog content for better SEO.
+
+Primary goal: produce a revised final draft first.
+Secondary goal: apply/publish in Webflow if tooling is available.
 
 WORKFLOW — execute every step in order:
 
-Step 1 — Fetch the existing post
-Use mcp__webflow__list_cms_items to find the post by title match.
-Use mcp__webflow__get_cms_item to get the full content.
-Note the current title, seo-title, seo-desc, and content.
-
-Step 2 — Audit the current content
+Step 1 — Audit the current content
 Use WebFetch on the live page URL to see how it renders.
 Analyze: current keyword targeting, word count, structure, missing sections, outdated info.
 
-Step 3 — Keyword research
+Step 2 — Keyword research
 Use WebSearch to find what's ranking for this topic now.
 Confirm or update the keyword target.
 
-Step 4 — Rewrite
+Step 3 — Rewrite
 Use the Skill tool: invoke "copy-editing" skill for targeted improvements, or "copywriting"
 skill for a full rewrite if the content is poor.
 Apply: better keyword targeting, improved structure, updated information, internal links.
 
-Step 5 — Update in Webflow
+Step 4 — Finalize revised draft for manual publishing
+Present clearly:
+- Revised title (if changed)
+- Revised SEO title/meta description
+- Revised excerpt
+- Full revised content
+
+Step 5 — Optional Webflow update
+Use mcp__webflow__list_cms_items to find the post by title match.
+Use mcp__webflow__get_cms_item to get current fields and item_id.
+If static/manual-only, provide copy-paste steps.
+
+If item found, update:
 Use mcp__webflow__update_cms_item with:
-  item_id: [from Step 1]
+  item_id: [from lookup]
   content: [rewritten content]
   name: [updated title if changed]
   seo-title: [updated SEO title]
   seo-desc: [updated meta description]
   excerpt: [updated excerpt if changed]
 
-Step 6 — Publish
-Use mcp__webflow__publish_cms_item.
+Step 6 — Optional publish
+If update succeeded, use mcp__webflow__publish_cms_item.
 
 Step 7 — Report:
 - What changed: content, title, meta desc
 - Old keyword target vs new keyword target
 - Key improvements made
+- Webflow status: [updated/published OR manual-only]
 {degradation}"""
 
     elif etype == "webflow_publish":

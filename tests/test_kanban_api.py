@@ -9,24 +9,16 @@ Red/Green TDD approach:
 
 import pytest
 from pathlib import Path
-from fastapi.testclient import TestClient
 from unittest.mock import patch, AsyncMock, MagicMock
 import json
 import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from agent.api.main import app
-
 
 # ============================================================================
 # FIXTURES
 # ============================================================================
-
-@pytest.fixture
-def client():
-    """Create test client."""
-    return TestClient(app)
 
 
 @pytest.fixture
@@ -131,6 +123,22 @@ class TestTaskAPI:
         # Verify it's gone
         get_response = client.get(f"/tasks/{task_id}")
         assert get_response.status_code == 404
+
+    def test_list_tasks_sorted_by_recently_updated_first(self, client):
+        """Test: GET /tasks returns tasks sorted by updated_at DESC."""
+        older = client.post("/tasks", json={"title": "Older Task", "status": "pending"}).json()
+        newer = client.post("/tasks", json={"title": "Newer Task", "status": "pending"}).json()
+
+        # Touch the older task so it becomes most recently updated.
+        client.patch(f"/tasks/{older['id']}", json={"status": "in_progress"})
+
+        response = client.get("/tasks")
+        assert response.status_code == 200
+        tasks = response.json()["tasks"]
+
+        older_index = next(i for i, t in enumerate(tasks) if t["id"] == older["id"])
+        newer_index = next(i for i, t in enumerate(tasks) if t["id"] == newer["id"])
+        assert older_index < newer_index
     
     def test_execute_task_no_agent(self, client):
         """Test: POST /tasks/{id}/execute returns error when agent not available."""
