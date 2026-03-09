@@ -83,6 +83,63 @@ Edit `agent/config.py` to customize:
 | `permission_mode` | `"acceptEdits"` | Permission mode for Claude |
 | `allowed_tools` | See config | Tools the agent can use |
 
+### Environment Variables
+
+Use `.env.example` as the reference file for environment setup.
+
+| Variable | Purpose | Default |
+|---------|---------|---------|
+| `APP_ENV` | Selects the default Kanban API DB (`production` or `staging`) | `production` |
+| `DATABASE_URL` | Explicit DB URL override for Kanban API (takes precedence over `APP_ENV`) | unset |
+| `COMMENT_AUTOPILOT_ENABLED` | Enable background `@agent` comment processing loop | `true` |
+| `COMMENT_AUTOPILOT_INTERVAL_SECONDS` | Poll interval for comment autopilot loop | `900` |
+| `AGENT_EXECUTION_TIMEOUT_SECONDS` | Timeout for each agent execution call | `900` |
+| `WEBFLOW_ACCESS_TOKEN` | Webflow API token | unset |
+| `WEBFLOW_SITE_ID` | Webflow site ID | unset |
+| `WEBFLOW_COLLECTION_ID` | Webflow collection ID | unset |
+| `GOOGLE_DOCS_CREDENTIALS_PATH` | Google SA credentials path | unset |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Alternate Google credentials env var | unset |
+
+Kanban DB defaults:
+- `APP_ENV=production` -> `sqlite:///./kanban.db`
+- `APP_ENV=staging` -> `sqlite:///./kanban.staging.db`
+- `DATABASE_URL=...` -> always used when set
+
+## Kanban API
+
+Run the API server:
+```bash
+uvicorn agent.api.main:app --reload --port 8000
+```
+
+Environment examples:
+```bash
+# Production database (default)
+APP_ENV=production uvicorn agent.api.main:app --reload --port 8000
+
+# Staging database
+APP_ENV=staging uvicorn agent.api.main:app --reload --port 8000
+
+# Explicit custom database URL
+DATABASE_URL=sqlite:///./kanban.custom.db uvicorn agent.api.main:app --reload --port 8000
+```
+
+Testing note:
+- `tests/conftest.py` routes API tests to shared in-memory SQLite (`sqlite:///:memory:` + `StaticPool`) to avoid writes to file-backed DBs.
+
+### Comment Autopilot
+
+When enabled, the API runs an internal background worker that checks for new user comments beginning with `@agent`.
+
+Behavior:
+- Polls every `COMMENT_AUTOPILOT_INTERVAL_SECONDS` (default 15 minutes).
+- Processes exactly one trigger comment per cycle (oldest first).
+- Moves task to `in_progress`, runs revision, then sets `completed` on success or `blocked` on failure.
+- Retries failed comment actions once (2 attempts total), then marks as retry exhausted.
+
+Manual trigger endpoint:
+- `POST /automation/comments/process-one` - process one eligible comment immediately.
+
 ## Project Structure
 
 ```

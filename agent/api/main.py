@@ -6,10 +6,11 @@ Provides REST API for task management and serves the kanban HTML.
 
 import asyncio
 import json
+import os
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
@@ -17,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
@@ -39,7 +41,22 @@ WEBFLOW_DEPENDENT_TYPES = {
 
 
 # Database setup
-DATABASE_URL = "sqlite:///./kanban.db"
+def resolve_database_url(env: Mapping[str, str] | None = None) -> str:
+    """Resolve database URL using explicit DATABASE_URL or APP_ENV defaults."""
+    env_map = env if env is not None else os.environ
+
+    explicit_url = env_map.get("DATABASE_URL")
+    if explicit_url:
+        return explicit_url
+
+    app_env = env_map.get("APP_ENV", "production").strip().lower()
+    if app_env == "staging":
+        return "sqlite:///./kanban.staging.db"
+
+    return "sqlite:///./kanban.db"
+
+
+DATABASE_URL = resolve_database_url()
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -87,6 +104,22 @@ class CommentModel(Base):
     author = Column(String(50), default="user")
     body = Column(Text, nullable=False)
     created_at = Column(String(20), default=lambda: datetime.utcnow().isoformat())
+
+
+class CommentActionModel(Base):
+    """Tracks agent actions for triggered user comments."""
+    __tablename__ = "comment_actions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, nullable=False, index=True)
+    comment_id = Column(Integer, nullable=False, unique=True, index=True)
+    status = Column(String(30), nullable=False, default="pending")
+    attempts = Column(Integer, nullable=False, default=0)
+    max_attempts = Column(Integer, nullable=False, default=2)
+    last_error = Column(Text, nullable=True)
+    created_at = Column(String(20), default=lambda: datetime.utcnow().isoformat())
+    updated_at = Column(String(20), default=lambda: datetime.utcnow().isoformat())
+    acted_at = Column(String(20), nullable=True)
 
 
 # Create tables
@@ -263,11 +296,259 @@ def add_subtasks_created_comment(db, task_id: int, subtask_count: int) -> Commen
     return add_task_comment(db, task_id, comment_body, "agent")
 
 
+def is_agent_trigger_comment(author: str, body: str) -> bool:
+    """Return True when a comment should trigger autopilot processing."""
+    if author != "user":
+        return False
+    if not body:
+        return False
+    return body.strip().lower().startswith("@agent")
+
+
+def extract_agent_comment_instruction(body: str) -> str:
+    """Extract actionable instruction from a trigger comment."""
+    stripped = (body or "").strip()
+    if stripped.lower().startswith("@agent"):
+        return stripped[6:].strip()
+    return stripped
+
+
+def build_comment_revision_prompt(task, user_comment_body: str) -> str:
+    """Build a follow-up prompt that applies user feedback to prior output."""
+    feedback = extract_agent_comment_instruction(user_comment_body) or "Revise the output based on user feedback."
+    current_output = task.notes or "(no prior output was saved)"
+    task_details = task.description or "(no additional task description)"
+
+    return f"""You are revising an existing task output based on explicit user feedback from a task comment.
+
+Original task title:
+{task.title}
+
+Original task details:
+{task_details}
+
+Execution type:
+{task.execution_type or "manual"}
+
+Current saved output/draft:
+{current_output}
+
+User revision request (from @agent comment):
+{feedback}
+
+Instructions:
+1. Keep the original task intent.
+2. Apply the user's requested edits exactly.
+3. Return the full revised output, not a summary.
+"""
+
+
+def _autopilot_enabled() -> bool:
+    """Return True when background comment autopilot should run."""
+    return os.environ.get("COMMENT_AUTOPILOT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _autopilot_interval_seconds() -> int:
+    """Get autopilot polling interval with a safe default."""
+    raw = os.environ.get("COMMENT_AUTOPILOT_INTERVAL_SECONDS", "900").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 900
+    return max(value, 1)
+
+
+def _agent_execution_timeout_seconds() -> int:
+    """Get a bounded timeout for agent execution calls."""
+    raw = os.environ.get("AGENT_EXECUTION_TIMEOUT_SECONDS", "900").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 900
+    return max(value, 1)
+
+
+async def _run_agent_prompt(prompt: str) -> str:
+    """Execute a prompt via SEOAgent using the same runtime config as task execution."""
+    from agent.seo_agent import SEOAgent
+    from agent.config import AgentConfig
+
+    os.environ.pop("CLAUDECODE", None)
+
+    config = AgentConfig.from_env()
+    config.cwd = "/Users/himanshusharma/Code/Codex/seo-bot"
+    config.setting_sources = []
+    config.system_prompt = (
+        "You are an autonomous SEO agent. Execute the given task completely "
+        "and autonomously. Use the tools available to you. Report what you did "
+        "and the outcome clearly at the end."
+    )
+    timeout = _agent_execution_timeout_seconds()
+    try:
+        return await asyncio.wait_for(SEOAgent.create_and_run(prompt, config), timeout=timeout)
+    except asyncio.TimeoutError as e:
+        raise RuntimeError(f"Agent execution timed out after {timeout}s") from e
+
+
+def _task_response(task) -> dict:
+    """Serialize task model into API response shape."""
+    return {
+        "id": task.id,
+        "title": task.title,
+        "description": task.description,
+        "status": task.status,
+        "priority": task.priority,
+        "assignee": task.assignee,
+        "due_date": task.due_date,
+        "execution_type": task.execution_type,
+        "requires_approval": task.requires_approval,
+        "approved_at": task.approved_at,
+        "notes": task.notes,
+        "model": task.model,
+        "parent_task_id": task.parent_task_id,
+        "comment_count": task.comment_count,
+        "created_at": task.created_at,
+        "updated_at": task.updated_at,
+    }
+
+
+def _acquire_next_comment_action(db) -> Optional[CommentActionModel]:
+    """Find or create the next action candidate and mark it as running."""
+    now = datetime.utcnow().isoformat()
+
+    action = (
+        db.query(CommentActionModel)
+        .filter(
+            CommentActionModel.status.in_(["pending", "failed"]),
+            CommentActionModel.attempts < CommentActionModel.max_attempts,
+        )
+        .order_by(CommentActionModel.id.asc())
+        .first()
+    )
+
+    if action is None:
+        comments = db.query(CommentModel).order_by(CommentModel.id.asc()).all()
+        for comment in comments:
+            if not is_agent_trigger_comment(comment.author, comment.body):
+                continue
+
+            action = CommentActionModel(
+                task_id=comment.task_id,
+                comment_id=comment.id,
+                status="pending",
+                attempts=0,
+                max_attempts=2,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(action)
+            try:
+                db.commit()
+                db.refresh(action)
+                break
+            except IntegrityError:
+                db.rollback()
+                action = None
+        else:
+            return None
+
+    action.status = "running"
+    action.attempts += 1
+    action.updated_at = now
+    db.commit()
+    db.refresh(action)
+    return action
+
+
+async def process_one_comment_action() -> dict:
+    """Process exactly one pending trigger comment action."""
+    async with app.state.comment_autopilot_lock:
+        db = get_db_session()
+        try:
+            action = _acquire_next_comment_action(db)
+            if action is None:
+                return {"processed": False, "reason": "no_pending_trigger_comments"}
+
+            task = db.query(TaskModel).filter(TaskModel.id == action.task_id).first()
+            comment = db.query(CommentModel).filter(CommentModel.id == action.comment_id).first()
+            if not task or not comment:
+                action.status = "retry_exhausted"
+                action.last_error = "Task or comment no longer exists."
+                action.updated_at = datetime.utcnow().isoformat()
+                db.commit()
+                return {
+                    "processed": True,
+                    "task_id": action.task_id,
+                    "comment_id": action.comment_id,
+                    "status": action.status,
+                    "attempts": action.attempts,
+                }
+
+            task.status = "in_progress"
+            task.updated_at = datetime.utcnow().isoformat()
+            db.commit()
+            add_task_comment(db, task.id, f"🤖 Started revision from comment #{comment.id}", "agent")
+
+            prompt = build_comment_revision_prompt(task, comment.body)
+            try:
+                revised_result = await _run_agent_prompt(prompt)
+                task.status = "completed"
+                task.notes = revised_result
+                task.updated_at = datetime.utcnow().isoformat()
+                db.commit()
+
+                add_task_comment(
+                    db,
+                    task.id,
+                    f"🤖 Revision completed for comment #{comment.id}\n\n{revised_result}",
+                    "agent",
+                )
+
+                action.status = "succeeded"
+                action.acted_at = datetime.utcnow().isoformat()
+                action.last_error = None
+            except Exception as e:
+                task.status = "blocked"
+                task.notes = f"Error: {str(e)}"
+                task.updated_at = datetime.utcnow().isoformat()
+                db.commit()
+                add_task_failed_comment(db, task.id, f"Comment #{comment.id}: {str(e)}")
+
+                action.last_error = str(e)
+                if action.attempts >= action.max_attempts:
+                    action.status = "retry_exhausted"
+                else:
+                    action.status = "failed"
+
+            action.updated_at = datetime.utcnow().isoformat()
+            db.commit()
+            return {
+                "processed": True,
+                "task_id": task.id,
+                "comment_id": comment.id,
+                "status": action.status,
+                "attempts": action.attempts,
+                "max_attempts": action.max_attempts,
+            }
+        finally:
+            db.close()
+
+
+async def _comment_autopilot_loop():
+    """Background loop that periodically processes one trigger comment."""
+    interval = _autopilot_interval_seconds()
+    while True:
+        await process_one_comment_action()
+        await asyncio.sleep(interval)
+
+
 # ============================================================================
 # FASTAPI APP
 # ============================================================================
 
 app = FastAPI(title="SEO Bot Kanban API")
+app.state.comment_autopilot_lock = asyncio.Lock()
+app.state.comment_autopilot_task = None
 
 # Add CORS middleware
 app.add_middleware(
@@ -277,6 +558,28 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+async def startup_comment_autopilot():
+    """Start comment autopilot loop when enabled."""
+    if not _autopilot_enabled():
+        return
+    if app.state.comment_autopilot_task is None or app.state.comment_autopilot_task.done():
+        app.state.comment_autopilot_task = asyncio.create_task(_comment_autopilot_loop())
+
+
+@app.on_event("shutdown")
+async def shutdown_comment_autopilot():
+    """Stop background autopilot loop cleanly."""
+    task = app.state.comment_autopilot_task
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
 
 # ============================================================================
@@ -907,28 +1210,8 @@ async def execute_task(task_id: int):
         
         # Execute the task via SEOAgent
         try:
-            import os
-            from agent.seo_agent import SEOAgent
-            from agent.config import AgentConfig
-
-            # Claude Code blocks nested sessions via the CLAUDECODE env var.
-            # Unset it so the sub-agent process can start cleanly.
-            os.environ.pop("CLAUDECODE", None)
-
-            config = AgentConfig.from_env()
-            config.cwd = "/Users/himanshusharma/Code/Codex/seo-bot"
-            # Don't load project/user settings — they put the agent into interactive
-            # SEO assistant mode. The task prompt is self-contained.
-            config.setting_sources = []
-            config.system_prompt = (
-                "You are an autonomous SEO agent. Execute the given task completely "
-                "and autonomously. Use the tools available to you. Report what you did "
-                "and the outcome clearly at the end."
-            )
-
             prompt = build_execution_prompt(task)
-
-            result = await SEOAgent.create_and_run(prompt, config)
+            result = await _run_agent_prompt(prompt)
 
             # Update task with result
             task.status = "completed"
@@ -952,24 +1235,7 @@ async def execute_task(task_id: int):
         # Refresh task to get updated comment_count
         db.refresh(task)
         
-        return {
-            "id": task.id,
-            "title": task.title,
-            "description": task.description,
-            "status": task.status,
-            "priority": task.priority,
-            "assignee": task.assignee,
-            "due_date": task.due_date,
-            "execution_type": task.execution_type,
-            "requires_approval": task.requires_approval,
-            "approved_at": task.approved_at,
-            "notes": task.notes,
-            "model": task.model,
-            "parent_task_id": task.parent_task_id,
-            "comment_count": task.comment_count,
-            "created_at": task.created_at,
-            "updated_at": task.updated_at,
-        }
+        return _task_response(task)
     finally:
         db.close()
 
@@ -1034,6 +1300,12 @@ def create_comment(task_id: int, comment: CommentCreate):
         db.close()
 
 
+@app.post("/automation/comments/process-one")
+async def process_one_comment_action_endpoint():
+    """Process one pending @agent trigger comment action."""
+    return await process_one_comment_action()
+
+
 # ============================================================================
 # SEO AUDIT ENDPOINT
 # ============================================================================
@@ -1059,24 +1331,8 @@ async def run_seo_audit(run_id: str, days: int = 28, max_rows: int = 1000):
         
         # Execute SEO audit
         try:
-            import os
-            from agent.seo_agent import SEOAgent
-            from agent.config import AgentConfig
-
-            os.environ.pop("CLAUDECODE", None)
-
-            config = AgentConfig.from_env()
-            config.cwd = "/Users/himanshusharma/Code/Codex/seo-bot"
-            config.setting_sources = []
-            config.system_prompt = (
-                "You are an autonomous SEO agent. Execute the given task completely "
-                "and autonomously. Use the tools available to you. Report what you did "
-                "and the outcome clearly at the end."
-            )
-
             prompt = f"Run a comprehensive SEO audit analyzing data from the last {days} days. Focus on identifying issues and opportunities."
-
-            result = await SEOAgent.create_and_run(prompt, config)
+            result = await _run_agent_prompt(prompt)
 
             # Update task
             task.status = "completed"
@@ -1110,12 +1366,12 @@ Map execution_type based on the task category:
 - Keyword research or competitor research → "research"
 - Tasks requiring Webflow Designer access (custom code, static page templates, favicon, global settings) → "manual"
 
-Use the Bash tool to make curl requests for each task. Create one Kanban card per actionable task (not subtasks — only parent tasks or standalone tasks).
+            Use the Bash tool to make curl requests for each task. Create one Kanban card per actionable task (not subtasks — only parent tasks or standalone tasks).
 """
             try:
-                await SEOAgent.create_and_run(breakdown_prompt, config)
+                await _run_agent_prompt(breakdown_prompt)
             except Exception as e:
-                logger.warning(f"Task breakdown failed: {e}")
+                print(f"Task breakdown failed: {e}")
 
         except Exception as e:
             task.status = "blocked"

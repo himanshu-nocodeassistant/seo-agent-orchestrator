@@ -51,6 +51,7 @@ Per the documentation-guide.md, always maintain:
 4. **Inline comments** - For non-obvious logic, especially complex queries
 5. **Docstrings** - For all functions (parameters, return types, purpose)
 6. **.env.example** - If environment variables are added
+7. **DECISIONS.md** - Record important technical decisions and rationale
 
 ## Code Conventions
 
@@ -241,6 +242,7 @@ Then open http://localhost:8000/kanban
 - `POST /tasks/{id}/execute` - Execute task via SEOAgent
 - `GET /tasks/{id}/comments` - Get task comments
 - `POST /tasks/{id}/comments` - Add comment
+- `POST /automation/comments/process-one` - Process one eligible `@agent` comment action
 - `POST /runs/{run_id}/seo-audit` - Run SEO audit
 
 ### Task Statuses
@@ -252,7 +254,25 @@ Then open http://localhost:8000/kanban
 
 ### Database
 
-Uses SQLite (`kanban.db`) with SQLAlchemy ORM. The database is created automatically on first run.
+Uses SQLite with SQLAlchemy ORM. The database is created automatically on first run.
+
+Environment-based defaults for Kanban API:
+- `APP_ENV=production` (default) -> `sqlite:///./kanban.db`
+- `APP_ENV=staging` -> `sqlite:///./kanban.staging.db`
+- `DATABASE_URL` (if set) overrides `APP_ENV`
+
+Comment revision automation:
+- `comment_actions` table tracks comment-triggered execution attempts and status.
+- Trigger format: user comment body must begin with `@agent`.
+- Background worker runs only while server is running.
+
+Comment automation environment variables:
+- `COMMENT_AUTOPILOT_ENABLED` (default `true`)
+- `COMMENT_AUTOPILOT_INTERVAL_SECONDS` (default `900`)
+- `AGENT_EXECUTION_TIMEOUT_SECONDS` (default `900`)
+
+Testing isolation:
+- `tests/conftest.py` forces API tests to use in-memory SQLite with `StaticPool` so tests never write into production/staging DB files.
 
 ### Module Structure
 ```
