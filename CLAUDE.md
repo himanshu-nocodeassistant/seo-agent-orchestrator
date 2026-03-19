@@ -265,10 +265,15 @@ Comment revision automation:
 - `comment_actions` table tracks comment-triggered execution attempts and status.
 - Trigger format: user comment body must begin with `@agent`.
 - Background worker runs only while server is running.
+- Autopilot skips `@agent` comments if the task was already executed after the comment was posted (`task.updated_at > comment.created_at`).
+
+User comments in task execution:
+- When a task is executed via the Execute button, all user comments on that task are included in the agent prompt under a `## User Notes` section.
+- This means notes like "keep the tone casual" or "focus on mobile users" are automatically factored in — no `@agent` prefix needed.
 
 Comment automation environment variables:
 - `COMMENT_AUTOPILOT_ENABLED` (default `true`)
-- `COMMENT_AUTOPILOT_INTERVAL_SECONDS` (default `900`)
+- `COMMENT_AUTOPILOT_INTERVAL_SECONDS` (default `300` — 5 minutes)
 - `AGENT_EXECUTION_TIMEOUT_SECONDS` (default `900`)
 
 Testing isolation:
