@@ -350,11 +350,11 @@ def _autopilot_enabled() -> bool:
 
 def _autopilot_interval_seconds() -> int:
     """Get autopilot polling interval with a safe default."""
-    raw = os.environ.get("COMMENT_AUTOPILOT_INTERVAL_SECONDS", "900").strip()
+    raw = os.environ.get("COMMENT_AUTOPILOT_INTERVAL_SECONDS", "300").strip()
     try:
         value = int(raw)
     except ValueError:
-        return 900
+        return 300
     return max(value, 1)
 
 
@@ -430,6 +430,11 @@ def _acquire_next_comment_action(db) -> Optional[CommentActionModel]:
         comments = db.query(CommentModel).order_by(CommentModel.id.asc()).all()
         for comment in comments:
             if not is_agent_trigger_comment(comment.author, comment.body):
+                continue
+
+            # Skip if the task was already executed after this comment was posted
+            task = db.query(TaskModel).filter(TaskModel.id == comment.task_id).first()
+            if task and task.updated_at and task.updated_at > comment.created_at:
                 continue
 
             action = CommentActionModel(
@@ -799,7 +804,18 @@ You cannot make live CMS changes. Instead:
 """
 
 
-def build_execution_prompt(task) -> str:
+def _append_user_notes(prompt: str, comments) -> str:
+    """Append a User Notes section to a prompt if there are any user comments."""
+    if not comments:
+        return prompt
+    user_comments = [c for c in comments if c.author == "user"]
+    if not user_comments:
+        return prompt
+    comment_block = "\n".join(f"- {c.body}" for c in user_comments)
+    return prompt + f"\n\n## User Notes\nThe user has left the following notes on this task. Factor these into your work:\n{comment_block}"
+
+
+def build_execution_prompt(task, comments=None) -> str:
     """
     Build a workflow-aware prompt for the agent based on the task's execution_type.
 
@@ -808,6 +824,9 @@ def build_execution_prompt(task) -> str:
 
     Args:
         task: TaskModel database object with title, description, execution_type
+        comments: Optional list of comment objects (with .author and .body). User
+            comments are appended as a "User Notes" section so the agent factors
+            them in during execution.
 
     Returns:
         Complete prompt string with context and ordered workflow steps
@@ -821,7 +840,7 @@ def build_execution_prompt(task) -> str:
     degradation = _webflow_degradation_note() if not webflow_ok else ""
 
     if etype == "rewrite_title":
-        return base + f"""
+        _prompt = base + f"""
 You are executing an SEO task: research keywords and rewrite the page/post title.
 
 Primary goal: produce a high-quality final title draft first.
@@ -872,9 +891,10 @@ Step 6 — Report clearly:
 - Keyword rationale: [why this keyword, search intent, competitive context]
 - Webflow update status: [updated/published OR manual-only]
 {degradation}"""
+        return _append_user_notes(_prompt, comments)
 
     elif etype == "rewrite_meta_desc":
-        return base + f"""
+        _prompt = base + f"""
 You are executing an SEO task: research and rewrite the meta description for a page.
 
 Primary goal: produce a final meta description draft first.
@@ -919,9 +939,10 @@ Step 6 — Report:
 - Character count: [exact count]
 - Webflow update status: [updated/published OR manual-only]
 {degradation}"""
+        return _append_user_notes(_prompt, comments)
 
     elif etype == "rewrite_h1":
-        return base + f"""
+        _prompt = base + f"""
 You are executing an SEO task: rewrite the H1 heading for a page.
 
 Primary goal: produce final H1 draft options first.
@@ -967,9 +988,10 @@ Step 7 — Report:
 - Keyword + intent rationale
 - Webflow update status: [updated/published OR manual-only]
 {degradation}"""
+        return _append_user_notes(_prompt, comments)
 
     elif etype == "blog_write":
-        return base + f"""
+        _prompt = base + f"""
 You are executing an SEO task: research and write a new blog post.
 
 Primary goal: produce a publish-ready blog draft first.
@@ -1028,9 +1050,10 @@ Step 7 — Report:
 - Primary keyword targeted: [keyword]
 - Webflow status: [created/published OR manual-only]
 {degradation}"""
+        return _append_user_notes(_prompt, comments)
 
     elif etype == "rewrite_blog_content":
-        return base + f"""
+        _prompt = base + f"""
 You are executing an SEO task: rewrite existing blog content for better SEO.
 
 Primary goal: produce a revised final draft first.
@@ -1081,9 +1104,10 @@ Step 7 — Report:
 - Key improvements made
 - Webflow status: [updated/published OR manual-only]
 {degradation}"""
+        return _append_user_notes(_prompt, comments)
 
     elif etype == "webflow_publish":
-        return base + f"""
+        _prompt = base + f"""
 You are executing an SEO task: publish a Webflow CMS item to the live site.
 
 WORKFLOW — execute every step in order:
@@ -1105,9 +1129,10 @@ Step 4 — Confirm and report:
 - Fields updated (if any): [list]
 - Published: yes
 {degradation}"""
+        return _append_user_notes(_prompt, comments)
 
     elif etype == "internal_links":
-        return base + f"""
+        _prompt = base + f"""
 You are executing an SEO task: add internal links between blog posts and pages in Webflow CMS.
 
 Note: Internal links can only be added to CMS rich-text "content" fields via the API.
@@ -1137,9 +1162,10 @@ Step 5 — Report:
 - Links added: [source page → target page, anchor text]
 - Any static pages that need manual linking (provide copy-paste instructions)
 {degradation}"""
+        return _append_user_notes(_prompt, comments)
 
     elif etype == "research":
-        return base + """
+        _prompt = base + """
 You are executing an SEO research task. This is research-only — no CMS changes.
 
 WORKFLOW — execute every step in order:
@@ -1164,9 +1190,10 @@ Produce a structured report with:
 
 Step 4 — Save findings to task notes.
 No CMS changes needed for this task type."""
+        return _append_user_notes(_prompt, comments)
 
     elif etype == "alt_text":
-        return base + """
+        _prompt = base + """
 You are executing an SEO task: write descriptive alt text for images on a page.
 
 Note: Webflow's CMS API does not expose individual image alt text fields for all image types.
@@ -1198,9 +1225,10 @@ Also provide Webflow-specific instructions for where to add alt text:
 - Designer images: select image → click Settings → Alt Text field
 
 Step 4 — Save report to task notes. No automated CMS changes for this task type."""
+        return _append_user_notes(_prompt, comments)
 
     elif etype == "update_schema":
-        return base + """
+        _prompt = base + """
 You are executing an SEO task: generate JSON-LD structured data for a page.
 
 Note: Webflow's CMS API does not expose custom code injection fields.
@@ -1237,13 +1265,14 @@ Write step-by-step Webflow instructions:
 [paste the complete JSON-LD <script> block]
 
 Step 5 — Save to task notes. No automated CMS changes."""
+        return _append_user_notes(_prompt, comments)
 
     else:
         # Default: flat prompt for unknown or manual types
-        prompt = task.title
+        _prompt = task.title
         if task.description:
-            prompt += f"\n\n{task.description}"
-        return prompt
+            _prompt += f"\n\n{task.description}"
+        return _append_user_notes(_prompt, comments)
 
 
 @app.post("/tasks/{task_id}/execute", response_model=TaskResponse)
@@ -1265,7 +1294,8 @@ async def execute_task(task_id: int):
         
         # Execute the task via SEOAgent
         try:
-            prompt = build_execution_prompt(task)
+            task_comments = db.query(CommentModel).filter(CommentModel.task_id == task_id).order_by(CommentModel.created_at).all()
+            prompt = build_execution_prompt(task, comments=task_comments)
             result = await _run_agent_prompt(prompt)
 
             # Update task with result

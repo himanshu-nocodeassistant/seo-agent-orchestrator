@@ -1,5 +1,6 @@
 """Tests for comment-driven autopilot execution."""
 
+import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -8,6 +9,7 @@ from agent.api.main import (
     build_comment_revision_prompt,
     get_db_session,
     is_agent_trigger_comment,
+    _autopilot_interval_seconds,
 )
 
 
@@ -155,3 +157,60 @@ class TestCommentAutopilotAPI:
         assert first["comment_id"] == c1["id"]
         assert second["processed"] is True
         assert second["comment_id"] == c2["id"]
+
+
+class TestAutopilotIntervalDefault:
+    def test_default_interval_is_five_minutes(self, monkeypatch):
+        monkeypatch.delenv("COMMENT_AUTOPILOT_INTERVAL_SECONDS", raising=False)
+        assert _autopilot_interval_seconds() == 300
+
+
+class TestStaleCommentSkip:
+    def _agent_patches(self, result="done"):
+        config_patch = patch(
+            "agent.config.AgentConfig.from_env",
+            return_value=SimpleNamespace(cwd="", setting_sources=[], system_prompt=""),
+        )
+        run_patch = patch("agent.seo_agent.SEOAgent.create_and_run", new=AsyncMock(return_value=result))
+        return config_patch, run_patch
+
+    def test_autopilot_skips_comment_if_task_executed_after_comment(self, client):
+        """If the task was executed AFTER the comment was posted, autopilot should skip it."""
+        task = client.post(
+            "/tasks",
+            json={"title": "Already done", "execution_type": "research"},
+        ).json()
+
+        # Post the @agent comment
+        client.post(
+            f"/tasks/{task['id']}/comments",
+            json={"author": "user", "body": "@agent redo this"},
+        )
+
+        # Now execute the task manually (simulates user clicking Execute after commenting)
+        config_patch, run_patch = self._agent_patches()
+        with config_patch, run_patch:
+            client.post(f"/tasks/{task['id']}/execute")
+
+        # Autopilot should NOT re-execute — task.updated_at is now after comment.created_at
+        response = client.post("/automation/comments/process-one")
+        assert response.status_code == 200
+        assert response.json()["processed"] is False
+
+    def test_autopilot_processes_comment_if_no_execution_after(self, client):
+        """If no execution happened after the comment, autopilot should process it."""
+        task = client.post(
+            "/tasks",
+            json={"title": "Needs revision", "execution_type": "research", "status": "completed"},
+        ).json()
+
+        client.post(
+            f"/tasks/{task['id']}/comments",
+            json={"author": "user", "body": "@agent add more detail"},
+        )
+
+        config_patch, run_patch = self._agent_patches(result="Revised output")
+        with config_patch, run_patch:
+            response = client.post("/automation/comments/process-one")
+
+        assert response.json()["processed"] is True

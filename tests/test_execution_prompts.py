@@ -5,6 +5,66 @@ from types import SimpleNamespace
 from agent.api.main import build_execution_prompt
 
 
+def _task(execution_type="rewrite_title"):
+    return SimpleNamespace(
+        title="Test task",
+        description="Task details",
+        execution_type=execution_type,
+        notes=None,
+    )
+
+
+def _comment(body="Keep it concise", author="user"):
+    return SimpleNamespace(author=author, body=body)
+
+
+class TestUserCommentsInPrompt:
+    def test_user_comments_appended_to_prompt(self):
+        comments = [_comment("Keep it concise")]
+        prompt = build_execution_prompt(_task(), comments=comments)
+        assert "User Notes" in prompt
+        assert "Keep it concise" in prompt
+
+    def test_multiple_user_comments_all_included(self):
+        comments = [_comment("Keep it concise"), _comment("Focus on mobile users")]
+        prompt = build_execution_prompt(_task(), comments=comments)
+        assert "Keep it concise" in prompt
+        assert "Focus on mobile users" in prompt
+
+    def test_agent_comments_excluded_from_user_notes(self):
+        comments = [_comment("agent output", author="agent"), _comment("user note", author="user")]
+        prompt = build_execution_prompt(_task(), comments=comments)
+        assert "user note" in prompt
+        assert "agent output" not in prompt
+
+    def test_no_comments_does_not_add_user_notes_section(self):
+        prompt = build_execution_prompt(_task(), comments=[])
+        assert "User Notes" not in prompt
+
+    def test_none_comments_does_not_add_user_notes_section(self):
+        prompt = build_execution_prompt(_task(), comments=None)
+        assert "User Notes" not in prompt
+
+    def test_execute_endpoint_includes_comments_in_prompt(self, client, monkeypatch):
+        """Integration: execute_task passes comments to build_execution_prompt."""
+        from unittest.mock import AsyncMock, patch, call
+        task = client.post("/tasks", json={"title": "Blog post", "execution_type": "blog_write"}).json()
+        client.post(f"/tasks/{task['id']}/comments", json={"author": "user", "body": "Use casual tone"})
+
+        config_patch = patch(
+            "agent.config.AgentConfig.from_env",
+            return_value=SimpleNamespace(cwd="", setting_sources=[], system_prompt=""),
+        )
+        run_mock = AsyncMock(return_value="done")
+        run_patch = patch("agent.seo_agent.SEOAgent.create_and_run", new=run_mock)
+        with config_patch, run_patch:
+            client.post(f"/tasks/{task['id']}/execute")
+
+        assert run_mock.called, "Agent was not called"
+        prompt_used = run_mock.call_args.args[0]
+        assert "Use casual tone" in prompt_used
+
+
 class TestWebflowPromptFallbackOrder:
     def _task(self, execution_type: str):
         return SimpleNamespace(
