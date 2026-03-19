@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-03-19
+
+### Added
+- User comments now included in task execution prompts:
+  - All user-authored comments on a task are appended as `## User Notes` when the Execute button is used
+  - `build_execution_prompt` accepts an optional `comments` parameter; `_append_user_notes` helper handles formatting
+  - No `@agent` prefix needed — plain notes like "keep it casual" are automatically factored in
+- Autopilot stale-comment skip:
+  - `@agent` comments are skipped if the task was already executed after the comment was posted (`task.updated_at > comment.created_at`)
+  - Prevents duplicate re-execution when user clicks Execute after leaving an `@agent` comment
+
+### Changed
+- Reduced default autopilot polling interval from 900s (15 min) to 300s (5 min)
+
+### Tests
+- 6 new tests in `tests/test_execution_prompts.py` for comment injection
+- 5 new tests in `tests/test_comment_autopilot.py` for stale-skip and interval (45 total passing)
+
+## [1.5.0] - 2026-03-05
+
 ### Added
 - Explicit Kanban API DB environment resolution in `agent/api/main.py`:
   - `APP_ENV=production` -> `sqlite:///./kanban.db`
@@ -12,33 +32,16 @@ All notable changes to this project will be documented in this file.
 - Comment-driven autopilot execution for task revisions:
   - Trigger: user comments starting with `@agent`
   - Tracking table: `comment_actions` with attempts/status (`pending`, `running`, `succeeded`, `failed`, `retry_exhausted`)
-  - Internal background poller (default every 300s) processes one comment per cycle
+  - Internal background poller processes one comment per cycle
   - Manual admin endpoint: `POST /automation/comments/process-one`
 - Shared agent execution timeout control: `AGENT_EXECUTION_TIMEOUT_SECONDS` (default 900)
-- Red/green TDD coverage for DB URL selection:
-  - `tests/test_db_env_config.py` (5 tests)
-- Red/green TDD coverage for comment autopilot:
-  - `tests/test_comment_autopilot.py` (11 tests)
-- User comments included in task execution prompts:
-  - All user-authored comments on a task are appended as `## User Notes` in the agent prompt when the Execute button is used
-  - `build_execution_prompt` accepts an optional `comments` parameter; `_append_user_notes` helper handles the formatting
-  - No `@agent` prefix needed — plain notes like "keep it casual" are automatically factored in
-- Autopilot stale-comment skip:
-  - `@agent` comments are skipped if the task was already executed after the comment was posted (`task.updated_at > comment.created_at`)
-  - Prevents duplicate re-execution when user clicks Execute after leaving an `@agent` comment
-- Reduced default autopilot polling interval from 900s (15 min) to 300s (5 min)
-- Red/green TDD for all new behaviours:
-  - `tests/test_execution_prompts.py` (6 new tests for comment injection)
-  - `tests/test_comment_autopilot.py` (5 new tests for stale-skip and interval)
-- Test DB isolation fixture:
-  - `tests/conftest.py` now uses in-memory SQLite with `StaticPool` to prevent test writes to file-backed DBs
+- Test DB isolation fixture: `tests/conftest.py` uses in-memory SQLite with `StaticPool`
 - Added `.env.example` documenting runtime environment variables
 - Added `DECISIONS.md` with database environment design decision
 
-### Verification
-- `pytest tests/test_db_env_config.py -v` -> 5 passed
-- `pytest tests/test_kanban_api.py -q` -> 26 passed
-- `pytest tests/test_comment_autopilot.py tests/test_db_env_config.py tests/test_kanban_api.py -q` -> 37 passed
+### Tests
+- `tests/test_db_env_config.py` (5 tests)
+- `tests/test_comment_autopilot.py` (6 tests)
 
 ## [1.4.0] - 2026-06-03
 
