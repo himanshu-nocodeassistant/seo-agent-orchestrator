@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-03-19
+
+### Added
+- **SEO Feedback Loop** — deterministic application-layer change logging and impact review system
+  - `CMS_CHANGE_FIELD_MAP` — single registry mapping 7 CMS execution types to change-type labels; all feedback-loop logic derives from this
+  - `_parse_change_log_block()` — extracts structured `<!-- CHANGE_LOG {...} -->` block from agent output; returns `failure_reason` in `{missing_block, invalid_json, missing_required_fields, field_mismatch}`
+  - `_write_change_log_entry()` — upserts idempotent entries to `memory/seo-changes.json`; always writes even on failed extraction (never silent loss)
+  - `_build_change_id()` — deterministic key `"{task_id}-{execution_type}-{url_slug}"` for deduplication and retry safety
+  - `_atomic_json_write()` — all JSON writes via temp file + `os.replace()` for write safety
+  - `_render_changes_markdown()` / `_render_learnings_markdown()` — JSON → readable markdown views
+  - `_refresh_markdown_views()` — regenerates `.claude/seo-changes-log.md` and `.claude/seo-learnings.md` after every JSON write
+  - `_change_log_block_instruction()` — per-type structured output contract appended to agent prompts for 7 CMS branches
+  - `seo_impact_review` execution type — 6-phase review prompt: backfill unlogged tasks → batch pending entries → evaluate each (WebSearch/WebFetch) → extract learnings → refresh views → post summary comment
+  - `seo-feedback-loop.skill` — packaged with 5 reference files (3 samples + 2 templates) following the `.skill` ZIP convention
+- `execute_task` now deterministically calls `_write_change_log_entry` after every CMS task — agent cannot skip logging; failures surface as task comment, never crash the task
+- `VALID_REVIEW_STATUSES` set enforces formal status lifecycle: `pending-review → reviewed-positive | reviewed-negative | reviewed-neutral | reviewed-inconclusive`
+- `seo_impact_review` added to `EXECUTABLE_TYPES` and to the Task Breakdown skill mapping in `run_seo_audit`
+- `memory/CLAUDE.md` — agent now instructed to read `.claude/seo-learnings.md` before writing any SEO copy (site-specific learned patterns take precedence over generic best practices)
+- `memory/seo-changes.json` and `memory/seo-learnings.json` — structured JSON sources of truth (created on first task completion)
+
+### Tests
+- 32 new tests in `tests/test_seo_feedback_loop.py` covering all new functions and integration paths (TDD: red → green)
+- All 14 pre-existing failures in `test_seo_agent.py` confirmed pre-existing; zero regressions introduced
+
 ## [1.7.0] - 2026-03-19
 
 ### Added
