@@ -77,6 +77,7 @@ The agent has access to these SEO skills (.skill files are ZIP archives containi
 - **Marketing Psychology** - Apply psychological principles and behavioral science to marketing
 - **Webflow CMS** - Manage Webflow CMS content (create, edit, publish posts)
 - **Google Docs** - Create and manage Google Docs for reports and content
+- **SEO Feedback Loop** - Track impact of implemented SEO changes, diagnose regressions, extract learnings, propagate winning patterns (includes sample log, sample learnings, sample review report, and templates). Use `execution_type: seo_impact_review` in Kanban to trigger a batch review of all pending changes.
 
 ## Usage
 
