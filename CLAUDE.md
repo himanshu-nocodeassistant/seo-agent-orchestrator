@@ -62,17 +62,21 @@ Per the documentation-guide.md, always maintain:
 
 ## Available Skills
 
-The agent has access to these SEO skills (.skill files are ZIP archives):
+The agent has access to these SEO skills (.skill files are ZIP archives containing SKILL.md + references):
 - **SEO Audit** - Comprehensive website SEO analysis (automatically triggers Task Breakdown)
 - **Content Strategy** - Content planning and optimization
 - **Copywriting** - Writing SEO-optimized content
-- **Copy Editing** - Editing existing content
+- **Copy Editing** - Editing existing content (includes plain-english-alternatives reference)
 - **Brand Voice** - Maintaining consistent brand tone
 - **Competitor Alternatives** - Finding competitor weaknesses
-- **Programmatic SEO** - Automated SEO at scale
-- **Schema Markup** - Adding structured data
-- **Analytics Tracking** - Setting up tracking
+- **Programmatic SEO** - Automated SEO at scale (includes playbooks reference)
+- **Schema Markup** - Adding structured data (includes JSON-LD examples reference)
+- **Analytics Tracking** - Setting up tracking (includes GA4, GTM, event library references)
 - **Task Breakdown** - Break audit findings into actionable tasks (one-output-per-task)
+- **Page CRO** - Conversion rate optimization for marketing pages (includes experiments reference)
+- **Marketing Psychology** - Apply psychological principles and behavioral science to marketing
+- **Webflow CMS** - Manage Webflow CMS content (create, edit, publish posts)
+- **Google Docs** - Create and manage Google Docs for reports and content
 
 ## Usage
 

@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-03-19
+
+### Added
+- 5 new skills with structured references:
+  - **Page CRO** (`page-cro.skill`) — conversion rate optimization for marketing pages; includes `references/experiments.md`
+  - **Marketing Psychology** (`marketing-psychology.skill`) — behavioral science and persuasion frameworks for marketing
+  - **Analytics Tracking** (`analytics-tracking.skill`) — GA4, GTM, and event tracking; includes 3 reference files (event-library, ga4-implementation, gtm-implementation)
+  - **Programmatic SEO** (`programmatic-seo.skill`) — template-driven SEO at scale; includes `references/playbooks.md`
+  - **Schema Markup** (`schema-markup.skill`) — updated with `references/schema-examples.md` (complete JSON-LD examples)
+- Updated **Copy Editing** skill (`copy-editing.skill`) now includes `references/plain-english-alternatives.md`
+- All new skills follow the structured format: `SKILL.md` + `references/` + `evals/evals.json`
+
+### Changed
+- CLAUDE.md updated to document all available skills including references bundled in each `.skill` ZIP
+
 ## [1.6.0] - 2026-03-19
 
 ### Added
