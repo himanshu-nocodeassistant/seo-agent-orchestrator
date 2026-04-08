@@ -55,6 +55,7 @@ These are principles extracted from measured ranking changes on this site. Prefe
 
 ## ⚠️ Copy Writing Rules (User Preferences — Apply Globally)
 
+- **Brand voice is mandatory before any copy task** — The Kanban agent automatically invokes the `brand-voice` skill as its first step for all execution types except `manual` and `webflow_publish`. Do not skip this step.
 - **No "no-code" or "low-code" in conversion copy** — Never use these terms in meta titles, meta descriptions, H1s, CTAs, or service/about/process page copy. Use "software agency", "custom", "internal tools", "SaaS", platform names (WeWeb, Bubble), or outcome language instead. Confirmed global preference 2026-03-19. Exception: informational blog posts where the term matches search intent (e.g. "how to build internal tools no-code") — acceptable in blog body copy only.
 - **No "Trusted" in titles or CTAs** — Weak filler word confirmed underperforming vs competitors
 - **Outcome-metric case study titles** — Lead with the strongest concrete metric (e.g. "95% Faster", "50% Less Ops") not methodology or platform labels
