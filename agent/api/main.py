@@ -70,6 +70,22 @@ SEO_LEARNINGS_MD_PATH = Path(".claude/seo-learnings.md")
 SEO_REVIEW_BATCH_SIZE = int(os.environ.get("SEO_REVIEW_BATCH_SIZE", "20"))
 
 
+def _get_gsc_client():
+    """Lazy-load GSC client using service account credentials.
+
+    Returns None if GOOGLE_APPLICATION_CREDENTIALS or GSC_SITE_URL is not set,
+    so the server starts cleanly even without GSC configured.
+    """
+    try:
+        from agent.gsc import GoogleSearchConsoleConfig, GoogleSearchConsoleClient
+        config = GoogleSearchConsoleConfig.from_env()
+        if config is None:
+            return None
+        return GoogleSearchConsoleClient(config)
+    except Exception:
+        return None
+
+
 # Database setup
 def resolve_database_url(env: Mapping[str, str] | None = None) -> str:
     """Resolve database URL using explicit DATABASE_URL or APP_ENV defaults."""
@@ -625,6 +641,90 @@ async def shutdown_comment_autopilot():
 def health_check():
     """Health check endpoint."""
     return {"status": "ok", "service": "seo-bot-kanban"}
+
+
+# ============================================================================
+# GSC ENDPOINTS
+# ============================================================================
+
+def _gsc_client_or_503():
+    client = _get_gsc_client()
+    if client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="GSC not configured. Set GOOGLE_APPLICATION_CREDENTIALS and GSC_SITE_URL.",
+        )
+    return client
+
+
+@app.get("/gsc/page-metrics")
+async def get_gsc_page_metrics(url: str, change_date: str):
+    """
+    Fetch before/after GSC Search Analytics metrics for a URL around a change date.
+
+    Query params:
+        url:         Full page URL (e.g. https://www.nocodeassistant.agency/weweb-agency)
+        change_date: ISO date of the SEO change (e.g. 2026-03-06)
+
+    Returns JSON with before/after clicks, impressions, CTR, position and computed deltas.
+    """
+    client = _gsc_client_or_503()
+    try:
+        return await client.get_page_metrics_range(url=url, change_date=change_date)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/gsc/inspect")
+async def inspect_url(url: str):
+    """
+    Inspect a single URL using the GSC URL Inspection API.
+
+    Query params:
+        url: Full page URL to inspect.
+
+    Returns indexed status, coverage state, canonical URLs, last crawl time,
+    mobile usability verdict, and rich results verdict.
+    """
+    client = _gsc_client_or_503()
+    try:
+        from agent.gsc import GoogleSearchConsoleError
+        return await client.inspect_url(url)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/gsc/inspect-bulk")
+async def inspect_urls_bulk(body: dict):
+    """
+    Inspect multiple URLs using the GSC URL Inspection API (sequential).
+
+    Request body:
+        { "urls": ["https://...", "https://..."] }
+
+    Returns a list of inspection results. Failed URLs are included with verdict=ERROR.
+    The URL Inspection API has a quota of 2,000 requests/day — use sparingly.
+    """
+    urls = body.get("urls", [])
+    if not urls:
+        raise HTTPException(status_code=400, detail="urls list is required and must not be empty.")
+    if len(urls) > 100:
+        raise HTTPException(status_code=400, detail="Maximum 100 URLs per request.")
+    client = _gsc_client_or_503()
+    try:
+        results = await client.inspect_urls(urls)
+        indexed = [r for r in results if r.get("is_indexed")]
+        not_indexed = [r for r in results if not r.get("is_indexed") and r.get("verdict") != "ERROR"]
+        errors = [r for r in results if r.get("verdict") == "ERROR"]
+        return {
+            "total": len(results),
+            "indexed_count": len(indexed),
+            "not_indexed_count": len(not_indexed),
+            "error_count": len(errors),
+            "results": results,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 # ============================================================================
