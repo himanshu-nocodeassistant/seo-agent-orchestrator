@@ -21,31 +21,8 @@ from claude_agent_sdk import query, ClaudeSDKClient, ClaudeAgentOptions
 from claude_agent_sdk.types import AssistantMessage, TextBlock, ResultMessage
 from claude_agent_sdk._errors import MessageParseError
 
-# Monkey-patch the SDK internal client so unknown message types (e.g. rate_limit_event)
-# are silently skipped. The SDK calls parse_message() inside _internal/client.py and
-# _internal/query.py which import it directly — so we must patch both the module
-# attribute AND the reference inside the already-imported client module.
-try:
-    import claude_agent_sdk._internal.message_parser as _mp
-    import claude_agent_sdk._internal.client as _mc
-
-    _original_parse = _mp.parse_message
-
-    def _safe_parse_message(data):
-        try:
-            return _original_parse(data)
-        except MessageParseError as e:
-            if "Unknown message type" in str(e):
-                logging.getLogger(__name__).warning(
-                    f"Skipping unknown SDK message type '{data.get('type')}'"
-                )
-                return None
-            raise
-
-    _mp.parse_message = _safe_parse_message
-    _mc.parse_message = _safe_parse_message  # patch the already-imported reference
-except Exception:
-    pass
+# Apply SDK compatibility patch (silently skips unknown message types like rate_limit_event)
+from . import sdk_compat  # noqa: F401 — import for side-effect
 
 from .config import AgentConfig
 
@@ -55,7 +32,6 @@ logger = logging.getLogger(__name__)
 # Memory file paths (relative to project root)
 MEMORY_DIR = "memory"
 MEMORY_CLAUDE = "memory/CLAUDE.md"
-MEMORY_STRATEGY = "memory/seo-strategy.md"
 MEMORY_CONTEXT = "memory/seo-context.md"
 
 

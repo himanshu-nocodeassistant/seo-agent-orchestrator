@@ -21,7 +21,7 @@ This project provides an autonomous SEO agent built with Python that leverages C
   - Analytics Tracking
   - Google Docs (save reports & content)
 - **Google Docs Integration** - Automatically saves audit reports and blog posts to Google Docs
-- **Webflow CMS** - Publish content directly to Webflow
+- **Kanban UI** - Visual task management with the Kanban API
 
 ## Requirements
 
@@ -49,6 +49,38 @@ This project provides an autonomous SEO agent built with Python that leverages C
    Or use the system Python:
    ```bash
    python3 main.py "Your SEO task here"
+   ```
+
+## Setup
+
+### 1. Configure Your Site
+
+Edit `memory/CLAUDE.md` to set up your site-specific context:
+- Site name and URL
+- Target keywords
+- Content gaps
+- Brand voice rules
+- Competitor intelligence
+
+### 2. (Optional) Google Docs Integration
+
+If you want to save audit reports to Google Docs:
+
+1. Create a Google Cloud project and enable the Google Docs API
+2. Create a Service Account and download the JSON credentials
+3. Share the Google Docs folders with your service account email
+4. Set the credentials path in your `.env` file:
+   ```
+   GOOGLE_APPLICATION_CREDENTIALS=path/to/your-service-account.json
+   ```
+
+### 3. (Optional) Google Search Console
+
+For SEO impact review functionality:
+1. Add your service account email to your Search Console property
+2. Set the property URL in your `.env`:
+   ```
+   GSC_SITE_URL=sc-domain:example.com
    ```
 
 ## Usage
@@ -124,9 +156,6 @@ APP_ENV=staging uvicorn agent.api.main:app --reload --port 8000
 DATABASE_URL=sqlite:///./kanban.custom.db uvicorn agent.api.main:app --reload --port 8000
 ```
 
-Testing note:
-- `tests/conftest.py` routes API tests to shared in-memory SQLite (`sqlite:///:memory:` + `StaticPool`) to avoid writes to file-backed DBs.
-
 ### Comment Autopilot
 
 When enabled, the API runs an internal background worker that checks for new user comments beginning with `@agent`.
@@ -149,15 +178,15 @@ seo-bot/
 │   ├── config.py         # Agent configuration
 │   └── seo_agent.py      # Main SEOAgent class
 ├── memory/               # Session memory (persistent context)
-│   ├── CLAUDE.md         # Site overview, keywords, gaps
-│   ├── seo-strategy.md    # Detailed strategy (evolves)
-│   └── seo-context.md    # Sprint state, tickets
+│   ├── CLAUDE.md         # Site overview, keywords, gaps (template)
+│   ├── seo-strategy.md   # Strategy template (fill in your own)
+│   └── seo-context.md   # Sprint state template
 ├── Skills/               # SEO skills (symlinked to .claude/skills)
 ├── .claude/
 │   ├── CLAUDE.md -> ../memory/CLAUDE.md  # Symlink for auto-loading
 │   └── skills -> ../Skills  # Symlink for Skills
 ├── main.py               # CLI entry point
-├── requirements.txt       # Dependencies
+├── requirements.txt      # Dependencies
 └── README.md            # This file
 ```
 
@@ -166,7 +195,7 @@ seo-bot/
 The agent uses file-based memory for persistent context across sessions:
 
 1. **`memory/CLAUDE.md`** - Site overview, target keywords, content gaps, what NOT to do
-2. **`memory/seo-strategy.md`** - Detailed strategy that evolves over time
+2. **`memory/seo-strategy.md`** - Your SEO strategy that evolves over time
 3. **`memory/seo-context.md`** - Current sprint state: active tickets, completed work
 
 **Session workflow:**

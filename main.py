@@ -27,8 +27,8 @@ async def main():
     
     # Create agent configuration (auto-detects Webflow from env vars)
     config = AgentConfig.from_env()
-    # Ensure working directory is set
-    config.cwd = "/Users/himanshusharma/Code/Codex/seo-bot"
+    # Ensure working directory is set to project root
+    config.cwd = Path(__file__).parent
     
     # Check for command line arguments
     if len(sys.argv) > 1:
