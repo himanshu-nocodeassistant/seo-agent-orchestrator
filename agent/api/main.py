@@ -1444,6 +1444,19 @@ def build_execution_prompt(task, comments=None, config=None) -> str:
 
     etype = task.execution_type
 
+    BRAND_VOICE_TYPES = {
+        "rewrite_title", "rewrite_meta_desc", "rewrite_h1",
+        "blog_write", "rewrite_blog_content", "internal_links",
+        "research", "alt_text", "update_schema", "seo_impact_review",
+    }
+    if etype in BRAND_VOICE_TYPES:
+        base += """
+MANDATORY FIRST STEP — Brand Voice:
+Before doing anything else, use the Skill tool to invoke the "brand-voice" skill.
+Read and internalize the brand voice guidelines. All copy you write must conform to them.
+
+"""
+
     if etype == "rewrite_title":
         _prompt = base + f"""
 You are executing an SEO task: research keywords and rewrite the page/post title.
@@ -2402,6 +2415,23 @@ KANBAN_HTML = """
                     <label class="field-label" for="detail-description">Description</label>
                     <textarea id="detail-description" class="field-input" rows="4" placeholder="Add a description…"></textarea>
                 </div>
+                <div style="margin-bottom:14px;">
+                    <label class="field-label" for="detail-execution_type">Execution Type</label>
+                    <select id="detail-execution_type" class="field-input">
+                        <option value="manual">👤 Manual (no Execute button)</option>
+                        <option value="research">🔍 Research</option>
+                        <option value="rewrite_title">🏷 Rewrite Title</option>
+                        <option value="rewrite_meta_desc">📝 Rewrite Meta Description</option>
+                        <option value="rewrite_h1">🔡 Rewrite H1</option>
+                        <option value="update_schema">🧩 Update Schema / JSON-LD</option>
+                        <option value="blog_write">✍️ Write Blog Post</option>
+                        <option value="rewrite_blog_content">✏️ Rewrite Blog Content</option>
+                        <option value="webflow_publish">🌐 Publish to Webflow</option>
+                        <option value="internal_links">🔗 Add Internal Links</option>
+                        <option value="alt_text">🖼 Write Alt Text</option>
+                        <option value="seo_impact_review">📊 SEO Impact Review</option>
+                    </select>
+                </div>
                 <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px;">
                     <div>
                         <label class="field-label" for="detail-assignee">Assignee</label>
@@ -2716,6 +2746,7 @@ async function openDetailModal(taskId) {
     document.getElementById('detail-description').value = task.description || '';
     document.getElementById('detail-assignee').value = task.assignee || '';
     document.getElementById('detail-due_date').value = task.due_date || '';
+    document.getElementById('detail-execution_type').value = task.execution_type || 'manual';
     setDetailStatus(task.status);
     if (task.notes) { document.getElementById('detail-notes').textContent = task.notes; document.getElementById('detail-notes-section').style.display = ''; }
     else { document.getElementById('detail-notes-section').style.display = 'none'; }
@@ -2774,7 +2805,7 @@ async function saveDetailTask() {
     const task = currentTasks.find(t => t.id === detailTaskId);
     const activeStatusBtn = document.querySelector('.status-btn.active');
     const activeStatus = activeStatusBtn?.dataset.status || task?.status || 'pending';
-    const data = { title: task?.title, description: document.getElementById('detail-description').value || null, assignee: document.getElementById('detail-assignee').value || null, due_date: document.getElementById('detail-due_date').value || null, status: activeStatus };
+    const data = { title: task?.title, description: document.getElementById('detail-description').value || null, assignee: document.getElementById('detail-assignee').value || null, due_date: document.getElementById('detail-due_date').value || null, status: activeStatus, execution_type: document.getElementById('detail-execution_type').value || null };
     try {
         const r = await fetch(API_BASE + '/tasks/' + detailTaskId, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
         if (!r.ok) throw new Error('save failed');

@@ -63,6 +63,12 @@ All notable changes to this project will be documented in this file.
 - Google SA credentials folder git-untracked and excluded via `.gitignore`
 - Confidential memory files (`seo-context.md`, `seo-strategy.md`, `seo-changes.json`, `seo-learnings.json`) added to `.gitignore`
 
+## [1.9.0] - 2026-04-09
+
+### Added
+- **Execution type now editable on existing tasks** — the task detail modal includes an "Execution Type" dropdown, allowing users to change a task's type after creation. Change is saved via the existing `PATCH /tasks/{id}` endpoint and the Execute button updates accordingly.
+- **Mandatory brand voice check before all content-writing executions** — `build_execution_prompt` now injects a hard-coded first step for all execution types except `manual` and `webflow_publish`: the agent must invoke the `brand-voice` skill and internalize its guidelines before producing any copy. Applies to: `rewrite_title`, `rewrite_meta_desc`, `rewrite_h1`, `blog_write`, `rewrite_blog_content`, `internal_links`, `research`, `alt_text`, `update_schema`, `seo_impact_review`.
+
 ## [1.8.0] - 2026-03-19
 
 ### Added
