@@ -1,7 +1,6 @@
 """Tests for execution prompt structure and fallback behavior."""
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
 
 from agent.api.main import build_execution_prompt
 
@@ -17,11 +16,6 @@ def _task(execution_type="rewrite_title"):
 
 def _comment(body="Keep it concise", author="user"):
     return SimpleNamespace(author=author, body=body)
-
-
-def _mock_config(site_name="TestSite", site_url="https://testsite.example.com"):
-    """Return a minimal AgentConfig-like namespace for prompt substitution tests."""
-    return SimpleNamespace(site_name=site_name, site_url=site_url)
 
 
 class TestUserCommentsInPrompt:
@@ -51,97 +45,53 @@ class TestUserCommentsInPrompt:
         prompt = build_execution_prompt(_task(), comments=None)
         assert "User Notes" not in prompt
 
+    def test_execute_endpoint_includes_comments_in_prompt(self, client, monkeypatch):
+        """Integration: execute_task passes comments to build_execution_prompt."""
+        from unittest.mock import AsyncMock, patch, call
+        task = client.post("/tasks", json={"title": "Blog post", "execution_type": "blog_write"}).json()
+        client.post(f"/tasks/{task['id']}/comments", json={"author": "user", "body": "Use casual tone"})
 
-class TestPromptSiteNameSubstitution:
-    """Test that site_name and site_url are substituted from config param."""
+        config_patch = patch(
+            "agent.config.AgentConfig.from_env",
+            return_value=SimpleNamespace(cwd="", setting_sources=[], system_prompt=""),
+        )
+        run_mock = AsyncMock(return_value="done")
+        run_patch = patch("agent.seo_agent.SEOAgent.create_and_run", new=run_mock)
+        with config_patch, run_patch:
+            client.post(f"/tasks/{task['id']}/execute")
 
-    def test_build_execution_prompt_accepts_config_param(self):
-        """Config param controls site_name substitution in all prompt branches."""
-        config = _mock_config(site_name="AcmeCorp", site_url="https://acme.example.com")
-        prompt = build_execution_prompt(_task("blog_write"), config=config)
-        assert "AcmeCorp" in prompt
-
-    def test_rewrite_title_uses_site_name(self):
-        config = _mock_config(site_name="PortfolioSite")
-        prompt = build_execution_prompt(_task("rewrite_title"), config=config)
-        assert "PortfolioSite" in prompt
-
-    def test_blog_write_uses_site_url(self):
-        config = _mock_config(site_url="https://demo.example.com")
-        prompt = build_execution_prompt(_task("blog_write"), config=config)
-        assert "demo.example.com" in prompt
-
-    def test_research_uses_site_url(self):
-        config = _mock_config(site_url="https://mysite.example.com")
-        prompt = build_execution_prompt(_task("research"), config=config)
-        assert "mysite.example.com" in prompt
-
-    def test_rewrite_meta_desc_has_no_webflow_steps(self):
-        config = _mock_config()
-        prompt = build_execution_prompt(_task("rewrite_meta_desc"), config=config)
-        # Webflow-specific instructions must not appear
-        assert "mcp__webflow__" not in prompt
-        assert "Webflow Designer" not in prompt
-
-    def test_rewrite_h1_has_no_webflow_steps(self):
-        config = _mock_config()
-        prompt = build_execution_prompt(_task("rewrite_h1"), config=config)
-        assert "mcp__webflow__" not in prompt
-
-    def test_blog_write_has_no_webflow_steps(self):
-        config = _mock_config()
-        prompt = build_execution_prompt(_task("blog_write"), config=config)
-        assert "mcp__webflow__" not in prompt
-
-    def test_update_schema_has_no_webflow_steps(self):
-        config = _mock_config()
-        prompt = build_execution_prompt(_task("update_schema"), config=config)
-        assert "mcp__webflow__" not in prompt
-
-    def test_alt_text_has_no_webflow_steps(self):
-        config = _mock_config()
-        prompt = build_execution_prompt(_task("alt_text"), config=config)
-        assert "mcp__webflow__" not in prompt
-
-    def test_internal_links_has_no_webflow_steps(self):
-        config = _mock_config()
-        prompt = build_execution_prompt(_task("internal_links"), config=config)
-        assert "mcp__webflow__" not in prompt
+        assert run_mock.called, "Agent was not called"
+        prompt_used = run_mock.call_args.args[0]
+        assert "Use casual tone" in prompt_used
 
 
-class TestPromptStructure:
-    """Test that key workflow sections are present in prompts."""
+class TestWebflowPromptFallbackOrder:
+    def _task(self, execution_type: str):
+        return SimpleNamespace(
+            title="Test task",
+            description="Task details",
+            execution_type=execution_type,
+            notes=None,
+        )
 
-    def test_rewrite_title_has_keyword_research_step(self):
-        prompt = build_execution_prompt(_task("rewrite_title"))
-        assert "Keyword research" in prompt
+    def test_rewrite_h1_prompt_prioritizes_draft_before_webflow(self, monkeypatch):
+        monkeypatch.delenv("WEBFLOW_ACCESS_TOKEN", raising=False)
+        prompt = build_execution_prompt(self._task("rewrite_h1"))
 
-    def test_rewrite_title_has_finalize_step(self):
-        prompt = build_execution_prompt(_task("rewrite_title"))
-        assert "Finalize draft" in prompt
+        assert "Step 4 — Finalize draft for manual use" in prompt
+        assert "Step 5 — Optional Webflow update" in prompt
+        assert prompt.index("Step 4 — Finalize draft for manual use") < prompt.index("Step 5 — Optional Webflow update")
 
-    def test_rewrite_h1_has_fetch_step(self):
-        prompt = build_execution_prompt(_task("rewrite_h1"))
-        assert "Fetch the current page" in prompt
+    def test_rewrite_title_prompt_prioritizes_draft_before_webflow(self, monkeypatch):
+        monkeypatch.delenv("WEBFLOW_ACCESS_TOKEN", raising=False)
+        prompt = build_execution_prompt(self._task("rewrite_title"))
 
-    def test_blog_write_has_outline_step(self):
-        prompt = build_execution_prompt(_task("blog_write"))
-        assert "Outline" in prompt
+        assert "Step 3 — Finalize draft for manual use" in prompt
+        assert "Step 4 — Optional Webflow update" in prompt
 
-    def test_research_type_has_synthesize_step(self):
-        prompt = build_execution_prompt(_task("research"))
-        assert "Synthesize findings" in prompt
+    def test_blog_write_prompt_has_manual_publishable_output(self, monkeypatch):
+        monkeypatch.delenv("WEBFLOW_ACCESS_TOKEN", raising=False)
+        prompt = build_execution_prompt(self._task("blog_write"))
 
-    def test_alt_text_has_categorization(self):
-        prompt = build_execution_prompt(_task("alt_text"))
-        assert "logos" in prompt.lower() or "alt text" in prompt.lower()
-
-    def test_update_schema_has_json_ld_mention(self):
-        prompt = build_execution_prompt(_task("update_schema"))
-        assert "JSON-LD" in prompt
-
-    def test_unknown_type_returns_task_title(self):
-        task = _task("unknown_type")
-        task.title = "My custom task"
-        prompt = build_execution_prompt(task)
-        assert "My custom task" in prompt
+        assert "Step 4 — Finalize draft for manual publishing" in prompt
+        assert "Step 5 — Optional Webflow create" in prompt

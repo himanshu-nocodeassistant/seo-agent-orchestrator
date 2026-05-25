@@ -178,10 +178,9 @@ The agent can create and manage Google Docs for SEO audit reports, blog content,
 
 ### Environment Variables
 ```bash
-# Place your service account JSON in a folder and reference it here
-GOOGLE_DOCS_CREDENTIALS_PATH=Google SA Credentials/your-service-account.json
+GOOGLE_DOCS_CREDENTIALS_PATH=Google SA Credentials/tinyclaw-487419-d5ab318833bb.json
 # OR use the standard Google application credentials path:
-GOOGLE_APPLICATION_CREDENTIALS=Google SA Credentials/your-service-account.json
+GOOGLE_APPLICATION_CREDENTIALS=Google SA Credentials/tinyclaw-487419-d5ab318833bb.json
 ```
 
 ### Programmatic Configuration
@@ -190,7 +189,7 @@ from agent import AgentConfig, GoogleDocsConfig
 
 config = AgentConfig(
     google_docs_config=GoogleDocsConfig(
-        credentials_path="Google SA Credentials/your-service-account.json"
+        credentials_path="Google SA Credentials/tinyclaw-487419-d5ab318833bb.json"
     )
 )
 ```

@@ -29,9 +29,8 @@ class GoogleDocsConfig:
         # Convert string to Path if needed
         if isinstance(self.credentials_path, str):
             self.credentials_path = Path(self.credentials_path)
-
-    def validate(self) -> None:
-        """Raise FileNotFoundError if the credentials file is missing. Call before actual API use."""
+        
+        # Validate credentials file exists
         if not self.credentials_path.exists():
             raise FileNotFoundError(
                 f"Google Docs credentials file not found: {self.credentials_path}"

@@ -6,16 +6,19 @@ how the SEO agent operates, including model selection,
 permissions, and working directory.
 """
 
-import os
-import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
-from agent.retry import RetryConfig
+import os
+
+
+# Claude Code CLI path - uses OAuth via Claude Code
+CLAUDE_CLI_PATH = "/Users/himanshusharma/.npm-global/bin/claude"
 
 # Import config types only for type hints
 if TYPE_CHECKING:
+    from .webflow import WebflowConfig
     from .google_docs import GoogleDocsConfig
 
 
@@ -25,6 +28,9 @@ class AgentConfig:
 
     # Working directory for the agent
     cwd: str = str(Path(__file__).parent.parent)
+
+    # Claude CLI path - uses OAuth via Claude Code (no API key needed)
+    cli_path: str = CLAUDE_CLI_PATH
 
     # Model to use (default, sonnet, opus, haiku)
     # Use "default" for Claude Code's default model
@@ -57,43 +63,54 @@ class AgentConfig:
     # Custom system prompt
     system_prompt: Optional[str] = None
 
+    # Webflow CMS configuration (optional)
+    webflow_config: Optional["WebflowConfig"] = None
+
     # Google Docs configuration (optional)
     google_docs_config: Optional["GoogleDocsConfig"] = None
 
     # MCP servers dict for Claude Agent SDK
     mcp_servers: dict = field(default_factory=dict)
 
-    # Target site URL (used in prompts and orchestration)
-    site_url: str = field(default_factory=lambda: os.environ.get("TARGET_SITE_URL", "https://example.com"))
-
-    # Target site name (used in prompts and orchestration)
-    site_name: str = field(default_factory=lambda: os.environ.get("TARGET_SITE_NAME", "My Site"))
-
-    # Retry configuration for failed tool calls
-    retry_config: RetryConfig = field(default_factory=RetryConfig)
-
-    # Enable supervisor logging (Phase 1)
-    enable_supervisor_logging: bool = field(default_factory=lambda: os.environ.get("SUPERVISOR_LOGGING", "true").lower() == "true")
-
-    # Enable validation layer (Phase 3)
-    enable_validation: bool = True
-
-    # Validation score threshold (0.0 - 1.0)
-    validation_threshold: float = 0.7
-
     def __post_init__(self):
         """Set defaults after initialization."""
-        # Resolve Claude CLI path — CLAUDE_CLI_PATH env var overrides, then shutil.which
-        cli_path = os.environ.get("CLAUDE_CLI_PATH") or shutil.which("claude")
-        if not cli_path or not Path(cli_path).exists():
+        # Verify CLI path exists
+        if not Path(self.cli_path).exists():
             raise FileNotFoundError(
-                "Claude CLI not found. Set CLAUDE_CLI_PATH or ensure 'claude' is on PATH. "
-                "Install with: npm install -g @anthropic-ai/claude-code"
+                f"Claude CLI not found at {self.cli_path}. "
+                "Please install Claude Code: npm install -g @anthropic-ai/claude-code"
             )
+
+        # Auto-configure Webflow MCP server if config is provided
+        if self.webflow_config is not None:
+            self._setup_webflow_mcp()
 
         # Auto-configure Google Docs MCP server if config is provided
         if self.google_docs_config is not None:
             self._setup_google_docs_mcp()
+
+    def _setup_webflow_mcp(self):
+        """Set up Webflow MCP server from config."""
+        from .webflow import create_webflow_server
+
+        # Create MCP server from Webflow config
+        webflow_server = create_webflow_server(self.webflow_config)
+
+        # Add to MCP servers dict
+        self.mcp_servers["webflow"] = webflow_server
+
+        # Add Webflow tools to allowed tools
+        webflow_tool_names = [
+            "mcp__webflow__list_cms_items",
+            "mcp__webflow__get_cms_item",
+            "mcp__webflow__create_cms_item",
+            "mcp__webflow__update_cms_item",
+            "mcp__webflow__publish_cms_item",
+            "mcp__webflow__get_collection_info",
+        ]
+        for tool_name in webflow_tool_names:
+            if tool_name not in self.allowed_tools:
+                self.allowed_tools.append(tool_name)
 
     def _setup_google_docs_mcp(self):
         """Set up Google Docs MCP server from config."""
@@ -122,15 +139,21 @@ class AgentConfig:
         Create AgentConfig from environment variables.
 
         Environment variables:
+        - WEBFLOW_ACCESS_TOKEN: Webflow API token
+        - WEBFLOW_SITE_ID: Webflow site ID
+        - WEBFLOW_COLLECTION_ID: Webflow collection ID
         - GOOGLE_DOCS_CREDENTIALS_PATH: Path to Google service account credentials
         - GOOGLE_APPLICATION_CREDENTIALS: Alternative credentials path
-        - TARGET_SITE_URL: Target site URL for prompts (default: https://example.com)
-        - TARGET_SITE_NAME: Target site name for prompts (default: My Site)
-        - CLAUDE_CLI_PATH: Optional override for Claude CLI binary location
 
         Returns:
             AgentConfig instance with integrations configured if env vars present
         """
+        # Check for Webflow env vars
+        webflow_config = None
+        if os.environ.get("WEBFLOW_ACCESS_TOKEN"):
+            from .webflow import WebflowConfig
+            webflow_config = WebflowConfig.from_env()
+
         # Check for Google Docs env vars
         google_docs_config = None
         if os.environ.get("GOOGLE_DOCS_CREDENTIALS_PATH") or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
@@ -138,12 +161,6 @@ class AgentConfig:
             google_docs_config = GoogleDocsConfig.from_env()
 
         return cls(
+            webflow_config=webflow_config,
             google_docs_config=google_docs_config,
-            retry_config=RetryConfig(
-                max_attempts=int(os.environ.get("RETRY_MAX_ATTEMPTS", "3")),
-                initial_delay_ms=int(os.environ.get("RETRY_INITIAL_DELAY_MS", "1000")),
-                max_delay_ms=int(os.environ.get("RETRY_MAX_DELAY_MS", "10000")),
-                backoff_multiplier=float(os.environ.get("RETRY_BACKOFF_MULTIPLIER", "2.0")),
-            ),
-            enable_supervisor_logging=os.environ.get("SUPERVISOR_LOGGING", "true").lower() == "true",
         )

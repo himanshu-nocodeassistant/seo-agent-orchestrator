@@ -527,48 +527,174 @@ class TestEdgeCases:
 
 
 # ============================================================================
-# TEST 6: AGENT CONFIG — NO MCP SERVERS BY DEFAULT
+# TEST 6: WEBFLOW INTEGRATION
 # ============================================================================
 
-class TestAgentConfigNoMcpServersByDefault:
-    """Test that AgentConfig has no MCP servers by default (Webflow removed)."""
-
-    def test_agent_config_has_no_mcp_servers_by_default(self):
-        """AgentConfig has no MCP servers unless google_docs_config is provided."""
-        config = AgentConfig()
-        assert config.mcp_servers == {}
-
-    def test_agent_config_from_env_no_mcp_servers(self, monkeypatch):
-        """AgentConfig.from_env without any integration env vars has empty mcp_servers."""
+class TestWebflowIntegration:
+    """Test Webflow CMS integration."""
+    
+    def test_webflow_config_from_env_missing_token(self, monkeypatch):
+        """Test WebflowConfig returns None when token is missing."""
         monkeypatch.delenv("WEBFLOW_ACCESS_TOKEN", raising=False)
-        monkeypatch.delenv("GOOGLE_DOCS_CREDENTIALS_PATH", raising=False)
-        monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
-        config = AgentConfig.from_env()
+        monkeypatch.delenv("WEBFLOW_SITE_ID", raising=False)
+        monkeypatch.delenv("WEBFLOW_COLLECTION_ID", raising=False)
+        
+        from agent.webflow import WebflowConfig
+        config = WebflowConfig.from_env()
+        
+        assert config is None
+    
+    def test_webflow_config_from_env_missing_site_id(self, monkeypatch):
+        """Test WebflowConfig returns None when site_id is missing."""
+        monkeypatch.setenv("WEBFLOW_ACCESS_TOKEN", "test_token")
+        monkeypatch.delenv("WEBFLOW_SITE_ID", raising=False)
+        monkeypatch.delenv("WEBFLOW_COLLECTION_ID", raising=False)
+        
+        from agent.webflow import WebflowConfig
+        config = WebflowConfig.from_env()
+        
+        assert config is None
+    
+    def test_webflow_config_from_env_missing_collection_id(self, monkeypatch):
+        """Test WebflowConfig returns None when collection_id is missing."""
+        monkeypatch.setenv("WEBFLOW_ACCESS_TOKEN", "test_token")
+        monkeypatch.setenv("WEBFLOW_SITE_ID", "test_site")
+        monkeypatch.delenv("WEBFLOW_COLLECTION_ID", raising=False)
+        
+        from agent.webflow import WebflowConfig
+        config = WebflowConfig.from_env()
+        
+        assert config is None
+    
+    def test_webflow_config_from_env_all_present(self, monkeypatch):
+        """Test WebflowConfig creates successfully with all env vars."""
+        monkeypatch.setenv("WEBFLOW_ACCESS_TOKEN", "test_token_123")
+        monkeypatch.setenv("WEBFLOW_SITE_ID", "test_site_456")
+        monkeypatch.setenv("WEBFLOW_COLLECTION_ID", "test_collection_789")
+        
+        from agent.webflow import WebflowConfig
+        config = WebflowConfig.from_env()
+        
+        assert config is not None
+        assert config.access_token == "test_token_123"
+        assert config.site_id == "test_site_456"
+        assert config.collection_id == "test_collection_789"
+    
+    def test_webflow_config_credentials_not_logged(self, monkeypatch, capsys):
+        """Test that credentials are not exposed in logs."""
+        import logging
+        logging.basicConfig(level=logging.DEBUG)
+        
+        monkeypatch.setenv("WEBFLOW_ACCESS_TOKEN", "secret_token_abc123")
+        monkeypatch.setenv("WEBFLOW_SITE_ID", "site_id_xyz")
+        monkeypatch.setenv("WEBFLOW_COLLECTION_ID", "collection_id_123")
+        
+        from agent.webflow import WebflowConfig
+        config = WebflowConfig.from_env()
+        
+        # Access token should be in the config object
+        assert config.access_token == "secret_token_abc123"
+        
+        # Check that token isn't in string representation
+        config_str = str(config)
+        assert "secret_token" not in config_str
+    
+    def test_webflow_config_masked_in_repr(self):
+        """Test that sensitive data is masked in repr."""
+        from agent.webflow import WebflowConfig
+        
+        config = WebflowConfig(
+            access_token="my_secret_token",
+            site_id="site123",
+            collection_id="collection456"
+        )
+        
+        repr_str = repr(config)
+        
+        # Token should be masked
+        assert "my_secret_token" not in repr_str
+        assert config.access_token == "my_secret_token"  # But still accessible
+    
+    def test_agent_config_webflow_none_by_default(self):
+        """Test that AgentConfig has no Webflow by default."""
+        config = AgentConfig()
+        
+        assert config.webflow_config is None
         assert config.mcp_servers == {}
-
-    def test_agent_config_site_url_from_env(self, monkeypatch):
-        """AgentConfig reads TARGET_SITE_URL from environment."""
-        monkeypatch.setenv("TARGET_SITE_URL", "https://my-demo-site.example.com")
+    
+    def test_agent_config_from_env_no_webflow(self, monkeypatch):
+        """Test AgentConfig.from_env without Webflow env vars."""
+        monkeypatch.delenv("WEBFLOW_ACCESS_TOKEN", raising=False)
+        monkeypatch.delenv("WEBFLOW_SITE_ID", raising=False)
+        monkeypatch.delenv("WEBFLOW_COLLECTION_ID", raising=False)
+        
         config = AgentConfig.from_env()
-        assert config.site_url == "https://my-demo-site.example.com"
-
-    def test_agent_config_site_name_from_env(self, monkeypatch):
-        """AgentConfig reads TARGET_SITE_NAME from environment."""
-        monkeypatch.setenv("TARGET_SITE_NAME", "Demo Portfolio Site")
+        
+        assert config.webflow_config is None
+    
+    def test_agent_config_from_env_with_webflow(self, monkeypatch):
+        """Test AgentConfig.from_env with Webflow env vars."""
+        monkeypatch.setenv("WEBFLOW_ACCESS_TOKEN", "env_token")
+        monkeypatch.setenv("WEBFLOW_SITE_ID", "env_site")
+        monkeypatch.setenv("WEBFLOW_COLLECTION_ID", "env_collection")
+        
         config = AgentConfig.from_env()
-        assert config.site_name == "Demo Portfolio Site"
-
-    def test_agent_config_site_url_default(self, monkeypatch):
-        """AgentConfig uses 'https://example.com' default when env var not set."""
-        monkeypatch.delenv("TARGET_SITE_URL", raising=False)
+        
+        assert config.webflow_config is not None
+        assert config.webflow_config.access_token == "env_token"
+    
+    def test_webflow_mcp_server_created(self, monkeypatch):
+        """Test that Webflow MCP server is created when config provided."""
+        monkeypatch.setenv("WEBFLOW_ACCESS_TOKEN", "test_token")
+        monkeypatch.setenv("WEBFLOW_SITE_ID", "test_site")
+        monkeypatch.setenv("WEBFLOW_COLLECTION_ID", "test_collection")
+        
         config = AgentConfig.from_env()
-        assert config.site_url == "https://example.com"
-
-    def test_agent_config_site_name_default(self, monkeypatch):
-        """AgentConfig uses 'My Site' default when env var not set."""
-        monkeypatch.delenv("TARGET_SITE_NAME", raising=False)
+        
+        # MCP server should be set up
+        assert "webflow" in config.mcp_servers
+        assert len(config.mcp_servers) > 0
+    
+    def test_webflow_tools_added_to_allowed_tools(self, monkeypatch):
+        """Test that Webflow tools are added to allowed_tools."""
+        monkeypatch.setenv("WEBFLOW_ACCESS_TOKEN", "test_token")
+        monkeypatch.setenv("WEBFLOW_SITE_ID", "test_site")
+        monkeypatch.setenv("WEBFLOW_COLLECTION_ID", "test_collection")
+        
         config = AgentConfig.from_env()
-        assert config.site_name == "My Site"
+        
+        # Check Webflow tool names are in allowed_tools
+        webflow_tools = [t for t in config.allowed_tools if "webflow" in t]
+        assert len(webflow_tools) >= 6  # All 6 tools should be added
+    
+    def test_webflow_client_initialization(self):
+        """Test WebflowAPIClient can be initialized."""
+        from agent.webflow import WebflowConfig, WebflowAPIClient
+        
+        config = WebflowConfig(
+            access_token="test_token",
+            site_id="test_site",
+            collection_id="test_collection"
+        )
+        
+        client = WebflowAPIClient(config)
+        
+        assert client.config == config
+        assert client._session is None  # Not created until used
+    
+    @pytest.mark.asyncio
+    async def test_webflow_client_close(self):
+        """Test WebflowAPIClient cleanup."""
+        from agent.webflow import WebflowConfig, WebflowAPIClient
+        
+        config = WebflowConfig(
+            access_token="test_token",
+            site_id="test_site",
+            collection_id="test_collection"
+        )
+        
+        client = WebflowAPIClient(config)
+        await client.close()  # Should not raise
 
 
 # ============================================================================
