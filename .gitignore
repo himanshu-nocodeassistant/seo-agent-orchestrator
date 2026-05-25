@@ -38,3 +38,22 @@ Thumbs.db
 
 # Claude
 .claude/backups/
+
+# Google service account credentials (never commit — add your own .json file)
+Google\ SA\ Credentials/
+*.json.credentials
+
+# Local memory files with site-specific content (confidential)
+memory/seo-context.md
+memory/seo-strategy.md
+memory/seo-changes.json
+memory/seo-learnings.json
+memory/gsc-index-snapshot.json
+memory/seo-tasks.md
+.claude/seo-changes-log.md
+.claude/seo-learnings.md
+
+# Databases
+*.db
+!kanban.db
+!kanban.staging.db

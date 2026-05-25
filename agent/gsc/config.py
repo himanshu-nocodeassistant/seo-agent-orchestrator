@@ -15,8 +15,8 @@ class GoogleSearchConsoleConfig:
     credentials_path: Path
 
     # Must exactly match the property registered in Search Console.
-    # Domain property:  "sc-domain:nocodeassistant.agency"
-    # URL-prefix:       "https://www.nocodeassistant.agency/"
+    # Domain property:  "sc-domain:example.com"
+    # URL-prefix:       "https://www.example.com/"
     site_url: str
 
     app_name: str = "SEO-Agent"

@@ -124,10 +124,18 @@ class TestGetPageMetricsRange:
 # URL Inspection tests
 # ---------------------------------------------------------------------------
 
+def _make_inspection_response(inspection_result):
+    """Build a mock discovery service that returns the given inspection result."""
+    svc = MagicMock()
+    svc.urlInspection().index().inspect().execute.return_value = {
+        "inspectionResult": inspection_result
+    }
+    return svc
+
+
 class TestInspectUrl:
     def test_indexed_page(self):
-        client = _make_client()
-        _mock_searchconsole_service(client, {
+        inspection_result = {
             "indexStatusResult": {
                 "verdict": "PASS",
                 "coverageState": "Submitted and indexed",
@@ -142,8 +150,11 @@ class TestInspectUrl:
             },
             "mobileUsabilityResult": {"verdict": "PASS"},
             "richResultsResult": {"verdict": "VERDICT_UNSPECIFIED"},
-        })
-        result = run(client.inspect_url("https://nocodeassistant.agency/weweb-agency"))
+        }
+        client = _make_client()
+        with patch("agent.gsc.client.discovery.build", return_value=_make_inspection_response(inspection_result)), \
+             patch("agent.gsc.client.service_account.Credentials.from_service_account_file"):
+            result = run(client.inspect_url("https://nocodeassistant.agency/weweb-agency"))
         assert result["is_indexed"] is True
         assert result["verdict"] == "PASS"
         assert result["coverage_state"] == "Submitted and indexed"
@@ -151,8 +162,7 @@ class TestInspectUrl:
         assert result["mobile_usability_verdict"] == "PASS"
 
     def test_not_indexed_page(self):
-        client = _make_client()
-        _mock_searchconsole_service(client, {
+        inspection_result = {
             "indexStatusResult": {
                 "verdict": "NEUTRAL",
                 "coverageState": "Crawled - currently not indexed",
@@ -163,20 +173,24 @@ class TestInspectUrl:
             },
             "mobileUsabilityResult": {},
             "richResultsResult": {},
-        })
-        result = run(client.inspect_url("https://nocodeassistant.agency/some-page"))
+        }
+        client = _make_client()
+        with patch("agent.gsc.client.discovery.build", return_value=_make_inspection_response(inspection_result)), \
+             patch("agent.gsc.client.service_account.Credentials.from_service_account_file"):
+            result = run(client.inspect_url("https://nocodeassistant.agency/some-page"))
         assert result["is_indexed"] is False
         assert result["verdict"] == "NEUTRAL"
         assert result["coverage_state"] == "Crawled - currently not indexed"
 
     def test_raises_on_api_error(self):
         from agent.gsc.client import GoogleSearchConsoleError
+        svc = MagicMock()
+        svc.urlInspection().index().inspect().execute.side_effect = Exception("403 Forbidden")
         client = _make_client()
-        service = MagicMock()
-        service.urlInspection().index().inspect().execute.side_effect = Exception("403 Forbidden")
-        client._searchconsole_service = service
-        with pytest.raises(GoogleSearchConsoleError, match="403 Forbidden"):
-            run(client.inspect_url("https://nocodeassistant.agency/"))
+        with patch("agent.gsc.client.discovery.build", return_value=svc), \
+             patch("agent.gsc.client.service_account.Credentials.from_service_account_file"):
+            with pytest.raises(GoogleSearchConsoleError, match="403 Forbidden"):
+                run(client.inspect_url("https://nocodeassistant.agency/"))
 
 
 class TestInspectUrls:

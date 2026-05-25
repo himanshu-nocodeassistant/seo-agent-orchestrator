@@ -51,6 +51,8 @@ class GoogleDocsAPIClient:
             Google Docs service instance
         """
         if self._service is None:
+            # Validate credentials file exists before attempting to load
+            self.config.validate()
             # Load credentials from service account JSON file
             credentials = service_account.Credentials.from_service_account_file(
                 str(self.config.credentials_path),

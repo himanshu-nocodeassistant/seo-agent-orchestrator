@@ -8,7 +8,9 @@ Wraps two GSC APIs:
 NOTE: This client is intentionally read-only. No write methods are provided.
 """
 
+import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from typing import Any, Optional
 
@@ -16,6 +18,9 @@ from google.oauth2 import service_account
 from googleapiclient import discovery
 
 from .config import GoogleSearchConsoleConfig
+
+# Thread pool for running blocking Google API calls without blocking the event loop
+_executor = ThreadPoolExecutor(max_workers=10)
 
 logger = logging.getLogger(__name__)
 
@@ -216,12 +221,21 @@ class GoogleSearchConsoleClient:
             "siteUrl": self.config.site_url,
         }
         try:
-            response = (
-                service.urlInspection()
-                .index()
-                .inspect(body=body)
-                .execute()
-            )
+            loop = asyncio.get_event_loop()
+            creds_path = str(self.config.credentials_path)
+            site_url = self.config.site_url
+
+            def _call():
+                # Build a fresh service per call so concurrent threads don't share state
+                _creds = service_account.Credentials.from_service_account_file(
+                    creds_path, scopes=_GSC_SCOPES
+                )
+                _svc = discovery.build(
+                    "searchconsole", "v1", credentials=_creds, cache_discovery=False
+                )
+                return _svc.urlInspection().index().inspect(body=body).execute()
+
+            response = await loop.run_in_executor(_executor, _call)
         except Exception as exc:
             logger.error("GSC URL Inspection error for %s: %s", url, exc)
             raise GoogleSearchConsoleError(f"GSC URL Inspection error: {exc}") from exc
@@ -248,30 +262,34 @@ class GoogleSearchConsoleClient:
             "is_indexed": index_status.get("verdict") == "PASS",
         }
 
-    async def inspect_urls(self, urls: list[str]) -> list[dict[str, Any]]:
+    async def inspect_urls(self, urls: list[str], concurrency: int = 5) -> list[dict[str, Any]]:
         """
-        Inspect multiple URLs sequentially.
+        Inspect multiple URLs concurrently.
 
-        The URL Inspection API has a quota of 2,000 requests/day and does not
-        support batch requests, so we call inspect_url() in a loop.
+        The URL Inspection API has a quota of 2,000 requests/day. Concurrency is
+        capped at 5 by default to stay within rate limits while being fast enough
+        for bulk sitemap audits.
 
         Args:
-            urls: List of full page URLs to inspect.
+            urls:        List of full page URLs to inspect.
+            concurrency: Max parallel requests (default 5).
 
         Returns:
-            List of inspection result dicts (same shape as inspect_url()).
+            List of inspection result dicts in the same order as input.
             Failed individual URLs are returned with verdict=ERROR and an error key.
         """
-        results = []
-        for url in urls:
-            try:
-                result = await self.inspect_url(url)
-            except GoogleSearchConsoleError as exc:
-                result = {
-                    "url": url,
-                    "verdict": "ERROR",
-                    "is_indexed": False,
-                    "error": str(exc),
-                }
-            results.append(result)
-        return results
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def _inspect_one(url: str) -> dict[str, Any]:
+            async with semaphore:
+                try:
+                    return await self.inspect_url(url)
+                except GoogleSearchConsoleError as exc:
+                    return {
+                        "url": url,
+                        "verdict": "ERROR",
+                        "is_indexed": False,
+                        "error": str(exc),
+                    }
+
+        return list(await asyncio.gather(*[_inspect_one(u) for u in urls]))

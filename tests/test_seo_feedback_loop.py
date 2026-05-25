@@ -525,8 +525,8 @@ class TestExecuteTaskLogging:
         assert resp.status_code == 200
         task_id = resp.json()["id"]
 
-        # Mock agent to return valid structured output
-        with patch.object(main_module, "_run_agent_prompt",
+        # Mock orchestrator to return valid structured output
+        with patch.object(main_module, "_run_orchestrated_task",
                           new=AsyncMock(return_value=self.VALID_AGENT_OUTPUT)):
             exec_resp = client.post(f"/tasks/{task_id}/execute")
             assert exec_resp.status_code == 200
@@ -549,7 +549,7 @@ class TestExecuteTaskLogging:
         })
         task_id = resp.json()["id"]
 
-        with patch.object(main_module, "_run_agent_prompt",
+        with patch.object(main_module, "_run_orchestrated_task",
                           new=AsyncMock(return_value="Research complete.")):
             client.post(f"/tasks/{task_id}/execute")
 
@@ -569,7 +569,7 @@ class TestExecuteTaskLogging:
         task_id = resp.json()["id"]
 
         # Agent output with no CHANGE_LOG block
-        with patch.object(main_module, "_run_agent_prompt",
+        with patch.object(main_module, "_run_orchestrated_task",
                           new=AsyncMock(return_value="Done. New title: Bubble Agency | NCA")):
             exec_resp = client.post(f"/tasks/{task_id}/execute")
             assert exec_resp.status_code == 200
@@ -589,12 +589,16 @@ class TestExecuteTaskLogging:
 # ---------------------------------------------------------------------------
 
 class TestConstants:
-    def test_cms_change_field_map_covers_webflow_dependent_types(self):
+    def test_cms_change_field_map_covers_expected_types(self):
+        """All CMS-mutating execution types must be in CMS_CHANGE_FIELD_MAP."""
         targets = _import_targets()
         cms_map = targets["CMS_CHANGE_FIELD_MAP"]
-        from agent.api.main import WEBFLOW_DEPENDENT_TYPES
-        # Every webflow-dependent type should be in the CMS map
-        for t in WEBFLOW_DEPENDENT_TYPES:
+        # These types produce tracked changes and must appear in the map
+        expected_types = {
+            "rewrite_title", "rewrite_meta_desc", "rewrite_h1",
+            "blog_write", "rewrite_blog_content", "internal_links",
+        }
+        for t in expected_types:
             assert t in cms_map, f"{t} missing from CMS_CHANGE_FIELD_MAP"
 
     def test_valid_review_statuses_contains_all_outcomes(self):

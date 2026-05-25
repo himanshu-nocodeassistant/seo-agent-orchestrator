@@ -14,6 +14,9 @@ from pathlib import Path
 from typing import Mapping, Optional
 from uuid import uuid4
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
@@ -31,13 +34,7 @@ from sqlalchemy.orm import sessionmaker
 EXECUTABLE_TYPES = {
     "research", "rewrite_title", "rewrite_meta_desc", "rewrite_h1",
     "update_schema", "blog_write", "rewrite_blog_content",
-    "webflow_publish", "internal_links", "alt_text", "seo_impact_review",
-}
-
-# Execution types that require Webflow CMS API access
-WEBFLOW_DEPENDENT_TYPES = {
-    "rewrite_title", "rewrite_meta_desc", "rewrite_h1",
-    "blog_write", "rewrite_blog_content", "webflow_publish", "internal_links",
+    "internal_links", "alt_text", "seo_impact_review",
 }
 
 # Single registry: execution types that mutate live CMS content and should be change-logged.
@@ -48,7 +45,6 @@ CMS_CHANGE_FIELD_MAP = {
     "rewrite_h1":           "heading structure",
     "blog_write":           "content",
     "rewrite_blog_content": "content",
-    "webflow_publish":      "publish",
     "internal_links":       "internal linking",
 }
 
@@ -415,14 +411,14 @@ def _agent_execution_timeout_seconds() -> int:
 
 
 async def _run_agent_prompt(prompt: str) -> str:
-    """Execute a prompt via SEOAgent using the same runtime config as task execution."""
+    """Execute a freeform prompt via SEOAgent (used by comment autopilot)."""
     from agent.seo_agent import SEOAgent
     from agent.config import AgentConfig
 
     os.environ.pop("CLAUDECODE", None)
 
     config = AgentConfig.from_env()
-    config.cwd = "/Users/himanshusharma/Code/Codex/seo-bot"
+    config.cwd = str(Path(__file__).parent.parent.parent)
     config.setting_sources = []
     config.system_prompt = (
         "You are an autonomous SEO agent. Execute the given task completely "
@@ -434,6 +430,39 @@ async def _run_agent_prompt(prompt: str) -> str:
         return await asyncio.wait_for(SEOAgent.create_and_run(prompt, config), timeout=timeout)
     except asyncio.TimeoutError as e:
         raise RuntimeError(f"Agent execution timed out after {timeout}s") from e
+    except BaseException as e:
+        # Python 3.11+ TaskGroup wraps sub-exceptions in ExceptionGroup — unwrap to expose root cause
+        if isinstance(e, BaseExceptionGroup) and e.exceptions:
+            sub = e.exceptions[0]
+            raise RuntimeError(f"Agent error: {type(sub).__name__}: {sub}") from sub
+        raise
+
+
+async def _run_orchestrated_task(task, db, task_comments) -> str:
+    """Execute a task via OrchestratorAgent with specialist routing and progress comments."""
+    from agent.config import AgentConfig
+    from agent.orchestrator import OrchestratorAgent
+
+    os.environ.pop("CLAUDECODE", None)
+
+    config = AgentConfig.from_env()
+    config.cwd = str(Path(__file__).parent.parent.parent)
+    config.setting_sources = []
+
+    def add_comment(body: str) -> None:
+        add_task_comment(db, task.id, body, "agent")
+
+    orchestrator = OrchestratorAgent(config, add_comment)
+    timeout = _agent_execution_timeout_seconds()
+    try:
+        return await asyncio.wait_for(orchestrator.run(task, task_comments), timeout=timeout)
+    except asyncio.TimeoutError as e:
+        raise RuntimeError(f"Agent execution timed out after {timeout}s") from e
+    except BaseException as e:
+        if isinstance(e, BaseExceptionGroup) and e.exceptions:
+            sub = e.exceptions[0]
+            raise RuntimeError(f"Agent error: {type(sub).__name__}: {sub}") from sub
+        raise
 
 
 def _task_response(task) -> dict:
@@ -663,7 +692,7 @@ async def get_gsc_page_metrics(url: str, change_date: str):
     Fetch before/after GSC Search Analytics metrics for a URL around a change date.
 
     Query params:
-        url:         Full page URL (e.g. https://www.nocodeassistant.agency/weweb-agency)
+        url:         Full page URL (e.g. https://www.example.com/page)
         change_date: ISO date of the SEO change (e.g. 2026-03-06)
 
     Returns JSON with before/after clicks, impressions, CTR, position and computed deltas.
@@ -692,6 +721,131 @@ async def inspect_url(url: str):
         return await client.inspect_url(url)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/gsc/index-audit")
+async def gsc_index_audit(sitemap_url: str = ""):
+    """
+    Fetch all URLs from a sitemap and check their indexing status in GSC.
+
+    Deduplicates URLs, normalises to trailing-slash canonical form, then inspects
+    each one via the URL Inspection API. Returns a grouped report with:
+      - indexed: PASS in GSC
+      - not_indexed: crawled but not indexed (thin content / quality signal)
+      - redirect: non-canonical URL redirecting elsewhere
+      - unknown: not yet seen by Google
+      - errors: API failures
+
+    Query params:
+        sitemap_url: Sitemap XML URL. Falls back to TARGET_SITEMAP_URL env var if not provided.
+    """
+    import xml.etree.ElementTree as ET
+    import httpx
+
+    # Resolve sitemap URL: query param → env var → 400 error
+    resolved_sitemap_url = sitemap_url or os.environ.get("TARGET_SITEMAP_URL", "")
+    if not resolved_sitemap_url:
+        raise HTTPException(
+            status_code=400,
+            detail="sitemap_url query parameter is required (or set TARGET_SITEMAP_URL env var).",
+        )
+
+    client = _gsc_client_or_503()
+
+    # Fetch and parse sitemap
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=15) as http:
+            resp = await http.get(resolved_sitemap_url)
+            resp.raise_for_status()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch sitemap: {exc}")
+
+    try:
+        root = ET.fromstring(resp.text)
+        ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+        # Handle sitemap index (sitemap of sitemaps)
+        sitemap_locs = root.findall("sm:sitemap/sm:loc", ns)
+        if sitemap_locs:
+            # Fetch first-level child sitemaps and collect all URLs
+            all_urls: list[str] = []
+            async with httpx.AsyncClient(follow_redirects=True, timeout=15) as http:
+                for loc in sitemap_locs:
+                    try:
+                        child_resp = await http.get(loc.text.strip())
+                        child_root = ET.fromstring(child_resp.text)
+                        for url_el in child_root.findall("sm:url/sm:loc", ns):
+                            all_urls.append(url_el.text.strip())
+                    except Exception:
+                        continue
+        else:
+            all_urls = [el.text.strip() for el in root.findall("sm:url/sm:loc", ns)]
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to parse sitemap: {exc}")
+
+    if not all_urls:
+        raise HTTPException(status_code=404, detail="No URLs found in sitemap.")
+
+    resolved_sitemap_url = resolved_sitemap_url  # used in return value below
+
+    # Deduplicate, strip anchors, and separate en (primary) from i18n URLs
+    seen: set[str] = set()
+    primary_urls: list[str] = []
+    i18n_urls: list[str] = []
+    i18n_prefixes = ("/es/", "/fr/", "/de/", "/zh/")
+
+    for url in all_urls:
+        clean = url.split("#")[0]
+        if clean in seen:
+            continue
+        seen.add(clean)
+        site_domain = os.environ.get("TARGET_SITE_URL", "").replace("https://", "").replace("http://", "").rstrip("/")
+        if site_domain and any((site_domain + p) in clean for p in i18n_prefixes):
+            i18n_urls.append(clean)
+        else:
+            primary_urls.append(clean)
+
+    # Inspect primary English URLs only — i18n pages are excluded by default for speed.
+    # The URL Inspection API is slow (~0.5s/req) so we cap at 75 to stay under 60s.
+    urls = primary_urls[:75]
+
+    results = await client.inspect_urls(urls, concurrency=10)
+
+    grouped: dict[str, list[dict]] = {
+        "indexed": [],
+        "not_indexed": [],
+        "redirect": [],
+        "unknown": [],
+        "error": [],
+    }
+
+    for r in results:
+        state = r.get("coverage_state", "")
+        verdict = r.get("verdict", "")
+        entry = {
+            "url": r["url"],
+            "coverage_state": state,
+            "verdict": verdict,
+            "last_crawl_time": r.get("last_crawl_time"),
+            "google_canonical": r.get("google_canonical"),
+        }
+        if verdict == "ERROR":
+            grouped["error"].append(entry)
+        elif verdict == "PASS":
+            grouped["indexed"].append(entry)
+        elif "redirect" in state.lower():
+            grouped["redirect"].append(entry)
+        elif "unknown" in state.lower():
+            grouped["unknown"].append(entry)
+        else:
+            grouped["not_indexed"].append(entry)
+
+    return {
+        "sitemap_url": resolved_sitemap_url,
+        "total_in_sitemap": len(all_urls),
+        "total_inspected": len(urls),
+        "summary": {k: len(v) for k, v in grouped.items()},
+        "results": grouped,
+    }
 
 
 @app.post("/gsc/inspect-bulk")
@@ -914,24 +1068,6 @@ def delete_task(task_id: int):
         return {"message": "Task deleted"}
     finally:
         db.close()
-
-
-def _webflow_available() -> bool:
-    """Check if Webflow API credentials are configured."""
-    import os
-    return bool(os.environ.get("WEBFLOW_ACCESS_TOKEN"))
-
-
-def _webflow_degradation_note() -> str:
-    """Return a note to append when Webflow is not configured."""
-    return """
-IMPORTANT: Webflow is not configured (WEBFLOW_ACCESS_TOKEN not set).
-You cannot make live CMS changes. Instead:
-1. Complete all research and content generation steps.
-2. Produce the final output (new title, meta description, content, etc.) clearly in your report.
-3. Format it so the user can manually paste it into Webflow.
-4. Do NOT attempt to call any mcp__webflow__ tools.
-"""
 
 
 def _append_user_notes(prompt: str, comments) -> str:
@@ -1174,8 +1310,9 @@ def _render_learnings_markdown(learnings: dict) -> str:
         key=lambda x: (conf_order.get(x.get("confidence", "low"), 2), x.get("id", ""))
     )
 
+    site_url_label = os.environ.get("TARGET_SITE_URL", "this site")
     lines = ["# SEO Learnings\n",
-             "_Principles extracted from measured ranking changes on nocodeassistant.agency._\n"]
+             f"_Principles extracted from measured ranking changes on {site_url_label}._\n"]
     for l in sorted_items:
         lines.append(f"## {l.get('id', 'unknown')} [{l.get('confidence', '?')} confidence, {l.get('hit_count', 0)} hits]")
         lines.append(f"- **Discovered:** {l.get('discovered', '')}")
@@ -1227,33 +1364,29 @@ def _change_log_block_instruction(execution_type: str) -> str:
 
     per_type_guidance = {
         "rewrite_title": (
-            "Extract url and webflow_item_id from Step 4 (Webflow lookup). "
-            "Set before = current title from get_cms_item (or null if static page). "
-            "Set after = the final title you wrote in Step 3."
+            "Set url = the page URL. "
+            "Set before = the current title (from your research/fetch). "
+            "Set after = the final title you produced."
         ),
         "rewrite_meta_desc": (
-            "Extract url and webflow_item_id from Step 4 (Webflow lookup). "
-            "Set before = current seo-desc from get_cms_item (or null if static). "
-            "Set after = the final meta description from Step 3."
+            "Set url = the page URL. "
+            "Set before = the current meta description (or null if not found). "
+            "Set after = the final meta description you produced."
         ),
         "rewrite_h1": (
-            "Extract url and webflow_item_id from Step 5 (Webflow lookup). "
-            "Set before = old H1 from Step 1 (WebFetch). "
-            "Set after = the final H1 from Step 4."
+            "Set url = the page URL. "
+            "Set before = the old H1 from your WebFetch. "
+            "Set after = the final H1 you produced."
         ),
         "blog_write": (
-            "Set url = the live URL of the newly created post (slug-based). "
+            "Set url = the planned live URL of the new post (slug-based). "
             "Set before = null (new post). "
             "Set after = the SEO title of the new post."
         ),
         "rewrite_blog_content": (
-            "Extract url and webflow_item_id from Step 5 (Webflow lookup). "
-            "Set before = old SEO title or slug from Step 1. "
+            "Set url = the page URL. "
+            "Set before = old SEO title or slug. "
             "Set after = new SEO title if changed, or 'content updated'."
-        ),
-        "webflow_publish": (
-            "Set url = the live URL of the published item. "
-            "Set before = null. Set after = 'published'."
         ),
         "internal_links": (
             "Set url = comma-separated list of all URLs updated. "
@@ -1276,42 +1409,44 @@ def _change_log_block_instruction(execution_type: str) -> str:
   "field": "{field}",
   "before": "<previous value, or null>",
   "after": "<new value>",
-  "webflow_item_id": "<Webflow item ID, or null>",
-  "webflow_status": "<published|updated|manual-only>"
+  "webflow_item_id": null,
+  "webflow_status": "manual-only"
 }}
 -->"""
 
 
-def build_execution_prompt(task, comments=None) -> str:
+def build_execution_prompt(task, comments=None, config=None) -> str:
     """
     Build a workflow-aware prompt for the agent based on the task's execution_type.
 
     Returns a rich prompt with step-by-step workflow instructions tailored
     to the execution type so the agent can act end-to-end autonomously.
+    Used by: legacy fallback path and comment autopilot.
 
     Args:
         task: TaskModel database object with title, description, execution_type
         comments: Optional list of comment objects (with .author and .body). User
             comments are appended as a "User Notes" section so the agent factors
             them in during execution.
+        config: Optional AgentConfig for site_name/site_url substitution.
 
     Returns:
         Complete prompt string with context and ordered workflow steps
     """
+    from agent.config import AgentConfig as _AgentConfig
+    _config = config or _AgentConfig.from_env()
+    site_name = _config.site_name
+    site_url = _config.site_url
+
     base = f"Task: {task.title}\n"
     if task.description:
         base += f"Details: {task.description}\n"
 
     etype = task.execution_type
-    webflow_ok = _webflow_available()
-    degradation = _webflow_degradation_note() if not webflow_ok else ""
 
     if etype == "rewrite_title":
         _prompt = base + f"""
 You are executing an SEO task: research keywords and rewrite the page/post title.
-
-Primary goal: produce a high-quality final title draft first.
-Secondary goal: apply/publish in Webflow if tooling is available.
 
 WORKFLOW — execute every step in order:
 
@@ -1326,38 +1461,20 @@ Step 2 — Generate 3 title options
 Rules:
 - 50–60 characters including spaces
 - Primary keyword near the beginning
-- Brand name at the end: "Keyword Phrase | NocodeAssistant"
-- Specific to the target audience: SMB founders/COOs/CEOs, $3M-$30M revenue, 5-80 employees
-- No filler qualifiers ("Trusted", "Best", "Leading")
+- Brand name at the end: "Keyword Phrase | {site_name}"
+- Direct and clear — no filler qualifiers ("Trusted", "Best", "Leading")
 
-Step 3 — Finalize draft for manual use
-Pick the strongest title and present it clearly as:
+Step 3 — Finalize draft
+Pick the strongest title and present clearly:
 - Final title draft
 - 2 backup options
-- keyword rationale
+- Keyword rationale (search intent, competitive context)
 
-Step 4 — Optional Webflow update
-Use mcp__webflow__list_cms_items (limit=100, offset=0) to list all CMS items.
-If there are more than 100 items, paginate with offset=100, offset=200, etc.
-Find the item whose "name" field best matches the page referenced in the task title/description.
-Use mcp__webflow__get_cms_item to fetch the full item. Note the item_id, current "name", and "seo-title".
-If the page is a static Webflow page (homepage, /weweb-agency, /bubble-agency, /faq), skip tool calls and give manual paste steps.
-
-If item found, then update:
-Pick the strongest title. Use mcp__webflow__update_cms_item with:
-  item_id: [from lookup]
-  name: [chosen title]
-  seo-title: [same title, or a slightly different version if the display name and SEO title should differ]
-
-Step 5 — Optional publish
-If the update succeeded, use mcp__webflow__publish_cms_item with the item_id.
-
-Step 6 — Report clearly:
+Step 4 — Report:
 - Final draft title: [final draft]
 - Backup options: [2]
-- Keyword rationale: [why this keyword, search intent, competitive context]
-- Webflow update status: [updated/published OR manual-only]
-{degradation}"""
+- Keyword rationale
+"""
         _prompt += _change_log_block_instruction(etype)
         return _append_user_notes(_prompt, comments)
 
@@ -1365,57 +1482,38 @@ Step 6 — Report clearly:
         _prompt = base + f"""
 You are executing an SEO task: research and rewrite the meta description for a page.
 
-Primary goal: produce a final meta description draft first.
-Secondary goal: apply/publish in Webflow if tooling is available.
-
 WORKFLOW — execute every step in order:
 
 Step 1 — Research
 Use WebSearch to understand what competitors use in meta descriptions for this topic:
 - Search: "[topic] [page type] meta description examples"
-- Identify: primary keyword, user intent, strongest value propositions for SMB operators.
+- Identify: primary keyword, user intent, strongest value propositions.
 
 Step 2 — Write the meta description
 Rules:
 - 150–160 characters exactly (count carefully)
 - Primary keyword appears naturally in the first half
-- Clear value proposition for SMB founders/COOs
+- Clear value proposition
 - Ends with an implicit or explicit call to action
 - No keyword stuffing; reads naturally
 
-Step 3 — Finalize draft for manual use
+Step 3 — Finalize draft
 Present:
 - Final meta description draft
 - Character count
 - Primary keyword used
 
-Step 4 — Optional Webflow update
-Use mcp__webflow__list_cms_items to find the item matching this page.
-Use mcp__webflow__get_cms_item to get the full item. Note the current "seo-desc" value.
-If it's a static page, provide copy-paste steps for Webflow Designer.
-
-If item found, update:
-Use mcp__webflow__update_cms_item:
-  item_id: [from lookup]
-  seo-desc: [new description]
-
-Step 5 — Optional publish
-If update succeeded, use mcp__webflow__publish_cms_item.
-
-Step 6 — Report:
+Step 4 — Report:
 - Final draft: [meta description]
 - Character count: [exact count]
-- Webflow update status: [updated/published OR manual-only]
-{degradation}"""
+- Primary keyword: [keyword]
+"""
         _prompt += _change_log_block_instruction(etype)
         return _append_user_notes(_prompt, comments)
 
     elif etype == "rewrite_h1":
         _prompt = base + f"""
 You are executing an SEO task: rewrite the H1 heading for a page.
-
-Primary goal: produce final H1 draft options first.
-Secondary goal: apply/publish in Webflow if tooling is available.
 
 WORKFLOW — execute every step in order:
 
@@ -1431,41 +1529,25 @@ Rules:
 - Under 70 characters
 - Contains the primary keyword
 - Specific to this page (not reusable across other pages)
-- Direct and clear — no filler, speaks to SMB operators
+- Direct and clear — no filler
 
-Step 4 — Finalize draft for manual use
+Step 4 — Finalize draft
 Pick the strongest option and present:
 - Final H1 draft
 - Backup H1 option
-- rationale
+- Rationale
 
-Step 5 — Optional Webflow update
-Use mcp__webflow__list_cms_items to find the Webflow item.
-Use mcp__webflow__get_collection_info to check what fields are available (H1 may map to
-"name" or a dedicated headline field).
-If static page/manual-only, provide copy-paste steps.
-
-If item found, update:
-Use mcp__webflow__update_cms_item with the appropriate field (likely "name").
-
-Step 6 — Optional publish
-If update succeeded, use mcp__webflow__publish_cms_item.
-
-Step 7 — Report:
+Step 5 — Report:
 - Old H1: [what it was]
 - Final draft H1: [selected draft]
 - Keyword + intent rationale
-- Webflow update status: [updated/published OR manual-only]
-{degradation}"""
+"""
         _prompt += _change_log_block_instruction(etype)
         return _append_user_notes(_prompt, comments)
 
     elif etype == "blog_write":
         _prompt = base + f"""
 You are executing an SEO task: research and write a new blog post.
-
-Primary goal: produce a publish-ready blog draft first.
-Secondary goal: create/publish in Webflow if tooling is available.
 
 WORKFLOW — execute every step in order:
 
@@ -1478,21 +1560,21 @@ Search: "[topic] keyword research", "[topic] how to", "[topic] guide"
 
 Step 2 — Outline
 Create a full post outline:
-- SEO title (50-60 chars, keyword-first, ends with "| NocodeAssistant")
+- SEO title (50-60 chars, keyword-first, ends with "| {site_name}")
 - Meta description (150-160 chars)
 - H1 (matches or is very close to the SEO title)
 - H2 sections with supporting H3s where needed
-- Target word count: 800-1500 words for this SMB audience
+- Target word count: 800-1500 words
 
 Step 3 — Write the post
 Use the Skill tool to invoke the copywriting skill.
 Write the full post following the outline. Must include:
 - Primary keyword in first 100 words
 - Keyword density ~1-2% (natural usage)
-- 2-3 internal links to other nocodeassistant.agency pages
-- CTA at the end pointing to the agency's services
+- 2-3 internal links to other {site_url} pages
+- CTA at the end pointing to the site's services
 
-Step 4 — Finalize draft for manual publishing
+Step 4 — Finalize draft
 Present clearly:
 - SEO title
 - Meta description
@@ -1500,35 +1582,18 @@ Present clearly:
 - Full post content
 - Excerpt
 
-Step 5 — Optional Webflow create
-Use mcp__webflow__create_cms_item with these fields:
-  name: [SEO title]
-  slug: [kebab-case-url-slug with primary keyword]
-  content: [full post content]
-  seo-title: [SEO title]
-  seo-desc: [meta description]
-  excerpt: [2-sentence summary for post cards]
-  display-date: [today's date in ISO format]
-
-Step 6 — Optional publish
-If create succeeded, use mcp__webflow__publish_cms_item with the new item's ID.
-
-Step 7 — Report:
+Step 5 — Report:
 - Title: [title]
 - URL slug: [slug]
 - Word count: [count]
 - Primary keyword targeted: [keyword]
-- Webflow status: [created/published OR manual-only]
-{degradation}"""
+"""
         _prompt += _change_log_block_instruction(etype)
         return _append_user_notes(_prompt, comments)
 
     elif etype == "rewrite_blog_content":
         _prompt = base + f"""
 You are executing an SEO task: rewrite existing blog content for better SEO.
-
-Primary goal: produce a revised final draft first.
-Secondary goal: apply/publish in Webflow if tooling is available.
 
 WORKFLOW — execute every step in order:
 
@@ -1545,101 +1610,53 @@ Use the Skill tool: invoke "copy-editing" skill for targeted improvements, or "c
 skill for a full rewrite if the content is poor.
 Apply: better keyword targeting, improved structure, updated information, internal links.
 
-Step 4 — Finalize revised draft for manual publishing
+Step 4 — Finalize revised draft
 Present clearly:
 - Revised title (if changed)
 - Revised SEO title/meta description
 - Revised excerpt
 - Full revised content
 
-Step 5 — Optional Webflow update
-Use mcp__webflow__list_cms_items to find the post by title match.
-Use mcp__webflow__get_cms_item to get current fields and item_id.
-If static/manual-only, provide copy-paste steps.
-
-If item found, update:
-Use mcp__webflow__update_cms_item with:
-  item_id: [from lookup]
-  content: [rewritten content]
-  name: [updated title if changed]
-  seo-title: [updated SEO title]
-  seo-desc: [updated meta description]
-  excerpt: [updated excerpt if changed]
-
-Step 6 — Optional publish
-If update succeeded, use mcp__webflow__publish_cms_item.
-
-Step 7 — Report:
+Step 5 — Report:
 - What changed: content, title, meta desc
 - Old keyword target vs new keyword target
 - Key improvements made
-- Webflow status: [updated/published OR manual-only]
-{degradation}"""
-        _prompt += _change_log_block_instruction(etype)
-        return _append_user_notes(_prompt, comments)
-
-    elif etype == "webflow_publish":
-        _prompt = base + f"""
-You are executing an SEO task: publish a Webflow CMS item to the live site.
-
-WORKFLOW — execute every step in order:
-
-Step 1 — Find the item
-Use mcp__webflow__list_cms_items to find the item referenced in this task.
-If the task description specifies field updates (title, meta desc, etc.), note them.
-
-Step 2 — Update if needed
-If the task description specifies field changes, use mcp__webflow__update_cms_item first
-with the requested field updates.
-
-Step 3 — Publish
-Use mcp__webflow__publish_cms_item with the item's ID.
-
-Step 4 — Confirm and report:
-- Item name: [name]
-- Item ID: [id]
-- Fields updated (if any): [list]
-- Published: yes
-{degradation}"""
+"""
         _prompt += _change_log_block_instruction(etype)
         return _append_user_notes(_prompt, comments)
 
     elif etype == "internal_links":
         _prompt = base + f"""
-You are executing an SEO task: add internal links between blog posts and pages in Webflow CMS.
-
-Note: Internal links can only be added to CMS rich-text "content" fields via the API.
-Static Webflow pages require manual editing in the Designer.
+You are executing an SEO task: create an internal link plan between pages on {site_url}.
 
 WORKFLOW — execute every step in order:
 
-Step 1 — Get all CMS content
-Use mcp__webflow__list_cms_items (paginate with offset if >100 items).
-Build a map of each item: title, slug, topic/theme.
+Step 1 — Research site structure
+Use WebFetch on the site URL or sitemap to understand what pages exist.
+Build a map of each key page: title, URL, topic/theme.
 
 Step 2 — Identify link opportunities
 For the page(s) mentioned in the task, identify which other site pages are topically related
 and would benefit from a link to or from this page.
 Prioritize: pages with overlapping topics, service pages, case studies relevant to the post.
 
-Step 3 — Update content with internal links
-For each item that needs a link added or received, use mcp__webflow__update_cms_item
-to update the "content" field, inserting the anchor text and link naturally in the text.
-Format: add the link as an HTML anchor tag within the rich text content.
+Step 3 — Produce the link plan
+For each recommended internal link, specify:
+- Source page URL
+- Target page URL
+- Suggested anchor text
+- Where to insert in the source page (section/paragraph hint)
 
-Step 4 — Publish updated items
-Use mcp__webflow__publish_cms_item for each updated item.
-
-Step 5 — Report:
-- Items updated: [list with IDs]
-- Links added: [source page → target page, anchor text]
-- Any static pages that need manual linking (provide copy-paste instructions)
-{degradation}"""
+Step 4 — Report:
+- Link plan: [table of source → target, anchor text, insertion point]
+- Priority links (most impactful 3-5): highlighted
+- Manual implementation instructions
+"""
         _prompt += _change_log_block_instruction(etype)
         return _append_user_notes(_prompt, comments)
 
     elif etype == "research":
-        _prompt = base + """
+        _prompt = base + f"""
 You are executing an SEO research task. This is research-only — no CMS changes.
 
 WORKFLOW — execute every step in order:
@@ -1659,7 +1676,7 @@ Step 3 — Synthesize findings
 Produce a structured report with:
 - Primary keyword recommendations (with estimated search volume if findable)
 - Competitor analysis (who ranks, why they rank, gaps you can exploit)
-- Specific actionable recommendations for nocodeassistant.agency
+- Specific actionable recommendations for {site_url}
 - Suggested next tasks with their execution types (e.g., rewrite_title, blog_write)
 
 Step 4 — Save findings to task notes.
@@ -1670,8 +1687,7 @@ No CMS changes needed for this task type."""
         _prompt = base + """
 You are executing an SEO task: write descriptive alt text for images on a page.
 
-Note: Webflow's CMS API does not expose individual image alt text fields for all image types.
-This task will produce copy-paste-ready alt text recommendations for manual implementation.
+This task produces copy-paste-ready alt text recommendations for manual implementation.
 
 WORKFLOW — execute every step in order:
 
@@ -1684,7 +1700,7 @@ Step 2 — Write alt text per category
 Rules by image type:
 - Client logos: "[Company Name] logo"
 - Testimonial portraits: "[Person Name], [Job Title] at [Company Name]"
-- G2 / rating stars: "G2 rating 4.8 out of 5 stars" (or aria-hidden if purely decorative)
+- Rating stars: "Rating X out of 5 stars" (or aria-hidden if purely decorative)
 - Content images: descriptive text of what the image shows and its purpose
 - Decorative dividers/backgrounds: leave as alt="" (correct) or add aria-hidden="true"
 
@@ -1694,10 +1710,6 @@ Format as a table:
 |---|---|
 ...
 
-Also provide Webflow-specific instructions for where to add alt text:
-- CMS images: in the CMS item's image field settings
-- Designer images: select image → click Settings → Alt Text field
-
 Step 4 — Save report to task notes. No automated CMS changes for this task type."""
         return _append_user_notes(_prompt, comments)
 
@@ -1705,9 +1717,8 @@ Step 4 — Save report to task notes. No automated CMS changes for this task typ
         _prompt = base + """
 You are executing an SEO task: generate JSON-LD structured data for a page.
 
-Note: Webflow's CMS API does not expose custom code injection fields.
-This task generates the correct JSON-LD and provides copy-paste instructions for
-Webflow's Page Settings > Custom Code > Head Code section.
+This task generates the correct JSON-LD and provides copy-paste instructions
+for the site's CMS or page settings Custom Code / Head Code section.
 
 WORKFLOW — execute every step in order:
 
@@ -1717,13 +1728,13 @@ Check what JSON-LD schemas already exist (look for <script type="application/ld+
 Note the page type: blog post, service page, FAQ, homepage, etc.
 
 Step 2 — Research the correct schema type
-Based on the page type, use WebFetch to check the schema.org spec for:
+Based on the page type, identify the appropriate schema:
 - BlogPosting or Article (blog posts)
 - Service (service pages)
 - FAQPage (FAQ pages)
 - Organization (homepage/about)
 - BreadcrumbList (navigation)
-Search: "schema.org [schema type] required properties"
+Use WebFetch to check schema.org spec: "schema.org [schema type] required properties"
 
 Step 3 — Generate the JSON-LD
 Write the complete, valid JSON-LD block.
@@ -1732,11 +1743,8 @@ Include all recommended fields (not just required).
 Validate mentally against the schema.org spec.
 
 Step 4 — Produce implementation instructions
-Write step-by-step Webflow instructions:
-1. Go to Webflow Designer → select the page → Page Settings (⚙ icon)
-2. Scroll to "Custom Code" → "Head Code" section
-3. Paste the following block:
-[paste the complete JSON-LD <script> block]
+Paste the complete JSON-LD <script> block with step-by-step instructions
+for inserting it into the page's <head> section.
 
 Step 5 — Save to task notes. No automated CMS changes."""
         return _append_user_notes(_prompt, comments)
@@ -1744,7 +1752,7 @@ Step 5 — Save to task notes. No automated CMS changes."""
     elif etype == "seo_impact_review":
         cms_types_list = ", ".join(sorted(CMS_CHANGE_FIELD_MAP.keys()))
         _prompt = base + f"""
-You are running an SEO feedback loop impact review for nocodeassistant.agency.
+You are running an SEO feedback loop impact review for {site_url}.
 Execute phases in order. After each phase the system state must be valid before proceeding.
 
 CONSTRAINTS:
@@ -1781,7 +1789,7 @@ For each entry in the batch:
 a. If is_backfilled=true and url=null: set status=reviewed-inconclusive,
    review_notes="backfilled — no URL to evaluate", reviewed_at=now. Write JSON. Continue.
 b. WebFetch the entry url — note current value of the changed field
-c. WebSearch: "site:nocodeassistant.agency" + page path + change_type + "impact"
+c. WebSearch: "site:{site_url}" + page path + change_type + "impact"
 d. Classify outcome: reviewed-positive | reviewed-negative | reviewed-neutral | reviewed-inconclusive
    - positive: measurable improvement visible (ranking, snippet, field value)
    - negative: measurable regression
@@ -1839,11 +1847,10 @@ async def execute_task(task_id: int):
         # Add "task started" comment
         add_task_started_comment(db, task_id, task.title)
         
-        # Execute the task via SEOAgent
+        # Execute the task via OrchestratorAgent (routes to specialist agents)
         try:
             task_comments = db.query(CommentModel).filter(CommentModel.task_id == task_id).order_by(CommentModel.created_at).all()
-            prompt = build_execution_prompt(task, comments=task_comments)
-            result = await _run_agent_prompt(prompt)
+            result = await _run_orchestrated_task(task, db, task_comments)
 
             # Update task with result
             task.status = "completed"
@@ -2310,6 +2317,10 @@ KANBAN_HTML = """
                     <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
                     <span id="audit-btn-label">Run Audit</span>
                 </button>
+                <button id="index-audit-btn" onclick="runIndexAudit()" class="btn" style="background:#7c3aed;color:#fff;">
+                    <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+                    <span id="index-audit-btn-label">Index Audit</span>
+                </button>
                 <button onclick="openCreateModal()" class="btn btn-primary">
                     <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
                     Add Task
@@ -2493,6 +2504,31 @@ KANBAN_HTML = """
         </div>
     </div>
 
+    <!-- Index Audit Modal -->
+    <div id="index-audit-modal" class="modal-backdrop" role="dialog" aria-modal="true" style="display:none;">
+        <div class="modal-box" style="max-width:780px;width:95%;">
+            <div class="modal-header">
+                <div>
+                    <div class="modal-title">Index Audit</div>
+                    <div id="index-audit-subtitle" style="font-size:12px;color:#6b7280;margin-top:2px;"></div>
+                </div>
+                <button class="modal-close" onclick="closeIndexAuditModal()">
+                    <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+                </button>
+            </div>
+            <div id="index-audit-body" style="padding:0 24px 8px;max-height:60vh;overflow-y:auto;">
+                <div id="index-audit-loading" style="text-align:center;padding:40px;color:#6b7280;">Fetching sitemap and inspecting pages… this may take a minute.</div>
+                <div id="index-audit-content" style="display:none;"></div>
+            </div>
+            <div class="modal-footer">
+                <div></div>
+                <div class="modal-footer-right">
+                    <button onclick="closeIndexAuditModal()" class="btn btn-ghost">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <div id="toast"><span id="toast-message"></span></div>
 
     <script>
@@ -2579,6 +2615,92 @@ async function runAudit() {
         fetchTasks();
     } catch(e) { showToast('Error: ' + e.message, 'error'); }
     finally { btn.disabled = false; label.textContent = 'Run Audit'; }
+}
+
+async function runIndexAudit() {
+    const btn = document.getElementById('index-audit-btn');
+    const label = document.getElementById('index-audit-btn-label');
+    btn.disabled = true;
+    label.textContent = 'Auditing…';
+
+    // Show modal in loading state
+    document.getElementById('index-audit-modal').style.display = 'flex';
+    document.getElementById('index-audit-loading').style.display = 'block';
+    document.getElementById('index-audit-content').style.display = 'none';
+    document.getElementById('index-audit-subtitle').textContent = '';
+
+    try {
+        const r = await fetch(API_BASE + '/gsc/index-audit');
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.detail || r.statusText);
+        renderIndexAuditResults(d);
+    } catch(e) {
+        document.getElementById('index-audit-loading').innerHTML = '<span style="color:#dc2626;">Error: ' + escapeHtml(e.message) + '</span>';
+    } finally {
+        btn.disabled = false;
+        label.textContent = 'Index Audit';
+    }
+}
+
+function renderIndexAuditResults(data) {
+    const loading = document.getElementById('index-audit-loading');
+    const content = document.getElementById('index-audit-content');
+    const subtitle = document.getElementById('index-audit-subtitle');
+
+    subtitle.textContent = data.sitemap_url + ' — ' + data.total_inspected + ' pages inspected';
+    loading.style.display = 'none';
+    content.style.display = 'block';
+
+    const s = data.summary;
+    const groups = data.results;
+
+    const COLORS = {
+        indexed:     { bg: '#f0fdf4', border: '#bbf7d0', dot: '#16a34a', label: '✅ Indexed' },
+        not_indexed: { bg: '#fffbeb', border: '#fde68a', dot: '#d97706', label: '⚠️ Not Indexed' },
+        redirect:    { bg: '#fef3c7', border: '#fcd34d', dot: '#b45309', label: '↪️ Page with Redirect' },
+        unknown:     { bg: '#f8fafc', border: '#e2e8f0', dot: '#94a3b8', label: '❓ Unknown to Google' },
+        error:       { bg: '#fef2f2', border: '#fecaca', dot: '#dc2626', label: '🔴 Error' },
+    };
+
+    // Summary pills
+    let html = '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:20px;">';
+    for (const [key, cfg] of Object.entries(COLORS)) {
+        const count = s[key] || 0;
+        html += `<div style="display:flex;align-items:center;gap:6px;padding:6px 12px;border-radius:20px;background:${cfg.bg};border:1px solid ${cfg.border};font-size:13px;">
+            <span style="width:8px;height:8px;border-radius:50%;background:${cfg.dot};flex-shrink:0;"></span>
+            <span style="font-weight:600;">${count}</span>&nbsp;${cfg.label}
+        </div>`;
+    }
+    html += '</div>';
+
+    // Sections — only show groups with entries, prioritise problems first
+    const order = ['not_indexed', 'redirect', 'unknown', 'error', 'indexed'];
+    for (const key of order) {
+        const pages = groups[key] || [];
+        if (!pages.length) continue;
+        const cfg = COLORS[key];
+        html += `<div style="margin-bottom:16px;">
+            <div style="font-size:13px;font-weight:600;color:#374151;margin-bottom:6px;padding:8px 10px;background:${cfg.bg};border-radius:6px;border-left:3px solid ${cfg.dot};">
+                ${cfg.label} (${pages.length})
+            </div>
+            <div style="display:flex;flex-direction:column;gap:2px;">`;
+        for (const p of pages) {
+            const path = p.url.replace(/https?:\\/\\/[^/]+/, '');
+            const state = p.coverage_state || p.verdict || '';
+            const crawl = p.last_crawl_time ? ' · crawled ' + p.last_crawl_time.slice(0,10) : '';
+            html += `<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 10px;border-radius:4px;font-size:12px;background:#f9fafb;border:1px solid #f3f4f6;">
+                <a href="${escapeHtml(p.url)}" target="_blank" style="color:#2563eb;text-decoration:none;font-family:monospace;word-break:break-all;">${escapeHtml(path || '/')}</a>
+                <span style="color:#6b7280;white-space:nowrap;margin-left:12px;">${escapeHtml(state)}${crawl}</span>
+            </div>`;
+        }
+        html += '</div></div>';
+    }
+
+    content.innerHTML = html;
+}
+
+function closeIndexAuditModal() {
+    document.getElementById('index-audit-modal').style.display = 'none';
 }
 
 async function openDetailModal(taskId) {
