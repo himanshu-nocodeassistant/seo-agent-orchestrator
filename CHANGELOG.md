@@ -4,6 +4,57 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-06-08
+
+### Added
+- **Multi-agent campaign orchestration** — new `execution_type = "orchestrate_seo_campaign"` triggers a full multi-agent pipeline from a single Kanban task
+  - `agent/orchestrator.py` — Python-managed dispatch loop: orchestrator agent produces a JSON plan; Python creates child tasks and runs each phase agent, threading outputs as context
+  - `OrchestrationStateModel` — new DB table tracking plan JSON, current phase, per-phase outputs, child run IDs, and campaign status (`planning → running → completed | error`)
+  - `parent_run_id` column on `AgentRunModel` — links every child run back to the orchestrator run for full audit trail
+  - `GET /orchestrations/{orchestrator_run_id}` — endpoint returning campaign state and all child task details
+- **DAG-based parallel phase execution** (`_resolve_execution_tiers`) — Kahn's topological sort groups phases into tiers; phases with no unmet dependencies run concurrently via `asyncio.gather`. Circular dependency and unknown dependency references raise `ValueError` before any agents run. Fail-fast: one failure in a tier cancels remaining tiers.
+- **Structured inter-agent handoffs** (`_extract_summary_block`) — agents write a `## Summary for Next Phase ... ## End Summary` block; the next agent receives this clean summary instead of a raw truncated output dump. Falls back to 1500-char truncation when no summary block is present.
+- **Retry with exponential backoff** (`_run_with_retry`) — transient failures (timeouts, 503s, rate limits) are retried up to `max_retries` times with doubling delay. Non-retryable errors (budget exceeded, malformed plan, circular dependency) raise immediately without retry.
+- **SDK result hardening** (`_normalize_execution_result`) — handles `None`, plain strings, known SDK types, and unknown types gracefully; unknown types log a `WARNING` with full payload rather than crashing.
+- **5 new execution profiles** in `agent/runtime_profiles.py`:
+  - `orchestrate_seo_campaign` — BASE tools, 6 turns, $1.00, validates JSON plan structure
+  - `campaign_researcher` — BASE + GSC (read-only), 14 turns, $2.50
+  - `campaign_content_writer` — EDIT + WEBFLOW, 18 turns, $4.00, validates blog output + CHANGE_LOG
+  - `campaign_publisher` — BASE + WEBFLOW, 8 turns, $1.50, validates CHANGE_LOG
+  - `campaign_analyst` — BASE + GSC (read-only), 16 turns, $3.00, no session resume
+- **Scalability annotations** — inline comments at every production-scaling boundary: task queue migration point (#1), Postgres swap (#2), tool scope enforcement (#6), file locking (#8)
+- **17 new tests** in `tests/test_orchestration.py` covering: structured summary extraction, summary fallback to truncation, DAG tier resolution (serial/parallel/circular/unknown-dep), parallel happy path, parallel fail-fast, retry (transient/non-retryable/exhausted/ValueError), SDK hardening (known/string/unknown/None)
+
+### Changed
+- `_build_child_prompt_with_prior_outputs` now injects structured summaries from prior agents when available, with a reminder to each agent to write the `## Summary for Next Phase` block at the end of its output
+- `_normalize_execution_result` extended to handle `None` and unknown SDK result types with a logged warning instead of a silent crash
+
+### Known limitations (not implemented in this version)
+- Campaign execution blocks the FastAPI worker — no task queue (Celery/arq). See Known Limitations in README.
+- SQLite only — no multi-worker write concurrency. Switch via `DATABASE_URL`.
+- Summary block not yet enforced by validator — agents that omit it fall back to truncation silently.
+- No circuit breaker on retry — a fully-down downstream gets retried without backoff ceiling.
+- File-based feedback loop state (`seo-changes.json`) uses `os.replace()`, not safe under concurrent workers.
+
+## [2.0.0] - 2026-06-08
+
+### Added
+- **Google Search Console integration** (`agent/gsc/`) — read-only MCP module following the same pattern as `agent/webflow/` and `agent/google_docs/`
+  - `GscConfig` — reads `GSC_SITE_URL` from env; credential lookup falls back from `GSC_CREDENTIALS_PATH` → `GOOGLE_DOCS_CREDENTIALS_PATH` → `GOOGLE_APPLICATION_CREDENTIALS`; the same Google SA JSON used for Google Docs works here
+  - `GscAPIClient` — three read-only methods: `query_search_analytics` (clicks/impressions/CTR/position with date range + dimension filters), `inspect_url` (indexing status), `list_sitemaps`
+  - Three MCP tools auto-registered when `GSC_SITE_URL` is set: `mcp__gsc__gsc_query_search_analytics`, `mcp__gsc__gsc_inspect_url`, `mcp__gsc__gsc_list_sitemaps`
+  - `AgentConfig._setup_gsc_mcp()` and `AgentConfig.from_env()` updated — GSC is auto-configured when `GSC_SITE_URL` is present; no code changes required
+- **GSC tools wired into two execution profiles** in `agent/runtime_profiles.py`:
+  - `seo_impact_review` — uses GSC as primary ranking signal source (before/after click and position deltas per page); falls back to WebSearch if GSC unavailable
+  - `research` — can pull live query and page data during keyword and competitor research
+- **`_gsc_available()` / `_gsc_degradation_note()`** helpers in `agent/api/main.py` — `seo_impact_review` prompt injects a fallback note when GSC is not configured
+- **`seo_impact_review` Phase 3 updated** — agent now queries GSC by page with a before/after date split; falls through to WebSearch only when GSC returns an error or is unconfigured
+- 16 new tests in `tests/test_gsc_client.py` covering config, client (mocked API), runtime profile wiring, and `AgentConfig` integration
+
+### Fixed
+- `.env` path for Google SA credentials corrected from stale `Google SA Credentials/` (old uppercase directory) to `google-sa-credentials/` (renamed in previous cleanup)
+- `GSC_SITE_URL` in `.env` was URL-encoded (`sc-domain%3A…`) — corrected to plain `sc-domain:…`
+
 ## [1.9.0] - 2026-04-09
 
 ### Added
@@ -203,7 +254,7 @@ All notable changes to this project will be documented in this file.
 - Uses Claude Pro subscription via OAuth (no API key required)
 - Default model: Sonnet (configurable to default, sonnet, opus, haiku)
 - Command line mode and interactive mode support
-- Skills loaded from `Skills/` directory (symlinked to `.claude/skills`)
+- Skills loaded from `skills/` directory (symlinked to `.claude/skills`)
 
 ### Architecture
 - Python-based agent using subprocess to call Claude Code CLI

@@ -6,6 +6,7 @@ Provides REST API for task management and serves the kanban HTML.
 
 import asyncio
 import json
+import logging
 import os
 import re
 from datetime import datetime
@@ -13,6 +14,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Mapping, Optional
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,6 +26,18 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
+from agent.config import AgentConfig
+from agent.memory_service import (
+    build_short_term_context,
+    compose_prompt_context,
+    fetch_episodic_context,
+    fetch_procedural_context,
+    fetch_semantic_context,
+    generate_context_view_markdown,
+)
+from agent.runtime_profiles import ValidationResult, get_execution_profile
+from agent.seo_agent import SEOAgent
+
 # ============================================================================
 # EXECUTION TYPE TAXONOMY
 # ============================================================================
@@ -32,6 +47,13 @@ EXECUTABLE_TYPES = {
     "research", "rewrite_title", "rewrite_meta_desc", "rewrite_h1",
     "update_schema", "blog_write", "rewrite_blog_content",
     "webflow_publish", "internal_links", "alt_text", "seo_impact_review",
+    "orchestrate_seo_campaign",
+    # Scalability note (#6): child campaign types intentionally expose only the tools
+    # their profile needs (campaign_researcher = BASE+GSC read-only; campaign_publisher =
+    # BASE+WEBFLOW write). Never grant all tools to child agents — blast radius grows with
+    # each new profile. If a new child type needs Webflow, add it to runtime_profiles.py
+    # with explicit WEBFLOW_TOOLS, not by expanding EXECUTABLE_TYPES here.
+    "campaign_researcher", "campaign_content_writer", "campaign_publisher", "campaign_analyst",
 }
 
 # Execution types that require Webflow CMS API access
@@ -63,6 +85,9 @@ VALID_REVIEW_STATUSES = {
 
 # Paths for SEO feedback loop persistence.
 # Relative to cwd (project root). Single uvicorn worker assumed; add file lock if multi-worker.
+# Scalability note (#8): _atomic_json_write uses os.replace() which is atomic on POSIX but
+# not safe under concurrent workers. For multi-worker deployments, wrap writes with
+# fcntl.flock() (Unix) or replace file-based storage with a DB column or Redis key.
 SEO_CHANGES_PATH = Path("memory/seo-changes.json")
 SEO_LEARNINGS_PATH = Path("memory/seo-learnings.json")
 SEO_CHANGES_MD_PATH = Path(".claude/seo-changes-log.md")
@@ -87,6 +112,9 @@ def resolve_database_url(env: Mapping[str, str] | None = None) -> str:
 
 
 DATABASE_URL = resolve_database_url()
+# Scalability note (#2): SQLite works for single-user and portfolio use. For production
+# with concurrent workers, set DATABASE_URL to a PostgreSQL connection string — SQLAlchemy
+# and the schema require no other changes. Add connection pooling via pool_size/max_overflow.
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -121,6 +149,8 @@ class TaskModel(Base):
     model = Column(String(50), nullable=True)
     parent_task_id = Column(Integer, nullable=True)
     comment_count = Column(Integer, default=0)
+    last_run_id = Column(String(64), nullable=True)
+    active_run_id = Column(String(64), nullable=True)
     created_at = Column(String(20), default=lambda: datetime.utcnow().isoformat())
     updated_at = Column(String(20), default=lambda: datetime.utcnow().isoformat())
 
@@ -143,6 +173,7 @@ class CommentActionModel(Base):
     id = Column(Integer, primary_key=True, index=True)
     task_id = Column(Integer, nullable=False, index=True)
     comment_id = Column(Integer, nullable=False, unique=True, index=True)
+    run_id = Column(String(64), nullable=True, index=True)
     status = Column(String(30), nullable=False, default="pending")
     attempts = Column(Integer, nullable=False, default=0)
     max_attempts = Column(Integer, nullable=False, default=2)
@@ -150,6 +181,68 @@ class CommentActionModel(Base):
     created_at = Column(String(20), default=lambda: datetime.utcnow().isoformat())
     updated_at = Column(String(20), default=lambda: datetime.utcnow().isoformat())
     acted_at = Column(String(20), nullable=True)
+
+
+class AgentRunModel(Base):
+    """Tracks each agent execution run."""
+    __tablename__ = "agent_runs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    run_id = Column(String(64), nullable=False, unique=True, index=True)
+    task_id = Column(Integer, nullable=True, index=True)
+    parent_run_id = Column(String(64), nullable=True, index=True)
+    status = Column(String(30), nullable=False, default="queued")
+    execution_type = Column(String(50), nullable=True)
+    trigger_source = Column(String(50), nullable=False, default="manual_execute")
+    session_id = Column(String(255), nullable=True)
+    validator_status = Column(String(30), nullable=True)
+    profile_name = Column(String(50), nullable=True)
+    prompt_text = Column(Text, nullable=True)
+    prompt_context_json = Column(Text, nullable=True)
+    result_summary = Column(Text, nullable=True)
+    error = Column(Text, nullable=True)
+    source_comment_id = Column(Integer, nullable=True, index=True)
+    started_at = Column(String(20), default=lambda: datetime.utcnow().isoformat())
+    finished_at = Column(String(20), nullable=True)
+
+
+class RunEventModel(Base):
+    """Append-only event log for agent runs."""
+    __tablename__ = "run_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    run_id = Column(String(64), nullable=False, index=True)
+    event_type = Column(String(50), nullable=False)
+    payload = Column(Text, nullable=True)
+    created_at = Column(String(20), default=lambda: datetime.utcnow().isoformat())
+
+
+class TaskSessionModel(Base):
+    """Maps a task to its most recent reusable Claude session."""
+    __tablename__ = "task_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, nullable=False, unique=True, index=True)
+    session_id = Column(String(255), nullable=False)
+    last_run_id = Column(String(64), nullable=True)
+    updated_at = Column(String(20), default=lambda: datetime.utcnow().isoformat())
+
+
+class OrchestrationStateModel(Base):
+    """Tracks state for a multi-agent campaign orchestration run."""
+    __tablename__ = "orchestration_states"
+
+    id = Column(Integer, primary_key=True, index=True)
+    orchestrator_run_id = Column(String(64), nullable=False, unique=True, index=True)
+    campaign_goal = Column(Text, nullable=False)
+    plan_json = Column(Text, nullable=True)
+    current_phase = Column(String(50), nullable=True)
+    phase_outputs_json = Column(Text, nullable=True)
+    child_run_ids_json = Column(Text, nullable=True)
+    status = Column(String(30), nullable=False, default="planning")
+    error = Column(Text, nullable=True)
+    created_at = Column(String(20), default=lambda: datetime.utcnow().isoformat())
+    updated_at = Column(String(20), default=lambda: datetime.utcnow().isoformat())
 
 
 # Create tables
@@ -203,6 +296,8 @@ class TaskResponse(BaseModel):
     model: Optional[str]
     parent_task_id: Optional[int]
     comment_count: int
+    last_run_id: Optional[str]
+    active_run_id: Optional[str]
     created_at: str
     updated_at: str
 
@@ -230,6 +325,27 @@ class CommentResponse(BaseModel):
     author: str
     body: str
     created_at: str
+
+
+class RunResponse(BaseModel):
+    run_id: str
+    task_id: Optional[int]
+    status: str
+    execution_type: Optional[str]
+    trigger_source: str
+    session_id: Optional[str]
+    validator_status: Optional[str]
+    profile_name: Optional[str]
+    error: Optional[str]
+    started_at: str
+    finished_at: Optional[str]
+
+
+class TaskMemoryResponse(BaseModel):
+    task_id: int
+    run_id: Optional[str]
+    execution_type: Optional[str]
+    memory: dict
 
 
 # ============================================================================
@@ -398,26 +514,14 @@ def _agent_execution_timeout_seconds() -> int:
     return max(value, 1)
 
 
-async def _run_agent_prompt(prompt: str) -> str:
-    """Execute a prompt via SEOAgent using the same runtime config as task execution."""
-    from agent.seo_agent import SEOAgent
-    from agent.config import AgentConfig
+def _project_root() -> str:
+    return str(Path(__file__).resolve().parents[2])
 
-    os.environ.pop("CLAUDECODE", None)
 
-    config = AgentConfig.from_env()
-    config.cwd = "/Users/himanshusharma/Code/Codex/seo-bot"
-    config.setting_sources = []
-    config.system_prompt = (
-        "You are an autonomous SEO agent. Execute the given task completely "
-        "and autonomously. Use the tools available to you. Report what you did "
-        "and the outcome clearly at the end."
-    )
-    timeout = _agent_execution_timeout_seconds()
-    try:
-        return await asyncio.wait_for(SEOAgent.create_and_run(prompt, config), timeout=timeout)
-    except asyncio.TimeoutError as e:
-        raise RuntimeError(f"Agent execution timed out after {timeout}s") from e
+def _serialize_prompt_context(prompt_context) -> str:
+    if prompt_context is None:
+        return "{}"
+    return json.dumps(prompt_context.as_dict(), ensure_ascii=False)
 
 
 def _task_response(task) -> dict:
@@ -437,9 +541,215 @@ def _task_response(task) -> dict:
         "model": task.model,
         "parent_task_id": task.parent_task_id,
         "comment_count": task.comment_count,
+        "last_run_id": task.last_run_id,
+        "active_run_id": task.active_run_id,
         "created_at": task.created_at,
         "updated_at": task.updated_at,
     }
+
+
+def _run_response(run) -> dict:
+    return {
+        "run_id": run.run_id,
+        "task_id": run.task_id,
+        "status": run.status,
+        "execution_type": run.execution_type,
+        "trigger_source": run.trigger_source,
+        "session_id": run.session_id,
+        "validator_status": run.validator_status,
+        "profile_name": run.profile_name,
+        "error": run.error,
+        "started_at": run.started_at,
+        "finished_at": run.finished_at,
+    }
+
+
+def _log_run_event(db, run_id: str, event_type: str, payload: Optional[dict] = None) -> None:
+    db.add(
+        RunEventModel(
+            run_id=run_id,
+            event_type=event_type,
+            payload=json.dumps(payload or {}, ensure_ascii=False),
+            created_at=datetime.utcnow().isoformat(),
+        )
+    )
+    db.commit()
+
+
+def _get_task_session_id(db, task_id: Optional[int]) -> Optional[str]:
+    if task_id is None:
+        return None
+    session = db.query(TaskSessionModel).filter(TaskSessionModel.task_id == task_id).first()
+    return session.session_id if session else None
+
+
+def _upsert_task_session(db, task_id: int, session_id: str, run_id: str) -> None:
+    record = db.query(TaskSessionModel).filter(TaskSessionModel.task_id == task_id).first()
+    now = datetime.utcnow().isoformat()
+    if record is None:
+        record = TaskSessionModel(
+            task_id=task_id,
+            session_id=session_id,
+            last_run_id=run_id,
+            updated_at=now,
+        )
+        db.add(record)
+    else:
+        record.session_id = session_id
+        record.last_run_id = run_id
+        record.updated_at = now
+    db.commit()
+
+
+def _create_run(db, task, trigger_source: str, execution_type: Optional[str], source_comment_id: Optional[int] = None):
+    run = AgentRunModel(
+        run_id=str(uuid4()),
+        task_id=task.id if task else None,
+        status="queued",
+        execution_type=execution_type or "manual",
+        trigger_source=trigger_source,
+        session_id=None,
+        validator_status="pending",
+        profile_name=None,
+        prompt_text=None,
+        prompt_context_json=None,
+        result_summary=None,
+        error=None,
+        source_comment_id=source_comment_id,
+        started_at=datetime.utcnow().isoformat(),
+        finished_at=None,
+    )
+    db.add(run)
+    db.commit()
+    db.refresh(run)
+    if task is not None:
+        task.active_run_id = run.run_id
+        task.last_run_id = run.run_id
+        task.updated_at = datetime.utcnow().isoformat()
+        db.commit()
+    _log_run_event(db, run.run_id, "run_created", {"trigger_source": trigger_source})
+    return run
+
+
+def _mark_run_started(db, run, prompt_context, profile_name: str, session_id: Optional[str]) -> None:
+    run.status = "running"
+    run.profile_name = profile_name
+    run.prompt_context_json = _serialize_prompt_context(prompt_context)
+    run.session_id = session_id
+    db.commit()
+    _log_run_event(db, run.run_id, "run_started", {"profile_name": profile_name, "session_id": session_id})
+
+
+def _finalize_run_success(
+    db,
+    run,
+    task,
+    result_text: str,
+    session_id: Optional[str],
+    validation: ValidationResult,
+) -> None:
+    now = datetime.utcnow().isoformat()
+    run.session_id = session_id
+    run.result_summary = result_text
+    run.validator_status = validation.status
+    run.finished_at = now
+    run.status = "completed" if validation.status == "passed" else "needs_review"
+    run.error = validation.message if validation.status != "passed" else None
+
+    task.notes = result_text
+    task.status = "completed" if validation.status == "passed" else "blocked"
+    task.active_run_id = None
+    task.last_run_id = run.run_id
+    task.updated_at = now
+    db.commit()
+
+    if session_id and run.task_id is not None:
+        _upsert_task_session(db, run.task_id, session_id, run.run_id)
+    _log_run_event(
+        db,
+        run.run_id,
+        "run_completed",
+        {"validator_status": validation.status, "message": validation.message},
+    )
+
+
+def _finalize_run_failure(db, run, task, error_message: str, status: str = "failed") -> None:
+    now = datetime.utcnow().isoformat()
+    run.status = status
+    run.error = error_message
+    run.finished_at = now
+    run.validator_status = "failed"
+    task.status = "blocked"
+    task.notes = f"Error: {error_message}"
+    task.active_run_id = None
+    task.last_run_id = run.run_id
+    task.updated_at = now
+    db.commit()
+    _log_run_event(db, run.run_id, "run_failed", {"error": error_message, "status": status})
+
+
+def _refresh_context_view(db, task_id: Optional[int] = None) -> None:
+    context_path = Path(_project_root()) / "memory" / "seo-context.md"
+    context_path.parent.mkdir(parents=True, exist_ok=True)
+    context_path.write_text(generate_context_view_markdown(db, task_id=task_id), encoding="utf-8")
+
+
+async def _run_agent_prompt(prompt: str, config: AgentConfig, prompt_context) -> object:
+    """Execute a prompt via SEOAgent using layered memory context."""
+    os.environ.pop("CLAUDECODE", None)
+    timeout = _agent_execution_timeout_seconds()
+    try:
+        return await asyncio.wait_for(
+            SEOAgent.create_and_run_result(prompt, config, prompt_context=prompt_context),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError as e:
+        raise RuntimeError(f"Agent execution timed out after {timeout}s") from e
+
+
+def _build_runtime_config(profile, resume_session_id: Optional[str]) -> AgentConfig:
+    config = AgentConfig.from_env()
+    config.cwd = _project_root()
+    config.setting_sources = []
+    config.system_prompt = (
+        "You are an autonomous SEO agent. Execute the given task completely "
+        "and autonomously. Use the tools available to you. Report what you did "
+        "and the outcome clearly at the end."
+    )
+    config.allowed_tools = list(profile.allowed_tools)
+    config.max_turns = profile.max_turns
+    config.max_budget_usd = profile.max_budget_usd
+    config.max_thinking_tokens = profile.max_thinking_tokens
+    config.resume = resume_session_id if profile.should_resume_session else None
+    return config
+
+
+def _normalize_execution_result(execution):
+    """
+    Coerce any SDK result type into an object with .result_text and .session_id.
+
+    Known SDK types (AgentExecutionResult) pass through unchanged. Plain strings
+    are wrapped. Unknown types are logged as a warning and wrapped gracefully so
+    the caller never crashes on an unexpected SDK payload (#5).
+
+    Scalability note (#5): if the SDK adds new result event types (streaming
+    chunks, tool-call receipts), they'll appear here first. Log the full payload
+    so debugging is easy. Do not silently discard — unknown ≠ empty.
+    """
+    if execution is None:
+        return type("ExecutionResult", (), {"result_text": "", "session_id": None})()
+    if hasattr(execution, "result_text"):
+        return execution
+    if isinstance(execution, str):
+        return type("ExecutionResult", (), {"result_text": execution, "session_id": None})()
+    # Unknown type — log and wrap rather than crash
+    logger.warning(
+        "Unknown SDK result type '%s' — wrapping gracefully. Payload: %r",
+        type(execution).__name__,
+        execution,
+    )
+    text = str(execution) if execution else ""
+    return type("ExecutionResult", (), {"result_text": text, "session_id": None})()
 
 
 def _acquire_next_comment_action(db) -> Optional[CommentActionModel]:
@@ -523,30 +833,45 @@ async def process_one_comment_action() -> dict:
             task.updated_at = datetime.utcnow().isoformat()
             db.commit()
             add_task_comment(db, task.id, f"🤖 Started revision from comment #{comment.id}", "agent")
+            run = _create_run(
+                db,
+                task,
+                "comment_autopilot",
+                task.execution_type or "manual",
+                source_comment_id=comment.id,
+            )
+            action.run_id = run.run_id
+            db.commit()
 
-            prompt = build_comment_revision_prompt(task, comment.body)
+            workflow_prompt = build_comment_revision_prompt(task, comment.body)
             try:
-                revised_result = await _run_agent_prompt(prompt)
-                task.status = "completed"
-                task.notes = revised_result
-                task.updated_at = datetime.utcnow().isoformat()
-                db.commit()
+                profile = get_execution_profile(task.execution_type)
+                resume_session_id = _get_task_session_id(db, task.id)
+                prompt_context = _resolve_prompt_context(db, run, task, [comment], workflow_prompt, profile)
+                run.prompt_text = workflow_prompt
+                _mark_run_started(db, run, prompt_context, profile.execution_type, resume_session_id)
+                config = _build_runtime_config(profile, resume_session_id)
+                execution = _normalize_execution_result(await _run_agent_prompt(workflow_prompt, config, prompt_context))
+                validation = ValidationResult(
+                    status="passed" if execution.result_text and execution.result_text.strip() else "failed",
+                    message=None if execution.result_text and execution.result_text.strip() else "Revision output was empty.",
+                )
+                _finalize_run_success(db, run, task, execution.result_text, execution.session_id, validation)
+                _refresh_context_view(db, task_id=task.id)
 
                 add_task_comment(
                     db,
                     task.id,
-                    f"🤖 Revision completed for comment #{comment.id}\n\n{revised_result}",
+                    f"🤖 Revision completed for comment #{comment.id}\n\n{execution.result_text}",
                     "agent",
                 )
 
-                action.status = "succeeded"
+                action.status = "succeeded" if validation.status == "passed" else "needs_review"
                 action.acted_at = datetime.utcnow().isoformat()
-                action.last_error = None
+                action.last_error = validation.message
             except Exception as e:
-                task.status = "blocked"
-                task.notes = f"Error: {str(e)}"
-                task.updated_at = datetime.utcnow().isoformat()
-                db.commit()
+                _finalize_run_failure(db, run, task, str(e))
+                _refresh_context_view(db, task_id=task.id)
                 add_task_failed_comment(db, task.id, f"Comment #{comment.id}: {str(e)}")
 
                 action.last_error = str(e)
@@ -644,27 +969,7 @@ def list_tasks(limit: int = 200):
         )
         
         # Convert to response format
-        task_list = []
-        for task in tasks:
-            task_dict = {
-                "id": task.id,
-                "title": task.title,
-                "description": task.description,
-                "status": task.status,
-                "priority": task.priority,
-                "assignee": task.assignee,
-                "due_date": task.due_date,
-                "execution_type": task.execution_type,
-                "requires_approval": task.requires_approval,
-                "approved_at": task.approved_at,
-                "notes": task.notes,
-                "model": task.model,
-                "parent_task_id": task.parent_task_id,
-                "comment_count": task.comment_count,
-                "created_at": task.created_at,
-                "updated_at": task.updated_at,
-            }
-            task_list.append(task_dict)
+        task_list = [_task_response(task) for task in tasks]
         
         # Calculate counts
         pending_count = sum(1 for t in tasks if t.status == "pending")
@@ -705,25 +1010,7 @@ def create_task(task: TaskCreate):
         db.add(db_task)
         db.commit()
         db.refresh(db_task)
-        
-        return {
-            "id": db_task.id,
-            "title": db_task.title,
-            "description": db_task.description,
-            "status": db_task.status,
-            "priority": db_task.priority,
-            "assignee": db_task.assignee,
-            "due_date": db_task.due_date,
-            "execution_type": db_task.execution_type,
-            "requires_approval": db_task.requires_approval,
-            "approved_at": db_task.approved_at,
-            "notes": db_task.notes,
-            "model": db_task.model,
-            "parent_task_id": db_task.parent_task_id,
-            "comment_count": db_task.comment_count,
-            "created_at": db_task.created_at,
-            "updated_at": db_task.updated_at,
-        }
+        return _task_response(db_task)
     finally:
         db.close()
 
@@ -737,24 +1024,7 @@ def get_task(task_id: int):
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
         
-        return {
-            "id": task.id,
-            "title": task.title,
-            "description": task.description,
-            "status": task.status,
-            "priority": task.priority,
-            "assignee": task.assignee,
-            "due_date": task.due_date,
-            "execution_type": task.execution_type,
-            "requires_approval": task.requires_approval,
-            "approved_at": task.approved_at,
-            "notes": task.notes,
-            "model": task.model,
-            "parent_task_id": task.parent_task_id,
-            "comment_count": task.comment_count,
-            "created_at": task.created_at,
-            "updated_at": task.updated_at,
-        }
+        return _task_response(task)
     finally:
         db.close()
 
@@ -777,24 +1047,7 @@ def update_task(task_id: int, task: TaskUpdate):
         db.commit()
         db.refresh(db_task)
         
-        return {
-            "id": db_task.id,
-            "title": db_task.title,
-            "description": db_task.description,
-            "status": db_task.status,
-            "priority": db_task.priority,
-            "assignee": db_task.assignee,
-            "due_date": db_task.due_date,
-            "execution_type": db_task.execution_type,
-            "requires_approval": db_task.requires_approval,
-            "approved_at": db_task.approved_at,
-            "notes": db_task.notes,
-            "model": db_task.model,
-            "parent_task_id": db_task.parent_task_id,
-            "comment_count": db_task.comment_count,
-            "created_at": db_task.created_at,
-            "updated_at": db_task.updated_at,
-        }
+        return _task_response(db_task)
     finally:
         db.close()
 
@@ -831,6 +1084,21 @@ You cannot make live CMS changes. Instead:
 2. Produce the final output (new title, meta description, content, etc.) clearly in your report.
 3. Format it so the user can manually paste it into Webflow.
 4. Do NOT attempt to call any mcp__webflow__ tools.
+"""
+
+
+def _gsc_available() -> bool:
+    """Check if Google Search Console credentials are configured."""
+    import os
+    return bool(os.environ.get("GSC_SITE_URL"))
+
+
+def _gsc_degradation_note() -> str:
+    """Return a note to append when GSC is not configured."""
+    return """
+NOTE: Google Search Console is not configured (GSC_SITE_URL not set).
+GSC tools (gsc_query_search_analytics, gsc_inspect_url, gsc_list_sitemaps) are unavailable.
+For ranking signals fall back to WebSearch and WebFetch as described in the phase instructions.
 """
 
 
@@ -1075,7 +1343,7 @@ def _render_learnings_markdown(learnings: dict) -> str:
     )
 
     lines = ["# SEO Learnings\n",
-             "_Principles extracted from measured ranking changes on nocodeassistant.agency._\n"]
+             "_Principles extracted from measured ranking changes on this site._\n"]
     for l in sorted_items:
         lines.append(f"## {l.get('id', 'unknown')} [{l.get('confidence', '?')} confidence, {l.get('hit_count', 0)} hits]")
         lines.append(f"- **Discovered:** {l.get('discovered', '')}")
@@ -1239,8 +1507,8 @@ Step 2 — Generate 3 title options
 Rules:
 - 50–60 characters including spaces
 - Primary keyword near the beginning
-- Brand name at the end: "Keyword Phrase | NocodeAssistant"
-- Specific to the target audience: SMB founders/COOs/CEOs, $3M-$30M revenue, 5-80 employees
+- Brand name at the end: "Keyword Phrase | [Your Brand]"
+- Specific to your target audience (read memory/CLAUDE.md for audience details)
 - No filler qualifiers ("Trusted", "Best", "Leading")
 
 Step 3 — Finalize draft for manual use
@@ -1286,13 +1554,13 @@ WORKFLOW — execute every step in order:
 Step 1 — Research
 Use WebSearch to understand what competitors use in meta descriptions for this topic:
 - Search: "[topic] [page type] meta description examples"
-- Identify: primary keyword, user intent, strongest value propositions for SMB operators.
+- Identify: primary keyword, user intent, strongest value propositions for your target audience.
 
 Step 2 — Write the meta description
 Rules:
 - 150–160 characters exactly (count carefully)
 - Primary keyword appears naturally in the first half
-- Clear value proposition for SMB founders/COOs
+- Clear value proposition for your target audience
 - Ends with an implicit or explicit call to action
 - No keyword stuffing; reads naturally
 
@@ -1344,7 +1612,7 @@ Rules:
 - Under 70 characters
 - Contains the primary keyword
 - Specific to this page (not reusable across other pages)
-- Direct and clear — no filler, speaks to SMB operators
+- Direct and clear — no filler, speaks to your target audience
 
 Step 4 — Finalize draft for manual use
 Pick the strongest option and present:
@@ -1391,19 +1659,19 @@ Search: "[topic] keyword research", "[topic] how to", "[topic] guide"
 
 Step 2 — Outline
 Create a full post outline:
-- SEO title (50-60 chars, keyword-first, ends with "| NocodeAssistant")
+- SEO title (50-60 chars, keyword-first, ends with "| [Your Brand]")
 - Meta description (150-160 chars)
 - H1 (matches or is very close to the SEO title)
 - H2 sections with supporting H3s where needed
-- Target word count: 800-1500 words for this SMB audience
+- Target word count: 800-1500 words (adjust based on competitor benchmarks from Step 1)
 
 Step 3 — Write the post
 Use the Skill tool to invoke the copywriting skill.
 Write the full post following the outline. Must include:
 - Primary keyword in first 100 words
 - Keyword density ~1-2% (natural usage)
-- 2-3 internal links to other nocodeassistant.agency pages
-- CTA at the end pointing to the agency's services
+- 2-3 internal links to other pages on the site
+- CTA at the end pointing to the relevant service or page
 
 Step 4 — Finalize draft for manual publishing
 Present clearly:
@@ -1572,7 +1840,7 @@ Step 3 — Synthesize findings
 Produce a structured report with:
 - Primary keyword recommendations (with estimated search volume if findable)
 - Competitor analysis (who ranks, why they rank, gaps you can exploit)
-- Specific actionable recommendations for nocodeassistant.agency
+- Specific actionable recommendations for this site
 - Suggested next tasks with their execution types (e.g., rewrite_title, blog_write)
 
 Step 4 — Save findings to task notes.
@@ -1656,8 +1924,9 @@ Step 5 — Save to task notes. No automated CMS changes."""
 
     elif etype == "seo_impact_review":
         cms_types_list = ", ".join(sorted(CMS_CHANGE_FIELD_MAP.keys()))
-        _prompt = base + f"""
-You are running an SEO feedback loop impact review for nocodeassistant.agency.
+        gsc_note = "" if _gsc_available() else _gsc_degradation_note()
+        _prompt = base + gsc_note + f"""
+You are running an SEO feedback loop impact review for this site.
 Execute phases in order. After each phase the system state must be valid before proceeding.
 
 CONSTRAINTS:
@@ -1693,15 +1962,23 @@ PHASE 3 — Evaluate each entry (sequential)
 For each entry in the batch:
 a. If is_backfilled=true and url=null: set status=reviewed-inconclusive,
    review_notes="backfilled — no URL to evaluate", reviewed_at=now. Write JSON. Continue.
-b. WebFetch the entry url — note current value of the changed field
-c. WebSearch: "site:nocodeassistant.agency" + page path + change_type + "impact"
+b. WebFetch the entry url — note current value of the changed field (confirms change is live)
+c. Gather ranking signal — use the first source that returns data:
+   1. GSC (preferred): call gsc_query_search_analytics with dimensions=["page"] and a
+      dimension_filter_groups page filter matching the entry url. Use date range covering
+      the 28 days before logged_at vs 28 days after. Compare clicks/impressions/position.
+      If GSC is unavailable (tool not in allowed list or returns an error), fall through to step 2.
+   2. GSC by query: call gsc_query_search_analytics with dimensions=["query","page"], same
+      filter + date range, row_limit=10 — identify top queries driving traffic to this page.
+   3. Fallback: WebSearch "site:[target-domain]" + page path + change_type + "ranking"
 d. Classify outcome: reviewed-positive | reviewed-negative | reviewed-neutral | reviewed-inconclusive
-   - positive: measurable improvement visible (ranking, snippet, field value)
-   - negative: measurable regression
-   - neutral: change present but no ranking signal yet
+   - positive: measurable improvement visible (clicks ↑, impressions ↑, position ↑, or better snippet)
+   - negative: measurable regression (clicks ↓, position ↓, or live change is absent/rolled back)
+   - neutral: change present, no ranking signal yet (data lag or not enough traffic)
    - inconclusive: live data unavailable after 2 attempts
 e. For negative: add one-line hypothesis (too soon / competitor change / intent mismatch / rolled back)
-f. Set entry status, review_notes, reviewed_at=now in memory/seo-changes.json
+f. Set entry status, review_notes (include GSC deltas if available), reviewed_at=now
+   in memory/seo-changes.json
 g. Atomic write immediately after each entry — partial progress is safe on timeout
 
 PHASE 4 — Extract learnings (positives only, skip backfilled)
@@ -1727,6 +2004,61 @@ Recommended next tasks: [task title, execution_type]
 """
         return _append_user_notes(_prompt, comments)
 
+    elif etype == "orchestrate_seo_campaign":
+        gsc_note = _gsc_degradation_note() if not _gsc_available() else ""
+        _prompt = base + f"""
+You are the SEO campaign orchestrator. Your sole output is a structured JSON campaign plan.
+
+Read the following files to understand the site before planning:
+- memory/CLAUDE.md (site overview, brand, audience, target keywords)
+- memory/seo-strategy.md (current SEO strategy)
+- memory/seo-context.md (recent sprint state)
+
+Then produce a JSON plan wrapped in ```json ... ``` with exactly this schema:
+
+{{
+  "campaign_goal": "...",
+  "phases": [
+    {{
+      "phase": "researcher",
+      "task_title": "Research: <specific angle>",
+      "task_description": "<one paragraph, actionable>",
+      "execution_type": "campaign_researcher",
+      "depends_on": []
+    }},
+    {{
+      "phase": "content_writer",
+      "task_title": "Write: <specific content>",
+      "task_description": "<one paragraph, actionable>",
+      "execution_type": "campaign_content_writer",
+      "depends_on": ["researcher"]
+    }},
+    {{
+      "phase": "publisher",
+      "task_title": "Publish: <item>",
+      "task_description": "<one paragraph, actionable>",
+      "execution_type": "campaign_publisher",
+      "depends_on": ["content_writer"]
+    }},
+    {{
+      "phase": "analyst",
+      "task_title": "Analyse: <what to measure>",
+      "task_description": "<one paragraph, actionable>",
+      "execution_type": "campaign_analyst",
+      "depends_on": ["publisher"]
+    }}
+  ]
+}}
+
+Rules:
+- phases must be listed in dependency order (no phase before its dependencies)
+- task_title must be specific — reference actual pages, keywords, or content from the memory files
+- task_description must be one actionable paragraph (what the agent should do, not why)
+- Only include phases relevant to this campaign goal; omit phases that add no value
+- Do not produce any output other than the JSON block
+{gsc_note}"""
+        return _append_user_notes(_prompt, comments)
+
     else:
         # Default: flat prompt for unknown or manual types
         _prompt = task.title
@@ -1735,59 +2067,167 @@ Recommended next tasks: [task title, execution_type]
         return _append_user_notes(_prompt, comments)
 
 
-@app.post("/tasks/{task_id}/execute", response_model=TaskResponse)
+def _resolve_prompt_context(db, run, task, comments, workflow_prompt, profile):
+    short_term = build_short_term_context(run, task, comments)
+    episodic = fetch_episodic_context(db, task.id if task else None, run.execution_type or "manual", profile.episodic_limit)
+    semantic = fetch_semantic_context(task, run.execution_type or "manual", _project_root(), profile.semantic_char_limit)
+    procedural = fetch_procedural_context(run.execution_type or "manual", workflow_prompt, profile)
+    return compose_prompt_context(short_term, episodic, semantic, procedural)
+
+
+@app.post("/tasks/{task_id}/execute", response_model=RunResponse)
 async def execute_task(task_id: int):
-    """Execute a task via SEOAgent."""
+    """Execute a task via SEOAgent and return the run record."""
     db = get_db_session()
     try:
         task = db.query(TaskModel).filter(TaskModel.id == task_id).first()
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
-        
-        # Update status to in_progress
+
+        run = _create_run(db, task, "manual_execute", task.execution_type or "manual")
         task.status = "in_progress"
         task.updated_at = datetime.utcnow().isoformat()
         db.commit()
-        
-        # Add "task started" comment
         add_task_started_comment(db, task_id, task.title)
-        
-        # Execute the task via SEOAgent
+
+        # ── Orchestration branch ──────────────────────────────────────────────
+        if task.execution_type == "orchestrate_seo_campaign":
+            from agent.orchestrator import run_campaign_orchestration
+            try:
+                await run_campaign_orchestration(db, task, run)
+            except Exception as e:
+                _finalize_run_failure(db, run, task, str(e))
+                _refresh_context_view(db, task_id=task.id)
+                add_task_failed_comment(db, task_id, str(e))
+            db.refresh(run)
+            return _run_response(run)
+        # ── End orchestration branch ──────────────────────────────────────────
+
         try:
             task_comments = db.query(CommentModel).filter(CommentModel.task_id == task_id).order_by(CommentModel.created_at).all()
-            prompt = build_execution_prompt(task, comments=task_comments)
-            result = await _run_agent_prompt(prompt)
-
-            # Update task with result
-            task.status = "completed"
-            task.notes = result
-            task.updated_at = datetime.utcnow().isoformat()
-            db.commit()
+            workflow_prompt = build_execution_prompt(task, comments=task_comments)
+            profile = get_execution_profile(task.execution_type)
+            resume_session_id = _get_task_session_id(db, task.id)
+            prompt_context = _resolve_prompt_context(db, run, task, task_comments, workflow_prompt, profile)
+            run.prompt_text = workflow_prompt
+            _mark_run_started(db, run, prompt_context, profile.execution_type, resume_session_id)
+            config = _build_runtime_config(profile, resume_session_id)
+            execution = _normalize_execution_result(await _run_agent_prompt(workflow_prompt, config, prompt_context))
+            validation = profile.validator(execution.result_text)
+            _finalize_run_success(db, run, task, execution.result_text, execution.session_id, validation)
+            _refresh_context_view(db, task_id=task.id)
 
             # Deterministic application-layer change logging (guaranteed, not prompt-dependent)
             if task.execution_type in CMS_CHANGE_FIELD_MAP:
                 try:
-                    _write_change_log_entry(task, result, task_comments)
+                    _write_change_log_entry(task, execution.result_text, task_comments)
                 except Exception as log_err:
                     add_task_comment(db, task_id, f"⚠️ Change log write failed: {log_err}", "agent")
 
-            # Add "task completed" comment
-            add_task_completed_comment(db, task_id, result)
-            
+            if validation.status == "passed":
+                add_task_completed_comment(db, task_id, execution.result_text)
+            else:
+                add_task_comment(
+                    db,
+                    task_id,
+                    f"⚠️ Run completed but failed validation: {validation.message}",
+                    "agent",
+                )
         except Exception as e:
-            # Mark as blocked on error
-            task.status = "blocked"
-            task.notes = f"Error: {str(e)}"
-            task.updated_at = datetime.utcnow().isoformat()
-            db.commit()
-            
-            # Add "task failed" comment
+            _finalize_run_failure(db, run, task, str(e))
+            _refresh_context_view(db, task_id=task.id)
             add_task_failed_comment(db, task_id, str(e))
-        
-        # Refresh task to get updated comment_count
-        db.refresh(task)
-        
-        return _task_response(task)
+
+        db.refresh(run)
+        return _run_response(run)
+    finally:
+        db.close()
+
+
+@app.get("/runs/{run_id}", response_model=RunResponse)
+def get_run(run_id: str):
+    db = get_db_session()
+    try:
+        run = db.query(AgentRunModel).filter(AgentRunModel.run_id == run_id).first()
+        if not run:
+            raise HTTPException(status_code=404, detail="Run not found")
+        return _run_response(run)
+    finally:
+        db.close()
+
+
+@app.get("/orchestrations/{orchestrator_run_id}")
+def get_orchestration_state(orchestrator_run_id: str):
+    """Get orchestration state and child task details for a campaign run."""
+    db = get_db_session()
+    try:
+        state = db.query(OrchestrationStateModel).filter(
+            OrchestrationStateModel.orchestrator_run_id == orchestrator_run_id
+        ).first()
+        if not state:
+            raise HTTPException(status_code=404, detail="Orchestration state not found")
+
+        child_run_ids = json.loads(state.child_run_ids_json or "[]")
+        phase_outputs = json.loads(state.phase_outputs_json or "{}")
+
+        child_tasks = []
+        for run_id in child_run_ids:
+            child_run = db.query(AgentRunModel).filter(AgentRunModel.run_id == run_id).first()
+            if child_run and child_run.task_id:
+                child_task = db.query(TaskModel).filter(TaskModel.id == child_run.task_id).first()
+                if child_task:
+                    child_tasks.append({
+                        "run_id": run_id,
+                        "task_id": child_task.id,
+                        "title": child_task.title,
+                        "status": child_task.status,
+                        "execution_type": child_task.execution_type,
+                    })
+
+        return {
+            "orchestrator_run_id": state.orchestrator_run_id,
+            "campaign_goal": state.campaign_goal,
+            "current_phase": state.current_phase,
+            "status": state.status,
+            "error": state.error,
+            "phases_completed": list(phase_outputs.keys()),
+            "child_tasks": child_tasks,
+            "created_at": state.created_at,
+            "updated_at": state.updated_at,
+        }
+    finally:
+        db.close()
+
+
+@app.get("/tasks/{task_id}/memory", response_model=TaskMemoryResponse)
+def get_task_memory(task_id: int):
+    db = get_db_session()
+    try:
+        task = db.query(TaskModel).filter(TaskModel.id == task_id).first()
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+        run = None
+        if task.last_run_id:
+            run = db.query(AgentRunModel).filter(AgentRunModel.run_id == task.last_run_id).first()
+        if run is None:
+            run = AgentRunModel(
+                run_id="preview",
+                task_id=task.id,
+                execution_type=task.execution_type or "manual",
+                trigger_source="memory_debug",
+                session_id=_get_task_session_id(db, task.id),
+                validator_status="preview",
+            )
+        comments = db.query(CommentModel).filter(CommentModel.task_id == task.id).order_by(CommentModel.created_at).all()
+        workflow_prompt = build_execution_prompt(task, comments=comments)
+        profile = get_execution_profile(task.execution_type)
+        prompt_context = _resolve_prompt_context(db, run, task, comments, workflow_prompt, profile)
+        return {
+            "task_id": task.id,
+            "run_id": getattr(run, "run_id", None),
+            "execution_type": task.execution_type,
+            "memory": prompt_context.as_dict(),
+        }
     finally:
         db.close()
 

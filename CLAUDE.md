@@ -10,12 +10,61 @@ This project contains an autonomous SEO agent built with Python using Claude Age
 
 ## Architecture
 
-- `agent/seo_agent.py` - Main SEOAgent class using Claude Agent SDK
-- `agent/config.py` - Configuration dataclass (AgentConfig)
-- `main.py` - CLI entry point
-- `Skills/` - SEO skills (.skill files are ZIP archives containing SKILL.md)
+- `agent/seo_agent.py` - Main SEOAgent class using Claude Agent SDK; returns `AgentExecutionResult`
+- `agent/config.py` - Configuration dataclass (AgentConfig); exports `PROJECT_ROOT`; supports `SEO_AGENT_CWD` env var and `max_thinking_tokens`
+- `agent/memory_service.py` - Layered memory composition: builds `ShortTermContext`, `EpisodicContext`, `SemanticContext`, `ProceduralContext` into a `ComposedPromptContext` for prompt injection
+- `agent/runtime_profiles.py` - `ExecutionProfile` registry; maps each execution type to tool policy, budget, timeout, turn limit, validator, and semantic char limits
+- `agent/orchestrator.py` - Multi-agent campaign dispatch loop; DAG tier resolution (`_resolve_execution_tiers`), structured inter-agent handoffs (`_extract_summary_block`), retry with backoff (`_run_with_retry`), parallel execution via `asyncio.gather`
+- `main.py` - CLI entry point; uses `PROJECT_ROOT` for portable working directory
+- `agent/api/main.py` - FastAPI Kanban server; includes `AgentRunModel`, `RunEventModel`, `TaskSessionModel`, `OrchestrationStateModel` DB tables for full run tracking
+- `skills/` - SEO skills (.skill files are ZIP archives containing SKILL.md)
 - `memory/` - Session memory (CLAUDE.md, seo-strategy.md, seo-context.md, seo-tasks.md)
 - `tests/` - Test suite with pytest
+
+## Multi-Agent Orchestration
+
+Trigger: create a Kanban task with `execution_type = "orchestrate_seo_campaign"` and click Execute.
+
+**Flow:**
+1. Orchestrator agent reads `memory/` files and outputs a `{"campaign_goal": ..., "phases": [...]}` JSON plan
+2. Python (`agent/orchestrator.py`) parses the plan and resolves execution tiers via Kahn's topological sort
+3. Child `TaskModel` rows are created (one per phase, with `parent_task_id` set)
+4. Tiers execute sequentially; phases within a tier run concurrently via `asyncio.gather`
+5. Each phase agent receives prior outputs via structured `## Summary for Next Phase` blocks (falls back to 1500-char truncation)
+6. `OrchestrationStateModel` persists state: plan JSON, current phase, all phase outputs, child run IDs, and final status
+7. All child `AgentRunModel` rows carry `parent_run_id` pointing to the orchestrator run
+
+**Phase plan schema** (what the orchestrator agent must output):
+```json
+{
+  "campaign_goal": "string",
+  "phases": [
+    {
+      "phase": "researcher",
+      "task_title": "Research: <specific angle>",
+      "task_description": "...",
+      "execution_type": "campaign_researcher",
+      "depends_on": []
+    },
+    { "phase": "content_writer", "depends_on": ["researcher"], ... }
+  ]
+}
+```
+
+**Inter-agent handoff protocol:** Each child agent must end its output with:
+```
+## Summary for Next Phase
+<concise handoff notes for the next agent>
+## End Summary
+```
+
+**Retry policy:** transient errors (timeouts, 503s, rate limits) are retried up to 2 times with exponential backoff. Non-retryable: budget exceeded, malformed plan, circular dependency.
+
+**Scalability boundaries** (annotated in source with `# Scalability note`):
+- `#1` — move `run_campaign_orchestration` call to a task queue (Celery/arq) for production; return 202 + polling
+- `#2` — swap SQLite for Postgres via `DATABASE_URL`; schema is unchanged
+- `#6` — child agent tool scopes are enforced in `runtime_profiles.py`; never expand via `EXECUTABLE_TYPES`
+- `#8` — `_atomic_json_write` uses `os.replace()` (POSIX-atomic); add `fcntl.flock()` for multi-worker
 
 ## Technology Stack
 
@@ -36,10 +85,17 @@ The agent uses file-based memory for persistent context:
 - **`memory/seo-tasks.md`** - Generated task lists from audits with priorities and subtasks.
 
 **Session workflow:**
-1. Agent reads `memory/CLAUDE.md` for SEO context
-2. Agent executes task via SDK
-3. Agent updates `memory/seo-context.md` with what was done
-4. Next session continues from persisted state
+1. Agent reads `memory/CLAUDE.md`, `memory/seo-strategy.md`, and `memory/seo-context.md` for SEO context
+2. `memory_service` composes a layered prompt context (short-term, episodic, semantic, procedural)
+3. `runtime_profiles` selects the `ExecutionProfile` for the execution type (tools, budget, turns, validator)
+4. Agent executes the task via SDK; result stored in `AgentRunModel`
+5. Next session can resume via session ID and draws from `EpisodicContext` (prior run summaries)
+
+**Orchestration workflow** (when `execution_type = "orchestrate_seo_campaign"`):
+1. Orchestrator agent produces JSON plan → stored in `OrchestrationStateModel.plan_json`
+2. `_resolve_execution_tiers` builds DAG tiers from `depends_on` fields
+3. Each tier dispatches concurrently; outputs accumulate in `OrchestrationStateModel.phase_outputs_json`
+4. Child runs record `parent_run_id`; child tasks record `parent_task_id`
 
 ## Documentation Rules
 
@@ -178,9 +234,9 @@ The agent can create and manage Google Docs for SEO audit reports, blog content,
 
 ### Environment Variables
 ```bash
-GOOGLE_DOCS_CREDENTIALS_PATH=Google SA Credentials/tinyclaw-487419-d5ab318833bb.json
+GOOGLE_DOCS_CREDENTIALS_PATH=google-sa-credentials/service-account.json
 # OR use the standard Google application credentials path:
-GOOGLE_APPLICATION_CREDENTIALS=Google SA Credentials/tinyclaw-487419-d5ab318833bb.json
+GOOGLE_APPLICATION_CREDENTIALS=google-sa-credentials/service-account.json
 ```
 
 ### Programmatic Configuration
@@ -189,7 +245,7 @@ from agent import AgentConfig, GoogleDocsConfig
 
 config = AgentConfig(
     google_docs_config=GoogleDocsConfig(
-        credentials_path="Google SA Credentials/tinyclaw-487419-d5ab318833bb.json"
+        credentials_path="google-sa-credentials/service-account.json"
     )
 )
 ```
@@ -218,6 +274,61 @@ agent/google_docs/
 ├── __init__.py    # Exports
 ├── config.py      # GoogleDocsConfig dataclass
 ├── client.py      # GoogleDocsAPIClient
+├── tools.py       # @tool decorated functions
+└── server.py      # MCP server factory
+```
+
+## Google Search Console Integration
+
+The agent can query live Search Console data: clicks, impressions, CTR, position,
+URL indexing status, and sitemaps. Read-only — no write operations are exposed.
+
+Uses the same Google Service Account as Google Docs. Grant the SA access to your
+GSC property in Search Console → Settings → Users and permissions.
+
+### Environment Variables
+```bash
+GSC_SITE_URL=sc-domain:example.com          # domain property
+# OR
+GSC_SITE_URL=https://www.example.com/       # URL-prefix property
+
+# Credentials (falls back to GOOGLE_DOCS_CREDENTIALS_PATH / GOOGLE_APPLICATION_CREDENTIALS):
+GSC_CREDENTIALS_PATH=google-sa-credentials/service-account.json
+```
+
+### Programmatic Configuration
+```python
+from agent import AgentConfig, GscConfig
+
+config = AgentConfig(
+    gsc_config=GscConfig(
+        site_url="sc-domain:example.com",
+        credentials_path="google-sa-credentials/service-account.json"
+    )
+)
+```
+
+### Available Tools
+**Automatically available when `GSC_SITE_URL` is set.** Added to `allowed_tools`:
+
+- `mcp__gsc__gsc_query_search_analytics` - Query clicks/impressions/CTR/position by query, page, device, or date
+- `mcp__gsc__gsc_inspect_url` - Get indexing status for a specific URL
+- `mcp__gsc__gsc_list_sitemaps` - List sitemaps submitted to GSC
+
+### Which Profiles Get GSC Access
+
+| Execution type | GSC tools | Reason |
+|---|---|---|
+| `seo_impact_review` | ✅ | Compares ranking before/after CMS changes |
+| `research` | ✅ | Pulls live query data during keyword and competitor research |
+| all others | ❌ | Publish/rewrite profiles don't need ranking data at write time |
+
+### Module Structure
+```
+agent/gsc/
+├── __init__.py    # Exports
+├── config.py      # GscConfig dataclass
+├── client.py      # GscAPIClient (read-only)
 ├── tools.py       # @tool decorated functions
 └── server.py      # MCP server factory
 ```
