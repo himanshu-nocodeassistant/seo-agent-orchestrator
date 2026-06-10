@@ -308,6 +308,10 @@ async def _dispatch_phase(
         )
     )
     child_validation = child_profile.validator(child_execution.result_text or "")
+    if child_validation.status == "failed":
+        raise RuntimeError(
+            f"Phase [{phase_name}] output failed validation: {child_validation.message}"
+        )
     helpers["_finalize_run_success"](
         db, child_run, child_task,
         child_execution.result_text or "",
