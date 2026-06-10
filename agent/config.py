@@ -51,6 +51,9 @@ class AgentConfig:
     # Setting sources for loading Skills
     setting_sources: list = field(default_factory=lambda: ["user", "project"])
 
+    # PostToolUse / other SDK hooks — see ClaudeAgentOptions.hooks
+    hooks: Optional[dict] = None
+
     # Max turns per task
     max_turns: Optional[int] = None
 

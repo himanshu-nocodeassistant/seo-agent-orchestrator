@@ -610,6 +610,32 @@ def _log_run_event(db, run_id: str, event_type: str, payload: Optional[dict] = N
     db.commit()
 
 
+def build_post_tool_use_hook(db, run_id: str):
+    """
+    Return a PostToolUse hook function that writes a RunEventModel row for
+    every tool call the agent makes.
+
+    Args:
+        db: SQLAlchemy session (caller owns lifecycle).
+        run_id: The AgentRunModel.run_id this hook is attached to.
+
+    Returns:
+        Async callable matching the SDK HookMatcher signature.
+    """
+    async def _hook(hook_input, session_id, ctx):
+        tool_name = hook_input.get("tool_name", "unknown")
+        tool_input = hook_input.get("tool_input", {})
+        tool_use_id = hook_input.get("tool_use_id", "")
+        _log_run_event(
+            db,
+            run_id,
+            "tool_use",
+            {"tool_name": tool_name, "tool_input": tool_input, "tool_use_id": tool_use_id},
+        )
+
+    return _hook
+
+
 def _get_task_session_id(db, task_id: Optional[int]) -> Optional[str]:
     if task_id is None:
         return None
@@ -741,7 +767,14 @@ async def _run_agent_prompt(prompt: str, config: AgentConfig, prompt_context) ->
         raise RuntimeError(f"Agent execution timed out after {timeout}s") from e
 
 
-def _build_runtime_config(profile, resume_session_id: Optional[str]) -> AgentConfig:
+def _build_runtime_config(
+    profile,
+    resume_session_id: Optional[str],
+    db=None,
+    run_id: Optional[str] = None,
+) -> AgentConfig:
+    from claude_agent_sdk.types import HookMatcher
+
     config = AgentConfig.from_env()
     config.cwd = _project_root()
     config.setting_sources = []
@@ -755,6 +788,12 @@ def _build_runtime_config(profile, resume_session_id: Optional[str]) -> AgentCon
     config.max_budget_usd = profile.max_budget_usd
     config.max_thinking_tokens = profile.max_thinking_tokens
     config.resume = resume_session_id if profile.should_resume_session else None
+
+    if db is not None and run_id is not None:
+        config.hooks = {
+            "PostToolUse": [HookMatcher(hooks=[build_post_tool_use_hook(db, run_id)])]
+        }
+
     return config
 
 

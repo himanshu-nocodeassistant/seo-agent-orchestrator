@@ -167,10 +167,18 @@ After each task, update this file with:
         except Exception as e:
             logger.warning(f"Failed to update {MEMORY_CONTEXT}: {e}")
     
-    def _build_prompt_with_context(self, prompt: str) -> str:
-        """Build prompt with memory context."""
+    def _build_prompt_with_context(self, prompt: str, prompt_context=None) -> str:
+        """Build prompt with memory context.
+
+        If prompt_context is provided (a ComposedPromptContext), it is already
+        embedded in the prompt string by the caller — skip the file-based memory
+        load to avoid duplicating context.
+        """
+        if prompt_context is not None:
+            return prompt
+
         memory_context = self.load_memory_context()
-        
+
         if memory_context:
             return f"""{memory_context}
 
@@ -201,6 +209,7 @@ Use the Edit tool to update memory/seo-context.md before ending your response.
             max_turns=self.config.max_turns,
             max_budget_usd=self.config.max_budget_usd,
             mcp_servers=self.config.mcp_servers,
+            hooks=self.config.hooks,
         )
     
     async def execute_task(self, prompt: str) -> str:
@@ -319,6 +328,58 @@ Use the Edit tool to update memory/seo-context.md before ending your response.
         """Async context manager exit."""
         await self.disconnect()
     
+    @classmethod
+    async def create_and_run_result(
+        cls,
+        prompt: str,
+        config: Optional[AgentConfig] = None,
+        prompt_context=None,
+    ):
+        """
+        Run a prompt and return an AgentExecutionResult-like object with
+        .result_text and .session_id attributes.
+
+        Used by _run_agent_prompt in api/main.py so the full layered-memory
+        workflow (config, hooks, session resume) goes through one code path.
+        """
+        agent = cls(config)
+        try:
+            full_prompt = agent._build_prompt_with_context(prompt, prompt_context)
+            options = agent._create_sdk_options()
+            result_text = ""
+            session_id = None
+
+            async for message in query(prompt=full_prompt, options=options):
+                if message is None:
+                    continue
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, TextBlock):
+                            result_text += block.text
+                elif isinstance(message, ResultMessage):
+                    if message.result:
+                        result_text += message.result
+                    if message.session_id:
+                        session_id = message.session_id
+
+            if result_text:
+                agent.update_context_after_task(prompt, result_text)
+
+            return type(
+                "AgentExecutionResult",
+                (),
+                {"result_text": result_text, "session_id": session_id},
+            )()
+        except MessageParseError as e:
+            logger.warning("SDK message parse error in create_and_run_result: %s", e)
+            return type(
+                "AgentExecutionResult",
+                (),
+                {"result_text": "", "session_id": None},
+            )()
+        finally:
+            await agent.disconnect()
+
     @classmethod
     async def create_and_run(cls, prompt: str, config: Optional[AgentConfig] = None) -> str:
         """

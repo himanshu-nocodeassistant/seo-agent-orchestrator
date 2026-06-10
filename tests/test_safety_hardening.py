@@ -389,6 +389,91 @@ class TestGroundingInstruction:
 
 
 # ============================================================================
+# Fix 10 — G3.4: PostToolUse hook audit log
+# ============================================================================
+
+class TestPostToolUseHook:
+    def test_agent_config_has_hooks_field(self):
+        from agent.config import AgentConfig
+        import dataclasses
+        fields = {f.name for f in dataclasses.fields(AgentConfig)}
+        assert "hooks" in fields
+
+    def test_hooks_defaults_to_none(self):
+        from agent.config import AgentConfig
+        config = AgentConfig()
+        assert config.hooks is None
+
+    def test_seo_agent_has_create_and_run_result(self):
+        from agent.seo_agent import SEOAgent
+        assert hasattr(SEOAgent, "create_and_run_result"), (
+            "SEOAgent must have a create_and_run_result classmethod"
+        )
+
+    def test_hooks_passed_to_sdk_options(self):
+        """When config.hooks is set, _create_sdk_options includes it."""
+        from agent.seo_agent import SEOAgent
+        from agent.config import AgentConfig
+        from claude_agent_sdk.types import HookMatcher
+
+        async def dummy_hook(inp, session_id, ctx):
+            return None
+
+        config = AgentConfig()
+        config.hooks = {"PostToolUse": [HookMatcher(hooks=[dummy_hook])]}
+        agent = SEOAgent.__new__(SEOAgent)
+        agent.config = config
+        options = agent._create_sdk_options()
+        assert options.hooks is not None
+        assert "PostToolUse" in options.hooks
+
+    def test_run_event_written_for_tool_call(self):
+        """build_post_tool_use_hook returns a callable that writes a RunEventModel row."""
+        import agent.api.main as main_module
+
+        db = main_module.get_db_session()
+        try:
+            now = main_module.datetime.utcnow().isoformat()
+            task = main_module.TaskModel(
+                title="Hook Test Task", status="pending",
+                created_at=now, updated_at=now,
+            )
+            db.add(task)
+            db.commit()
+            db.refresh(task)
+            run = main_module._create_run(db, task, "test", "research")
+
+            hook_fn = main_module.build_post_tool_use_hook(db, run.run_id)
+
+            import asyncio
+            from unittest.mock import MagicMock
+
+            fake_input = {
+                "tool_name": "WebSearch",
+                "tool_input": {"query": "no-code tools"},
+                "tool_response": {"results": []},
+                "tool_use_id": "tu_abc123",
+                "session_id": "sess-1",
+                "hook_event_name": "PostToolUse",
+                "cwd": "/tmp",
+                "transcript_path": "/tmp/t.json",
+            }
+            fake_ctx = MagicMock()
+
+            asyncio.get_event_loop().run_until_complete(hook_fn(fake_input, "sess-1", fake_ctx))
+
+            events = db.query(main_module.RunEventModel).filter(
+                main_module.RunEventModel.run_id == run.run_id
+            ).all()
+            assert len(events) >= 1
+            tool_events = [e for e in events if e.event_type == "tool_use"]
+            assert len(tool_events) >= 1
+            assert "WebSearch" in tool_events[-1].payload
+        finally:
+            db.close()
+
+
+# ============================================================================
 # Fix 9 — G2.3: Human approval gate before campaign_publisher
 # ============================================================================
 
