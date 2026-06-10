@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from datetime import datetime
 from typing import Optional
 from uuid import uuid4
@@ -59,7 +60,14 @@ def _is_retryable(exc: BaseException) -> bool:
     return False
 
 
-async def _run_with_retry(coro_fn, *args, max_retries: int = 2, base_delay: float = 1.0, **kwargs):
+async def _run_with_retry(
+    coro_fn,
+    *args,
+    max_retries: int = 2,
+    base_delay: float = 1.0,
+    max_total_seconds: Optional[float] = None,
+    **kwargs,
+):
     """
     Call `coro_fn(*args, **kwargs)` with exponential backoff on transient failures.
 
@@ -67,16 +75,26 @@ async def _run_with_retry(coro_fn, *args, max_retries: int = 2, base_delay: floa
         coro_fn: Async callable to retry.
         max_retries: Total attempts (1 = no retry).
         base_delay: Initial sleep between retries in seconds (doubled each attempt).
+        max_total_seconds: Optional wall-clock deadline across all attempts. If set,
+            each attempt checks the clock before running; if the deadline has passed,
+            raises RuntimeError immediately rather than retrying.
 
     Raises:
         The last exception if all retries are exhausted or the error is non-retryable.
+        RuntimeError if max_total_seconds is exceeded before all retries are used.
 
     Scalability note (#7): In production, circuit-breaker logic (e.g. tenacity with
     circuit_breaker) would prevent hammering a downstream that's fully down.
     """
+    deadline = time.monotonic() + max_total_seconds if max_total_seconds is not None else None
     last_exc: Optional[BaseException] = None
     delay = base_delay
     for attempt in range(max_retries):
+        if deadline is not None and time.monotonic() > deadline:
+            raise RuntimeError(
+                f"_run_with_retry exceeded max_total_seconds={max_total_seconds} "
+                f"after {attempt} attempt(s)"
+            )
         try:
             return await coro_fn(*args, **kwargs)
         except BaseException as exc:
@@ -84,6 +102,11 @@ async def _run_with_retry(coro_fn, *args, max_retries: int = 2, base_delay: floa
                 raise
             last_exc = exc
             if attempt < max_retries - 1:
+                if deadline is not None and time.monotonic() > deadline:
+                    raise RuntimeError(
+                        f"_run_with_retry exceeded max_total_seconds={max_total_seconds} "
+                        f"after {attempt + 1} attempt(s)"
+                    )
                 logger.warning(
                     "Transient failure (attempt %d/%d): %s — retrying in %.1fs",
                     attempt + 1, max_retries, exc, delay,
@@ -281,6 +304,7 @@ async def _dispatch_phase(
             child_prompt_context,
             max_retries=2,
             base_delay=1.0,
+            max_total_seconds=child_profile.timeout_seconds,
         )
     )
     child_validation = child_profile.validator(child_execution.result_text or "")
@@ -367,6 +391,7 @@ async def run_campaign_orchestration(db, parent_task, orchestrator_run) -> None:
             orch_prompt_context,
             max_retries=2,
             base_delay=1.0,
+            max_total_seconds=orch_profile.timeout_seconds,
         )
     )
     plan_text = raw_execution.result_text or ""

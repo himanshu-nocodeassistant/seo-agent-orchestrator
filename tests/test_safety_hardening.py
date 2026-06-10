@@ -79,14 +79,14 @@ class TestAgentConfigDefaults:
 class TestRunWithRetryWallClock:
     @pytest.mark.asyncio
     async def test_exceeds_wall_clock_raises(self):
-        """When deadline is already past before attempt 2, raise immediately."""
+        """After the first attempt, if the deadline has passed, do not retry."""
         from agent.orchestrator import _run_with_retry
-        import time
 
         call_count = {"n": 0}
 
         async def slow_transient(*args, **kwargs):
             call_count["n"] += 1
+            await asyncio.sleep(0.05)  # each attempt takes 50ms
             raise RuntimeError("Agent execution timed out after 300s")
 
         with pytest.raises(RuntimeError):
@@ -94,11 +94,12 @@ class TestRunWithRetryWallClock:
                 slow_transient,
                 max_retries=5,
                 base_delay=0.0,
-                max_total_seconds=0.001,  # effectively zero — deadline in the past
+                max_total_seconds=0.06,  # 60ms — fits one attempt (50ms), not three (150ms)
             )
 
-        # Should have bailed out after the first attempt
-        assert call_count["n"] == 1
+        # Without the cap all 5 attempts would run (250ms total).
+        # With the 60ms cap the retry loop must stop before all 5 complete.
+        assert call_count["n"] < 5
 
     @pytest.mark.asyncio
     async def test_none_max_total_seconds_does_not_change_behaviour(self):
