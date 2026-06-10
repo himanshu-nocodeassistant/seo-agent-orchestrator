@@ -153,7 +153,7 @@ class TestCampaignTimeout:
                 db, parent_task, "manual_execute", "orchestrate_seo_campaign"
             )
 
-            with patch("agent.api.main.run_campaign_orchestration", side_effect=_hanging_orchestration):
+            with patch("agent.orchestrator.run_campaign_orchestration", side_effect=_hanging_orchestration):
                 with patch.dict("os.environ", {"CAMPAIGN_TIMEOUT_SECONDS": "1"}):
                     with pytest.raises((RuntimeError, asyncio.TimeoutError)):
                         await main_module._execute_campaign_with_timeout(

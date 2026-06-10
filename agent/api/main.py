@@ -514,6 +514,40 @@ def _agent_execution_timeout_seconds() -> int:
     return max(value, 1)
 
 
+def _campaign_timeout_seconds() -> int:
+    """Top-level timeout for a full multi-agent campaign (all tiers combined).
+
+    Defaults to 5400s (6 tiers × 900s each). Override with CAMPAIGN_TIMEOUT_SECONDS.
+    """
+    raw = os.environ.get("CAMPAIGN_TIMEOUT_SECONDS", "5400").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 5400
+    return max(value, 1)
+
+
+async def _execute_campaign_with_timeout(db, task, run) -> None:
+    """Run the campaign orchestration with a top-level wall-clock timeout.
+
+    Raises RuntimeError if the campaign exceeds CAMPAIGN_TIMEOUT_SECONDS so the
+    FastAPI endpoint can fail the run cleanly rather than blocking indefinitely.
+    """
+    from agent.orchestrator import run_campaign_orchestration
+
+    timeout = _campaign_timeout_seconds()
+    try:
+        await asyncio.wait_for(
+            run_campaign_orchestration(db, task, run),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError as e:
+        raise RuntimeError(
+            f"Campaign timed out after {timeout}s — "
+            "increase CAMPAIGN_TIMEOUT_SECONDS or reduce the number of phases."
+        ) from e
+
+
 def _project_root() -> str:
     return str(Path(__file__).resolve().parents[2])
 
@@ -2092,9 +2126,8 @@ async def execute_task(task_id: int):
 
         # ── Orchestration branch ──────────────────────────────────────────────
         if task.execution_type == "orchestrate_seo_campaign":
-            from agent.orchestrator import run_campaign_orchestration
             try:
-                await run_campaign_orchestration(db, task, run)
+                await _execute_campaign_with_timeout(db, task, run)
             except Exception as e:
                 _finalize_run_failure(db, run, task, str(e))
                 _refresh_context_view(db, task_id=task.id)
