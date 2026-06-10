@@ -386,3 +386,118 @@ class TestGroundingInstruction:
             assert "grounding-required" not in profile.procedural_tags, (
                 f"{name} should not have grounding-required tag"
             )
+
+
+# ============================================================================
+# Fix 9 — G2.3: Human approval gate before campaign_publisher
+# ============================================================================
+
+class TestApprovalGate:
+    def test_execution_profile_has_requires_approval_field(self):
+        from agent.runtime_profiles import ExecutionProfile
+        import dataclasses
+        fields = {f.name for f in dataclasses.fields(ExecutionProfile)}
+        assert "requires_approval" in fields
+
+    def test_campaign_publisher_requires_approval(self):
+        from agent.runtime_profiles import PROFILE_REGISTRY
+        profile = PROFILE_REGISTRY["campaign_publisher"]
+        assert profile.requires_approval is True
+
+    def test_other_profiles_do_not_require_approval(self):
+        from agent.runtime_profiles import PROFILE_REGISTRY
+        for name in ["campaign_draft_writer", "campaign_researcher", "research", "manual"]:
+            profile = PROFILE_REGISTRY[name]
+            assert profile.requires_approval is False, (
+                f"{name} should not require approval"
+            )
+
+    @pytest.mark.asyncio
+    async def test_unapproved_publisher_halts_campaign(self):
+        """
+        When campaign_publisher fires without parent_task.approved_at set,
+        the orchestration must stop with status='awaiting_approval', not error.
+        """
+        import agent.api.main as main_module
+        from agent.orchestrator import run_campaign_orchestration
+        import json
+
+        draft_output = (
+            "Title: Guide to No-Code Automation\n"
+            "URL Slug: no-code-automation-guide\n"
+            "Word Count: 1200\n"
+            "Webflow Status: draft saved\n"
+            "<!-- CHANGE_LOG\n"
+            '{"url": "https://example.com/no-code-automation-guide", "field": "content"}\n'
+            "-->\n"
+            "## Summary for Next Phase\nDraft is ready to publish.\n## End Summary"
+        )
+
+        results_iter = iter([
+            # Plan — researcher + draft_writer → publisher
+            MagicMock(result_text=(
+                "```json\n" + json.dumps({
+                    "campaign_goal": "test",
+                    "phases": [
+                        {
+                            "phase": "draft_writer",
+                            "task_title": "Write post",
+                            "task_description": "Write it.",
+                            "execution_type": "campaign_draft_writer",
+                            "depends_on": [],
+                        },
+                        {
+                            "phase": "publisher",
+                            "task_title": "Publish post",
+                            "task_description": "Publish it.",
+                            "execution_type": "campaign_publisher",
+                            "depends_on": ["draft_writer"],
+                        },
+                    ]
+                }) + "\n```"
+            ), session_id="s0"),
+            # Draft writer — good output
+            MagicMock(result_text=draft_output, session_id="s1"),
+            # Publisher should never be called — approval gate should stop here
+        ])
+
+        async def _side_effect(*args, **kwargs):
+            return next(results_iter)
+
+        db = main_module.get_db_session()
+        try:
+            now = main_module.datetime.utcnow().isoformat()
+            parent_task = main_module.TaskModel(
+                title="Approval Gate Campaign",
+                description="Should pause before publisher",
+                execution_type="orchestrate_seo_campaign",
+                status="in_progress",
+                approved_at=None,  # not approved
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(parent_task)
+            db.commit()
+            db.refresh(parent_task)
+            orch_run = main_module._create_run(
+                db, parent_task, "manual_execute", "orchestrate_seo_campaign"
+            )
+
+            with patch("agent.api.main._run_agent_prompt", side_effect=_side_effect):
+                await run_campaign_orchestration(db, parent_task, orch_run)
+
+            db.refresh(orch_run)
+            db.refresh(parent_task)
+
+            state = db.query(main_module.OrchestrationStateModel).filter(
+                main_module.OrchestrationStateModel.orchestrator_run_id == orch_run.run_id
+            ).first()
+
+            assert state.status == "awaiting_approval", (
+                f"Expected awaiting_approval, got {state.status}"
+            )
+            # Publisher phase must NOT have run — only 2 results consumed (plan + draft)
+            with pytest.raises(StopIteration):
+                next(results_iter)  # publisher result was never popped → still in iterator
+        finally:
+            db.close()

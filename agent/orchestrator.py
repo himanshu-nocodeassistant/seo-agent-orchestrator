@@ -458,6 +458,25 @@ async def run_campaign_orchestration(db, parent_task, orchestrator_run) -> None:
             "agent",
         )
 
+        # Approval gate: if any phase in this tier requires approval and the
+        # parent task has not been approved, pause the campaign.
+        for phase_spec in tier:
+            child_exec_type = phase_spec.get("execution_type", phase_spec["phase"])
+            child_profile = get_execution_profile(child_exec_type)
+            if child_profile.requires_approval and not parent_task.approved_at:
+                state.status = "awaiting_approval"
+                state.current_phase = phase_spec["phase"]
+                state.updated_at = datetime.utcnow().isoformat()
+                db.commit()
+                add_task_comment(
+                    db,
+                    parent_task.id,
+                    f"Campaign paused before phase [{phase_spec['phase']}] — human approval required. "
+                    "Set approved_at on this task to resume.",
+                    "agent",
+                )
+                return
+
         # Mark all phases in this tier as in_progress
         for phase_spec in tier:
             child_task = child_tasks[phase_spec["phase"]]

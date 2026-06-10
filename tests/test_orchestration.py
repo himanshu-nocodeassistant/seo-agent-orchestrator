@@ -378,6 +378,7 @@ class TestFullOrchestration:
                 description="Improve blog SEO for Q3",
                 execution_type="orchestrate_seo_campaign",
                 status="in_progress",
+                approved_at=now,  # pre-approved so publisher phase is not gated
                 created_at=now,
                 updated_at=now,
             )
@@ -504,7 +505,7 @@ class TestOrchestrationStateEndpoint:
         assert state_resp.status_code == 200
         data = state_resp.json()
         assert data["orchestrator_run_id"] == run_id
-        assert data["status"] in ("completed", "error", "running")
+        assert data["status"] in ("completed", "error", "running", "awaiting_approval")
         assert "child_tasks" in data
         assert "phases_completed" in data
 

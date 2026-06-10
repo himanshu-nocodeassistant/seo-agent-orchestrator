@@ -46,6 +46,7 @@ class ExecutionProfile:
     validator: Callable[[str], ValidationResult]
     should_resume_session: bool = True
     procedural_tags: list[str] = field(default_factory=list)
+    requires_approval: bool = False
 
 
 def _validate_non_empty(output: str) -> ValidationResult:
@@ -168,6 +169,7 @@ def _profile(
     validator: Callable[[str], ValidationResult],
     should_resume_session: bool = True,
     procedural_tags: Optional[list[str]] = None,
+    requires_approval: bool = False,
 ) -> ExecutionProfile:
     return ExecutionProfile(
         execution_type=execution_type,
@@ -181,6 +183,7 @@ def _profile(
         validator=validator,
         should_resume_session=should_resume_session,
         procedural_tags=procedural_tags or [],
+        requires_approval=requires_approval,
     )
 
 
@@ -379,6 +382,7 @@ PROFILE_REGISTRY: dict[str, ExecutionProfile] = {
         semantic_char_limit=1200,
         validator=_with_change_log(_validate_non_empty),
         procedural_tags=["publish", "campaign"],
+        requires_approval=True,
     ),
     "campaign_analyst": _profile(
         "campaign_analyst",
