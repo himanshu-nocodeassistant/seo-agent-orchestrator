@@ -356,21 +356,21 @@ PROFILE_REGISTRY: dict[str, ExecutionProfile] = {
         validator=_validate_research_output,
         procedural_tags=["brand-voice", "research", "campaign"],
     ),
-    "campaign_content_writer": _profile(
-        "campaign_content_writer",
-        allowed_tools=EDIT_ALLOWED_TOOLS + WEBFLOW_TOOLS,
+    "campaign_draft_writer": _profile(
+        "campaign_draft_writer",
+        allowed_tools=EDIT_ALLOWED_TOOLS,  # file edits only — no Webflow publish
         max_turns=18,
         max_budget_usd=4.0,
         timeout_seconds=900,
         max_thinking_tokens=8000,
         episodic_limit=3,
         semantic_char_limit=3500,
-        validator=_with_change_log(_validate_blog_write),
+        validator=_validate_blog_write,
         procedural_tags=["brand-voice", "copywriting", "campaign"],
     ),
     "campaign_publisher": _profile(
         "campaign_publisher",
-        allowed_tools=BASE_ALLOWED_TOOLS + WEBFLOW_TOOLS,
+        allowed_tools=BASE_ALLOWED_TOOLS + WEBFLOW_TOOLS,  # read + publish; no Write/Edit
         max_turns=8,
         max_budget_usd=1.5,
         timeout_seconds=300,

@@ -195,7 +195,7 @@ class TestValidatorFailureStopsPipeline:
                         "phase": "content_writer",
                         "task_title": "Write post",
                         "task_description": "Write it.",
-                        "execution_type": "campaign_content_writer",
+                        "execution_type": "campaign_draft_writer",
                         "depends_on": [],
                     }]
                 }) + "\n```"
@@ -288,3 +288,44 @@ class TestResearchValidator:
         from agent.runtime_profiles import PROFILE_REGISTRY, _validate_research_output
         profile = PROFILE_REGISTRY["campaign_researcher"]
         assert profile.validator is _validate_research_output
+
+
+# ============================================================================
+# Fix 7 — G3.2: Split campaign_content_writer into draft-only + publish-only
+# ============================================================================
+
+class TestContentWriterSplit:
+    def test_campaign_draft_writer_profile_exists(self):
+        from agent.runtime_profiles import PROFILE_REGISTRY
+        assert "campaign_draft_writer" in PROFILE_REGISTRY
+
+    def test_campaign_draft_writer_has_no_webflow_tools(self):
+        from agent.runtime_profiles import PROFILE_REGISTRY, WEBFLOW_TOOLS
+        profile = PROFILE_REGISTRY["campaign_draft_writer"]
+        for tool in WEBFLOW_TOOLS:
+            assert tool not in profile.allowed_tools, f"draft writer must not have {tool}"
+
+    def test_campaign_draft_writer_has_edit_tools(self):
+        from agent.runtime_profiles import PROFILE_REGISTRY
+        profile = PROFILE_REGISTRY["campaign_draft_writer"]
+        assert "Write" in profile.allowed_tools
+        assert "Edit" in profile.allowed_tools
+
+    def test_campaign_publisher_profile_has_no_write_edit(self):
+        """Publisher must not be able to modify file content — only publish to CMS."""
+        from agent.runtime_profiles import PROFILE_REGISTRY
+        profile = PROFILE_REGISTRY["campaign_publisher"]
+        assert "Write" not in profile.allowed_tools
+        assert "Edit" not in profile.allowed_tools
+
+    def test_campaign_content_writer_is_removed(self):
+        """Old monolithic profile must no longer exist to prevent accidental use."""
+        from agent.runtime_profiles import PROFILE_REGISTRY
+        assert "campaign_content_writer" not in PROFILE_REGISTRY
+
+    def test_campaign_draft_writer_validator_requires_blog_fields(self):
+        from agent.runtime_profiles import PROFILE_REGISTRY, _validate_blog_write
+        profile = PROFILE_REGISTRY["campaign_draft_writer"]
+        # Validator should be blog-write aware (wrapped or direct)
+        bad = profile.validator("some draft without required fields")
+        assert bad.status == "failed"

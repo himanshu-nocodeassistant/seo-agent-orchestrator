@@ -37,7 +37,7 @@ MINIMAL_PLAN_JSON = {
             "phase": "content_writer",
             "task_title": "Write: No-code automation guide",
             "task_description": "Write a 1200-word blog post using research findings.",
-            "execution_type": "campaign_content_writer",
+            "execution_type": "campaign_draft_writer",
             "depends_on": ["researcher"],
         },
         {
@@ -134,7 +134,7 @@ class TestParsePlan:
         phases = _parse_orchestration_plan(PLAN_OUTPUT)
         assert len(phases) == 4
         assert phases[0]["phase"] == "researcher"
-        assert phases[1]["execution_type"] == "campaign_content_writer"
+        assert phases[1]["execution_type"] == "campaign_draft_writer"
 
     def test_missing_json_block_raises(self):
         from agent.orchestrator import _parse_orchestration_plan
@@ -291,7 +291,7 @@ class TestCampaignProfiles:
         for name in [
             "orchestrate_seo_campaign",
             "campaign_researcher",
-            "campaign_content_writer",
+            "campaign_draft_writer",
             "campaign_publisher",
             "campaign_analyst",
         ]:
@@ -592,7 +592,7 @@ PARALLEL_PLAN_JSON = {
             "phase": "content_writer",
             "task_title": "Write: Combined guide",
             "task_description": "Write using both research outputs.",
-            "execution_type": "campaign_content_writer",
+            "execution_type": "campaign_draft_writer",
             "depends_on": ["keyword_researcher", "competitor_researcher"],
         },
     ],
