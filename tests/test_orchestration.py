@@ -37,7 +37,7 @@ MINIMAL_PLAN_JSON = {
             "phase": "content_writer",
             "task_title": "Write: No-code automation guide",
             "task_description": "Write a 1200-word blog post using research findings.",
-            "execution_type": "campaign_content_writer",
+            "execution_type": "campaign_draft_writer",
             "depends_on": ["researcher"],
         },
         {
@@ -86,7 +86,7 @@ def mock_run_agent_prompt():
     """
     results = [
         _make_exec_result(PLAN_OUTPUT, "s0"),
-        _make_exec_result("Research complete: found 10 keywords.", "s1"),
+        _make_exec_result("Research complete: found 10 keywords. Source: https://ahrefs.com/keywords?q=no-code", "s1"),
         _make_exec_result(WRITER_OUTPUT, "s2"),
         _make_exec_result(
             "Published item 123.\n<!-- CHANGE_LOG\n"
@@ -117,7 +117,7 @@ def mock_run_agent_prompt_writer_fails():
         if idx == 0:
             return _make_exec_result(PLAN_OUTPUT, "s0")
         if idx == 1:
-            return _make_exec_result("Research complete.", "s1")
+            return _make_exec_result("Research complete. Top keyword: no-code automation. Source: https://ahrefs.com/kw", "s1")
         raise RuntimeError("Writer agent timed out")
 
     with patch("agent.api.main._run_agent_prompt", side_effect=_side_effect):
@@ -134,7 +134,7 @@ class TestParsePlan:
         phases = _parse_orchestration_plan(PLAN_OUTPUT)
         assert len(phases) == 4
         assert phases[0]["phase"] == "researcher"
-        assert phases[1]["execution_type"] == "campaign_content_writer"
+        assert phases[1]["execution_type"] == "campaign_draft_writer"
 
     def test_missing_json_block_raises(self):
         from agent.orchestrator import _parse_orchestration_plan
@@ -291,7 +291,7 @@ class TestCampaignProfiles:
         for name in [
             "orchestrate_seo_campaign",
             "campaign_researcher",
-            "campaign_content_writer",
+            "campaign_draft_writer",
             "campaign_publisher",
             "campaign_analyst",
         ]:
@@ -378,6 +378,7 @@ class TestFullOrchestration:
                 description="Improve blog SEO for Q3",
                 execution_type="orchestrate_seo_campaign",
                 status="in_progress",
+                approved_at=now,  # pre-approved so publisher phase is not gated
                 created_at=now,
                 updated_at=now,
             )
@@ -504,7 +505,7 @@ class TestOrchestrationStateEndpoint:
         assert state_resp.status_code == 200
         data = state_resp.json()
         assert data["orchestrator_run_id"] == run_id
-        assert data["status"] in ("completed", "error", "running")
+        assert data["status"] in ("completed", "error", "running", "awaiting_approval")
         assert "child_tasks" in data
         assert "phases_completed" in data
 
@@ -592,7 +593,7 @@ PARALLEL_PLAN_JSON = {
             "phase": "content_writer",
             "task_title": "Write: Combined guide",
             "task_description": "Write using both research outputs.",
-            "execution_type": "campaign_content_writer",
+            "execution_type": "campaign_draft_writer",
             "depends_on": ["keyword_researcher", "competitor_researcher"],
         },
     ],
@@ -666,8 +667,8 @@ def mock_parallel_agent_prompt():
     )
     results = [
         _make_exec_result(PARALLEL_PLAN_OUTPUT, "s0"),    # orchestrator plan
-        _make_exec_result("Keyword research done.", "s1"),  # keyword_researcher
-        _make_exec_result("Competitor analysis done.", "s2"),  # competitor_researcher
+        _make_exec_result("Keyword research done. Top keyword: no-code tools. Source: https://ahrefs.com/kw", "s1"),  # keyword_researcher
+        _make_exec_result("Competitor analysis done. Top keyword: workflow automation. Source: https://semrush.com/kw", "s2"),  # competitor_researcher
         _make_exec_result(WRITER_OUT, "s3"),               # content_writer
     ]
     call_index = {"n": 0}
@@ -738,7 +739,7 @@ class TestParallelOrchestration:
             if idx == 0:
                 return _make_exec_result(PARALLEL_PLAN_OUTPUT, "s0")
             if idx == 1:
-                return _make_exec_result("Keyword research done.", "s1")
+                return _make_exec_result("Keyword research done. Top keyword: no-code. Source: https://ahrefs.com/kw", "s1")
             raise RuntimeError("Competitor agent failed")
 
         db = main_module.get_db_session()

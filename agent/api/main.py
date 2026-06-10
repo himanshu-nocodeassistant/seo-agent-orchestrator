@@ -514,6 +514,40 @@ def _agent_execution_timeout_seconds() -> int:
     return max(value, 1)
 
 
+def _campaign_timeout_seconds() -> int:
+    """Top-level timeout for a full multi-agent campaign (all tiers combined).
+
+    Defaults to 5400s (6 tiers × 900s each). Override with CAMPAIGN_TIMEOUT_SECONDS.
+    """
+    raw = os.environ.get("CAMPAIGN_TIMEOUT_SECONDS", "5400").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 5400
+    return max(value, 1)
+
+
+async def _execute_campaign_with_timeout(db, task, run) -> None:
+    """Run the campaign orchestration with a top-level wall-clock timeout.
+
+    Raises RuntimeError if the campaign exceeds CAMPAIGN_TIMEOUT_SECONDS so the
+    FastAPI endpoint can fail the run cleanly rather than blocking indefinitely.
+    """
+    from agent.orchestrator import run_campaign_orchestration
+
+    timeout = _campaign_timeout_seconds()
+    try:
+        await asyncio.wait_for(
+            run_campaign_orchestration(db, task, run),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError as e:
+        raise RuntimeError(
+            f"Campaign timed out after {timeout}s — "
+            "increase CAMPAIGN_TIMEOUT_SECONDS or reduce the number of phases."
+        ) from e
+
+
 def _project_root() -> str:
     return str(Path(__file__).resolve().parents[2])
 
@@ -574,6 +608,32 @@ def _log_run_event(db, run_id: str, event_type: str, payload: Optional[dict] = N
         )
     )
     db.commit()
+
+
+def build_post_tool_use_hook(db, run_id: str):
+    """
+    Return a PostToolUse hook function that writes a RunEventModel row for
+    every tool call the agent makes.
+
+    Args:
+        db: SQLAlchemy session (caller owns lifecycle).
+        run_id: The AgentRunModel.run_id this hook is attached to.
+
+    Returns:
+        Async callable matching the SDK HookMatcher signature.
+    """
+    async def _hook(hook_input, session_id, ctx):
+        tool_name = hook_input.get("tool_name", "unknown")
+        tool_input = hook_input.get("tool_input", {})
+        tool_use_id = hook_input.get("tool_use_id", "")
+        _log_run_event(
+            db,
+            run_id,
+            "tool_use",
+            {"tool_name": tool_name, "tool_input": tool_input, "tool_use_id": tool_use_id},
+        )
+
+    return _hook
 
 
 def _get_task_session_id(db, task_id: Optional[int]) -> Optional[str]:
@@ -707,7 +767,14 @@ async def _run_agent_prompt(prompt: str, config: AgentConfig, prompt_context) ->
         raise RuntimeError(f"Agent execution timed out after {timeout}s") from e
 
 
-def _build_runtime_config(profile, resume_session_id: Optional[str]) -> AgentConfig:
+def _build_runtime_config(
+    profile,
+    resume_session_id: Optional[str],
+    db=None,
+    run_id: Optional[str] = None,
+) -> AgentConfig:
+    from claude_agent_sdk.types import HookMatcher
+
     config = AgentConfig.from_env()
     config.cwd = _project_root()
     config.setting_sources = []
@@ -721,6 +788,12 @@ def _build_runtime_config(profile, resume_session_id: Optional[str]) -> AgentCon
     config.max_budget_usd = profile.max_budget_usd
     config.max_thinking_tokens = profile.max_thinking_tokens
     config.resume = resume_session_id if profile.should_resume_session else None
+
+    if db is not None and run_id is not None:
+        config.hooks = {
+            "PostToolUse": [HookMatcher(hooks=[build_post_tool_use_hook(db, run_id)])]
+        }
+
     return config
 
 
@@ -2092,9 +2165,8 @@ async def execute_task(task_id: int):
 
         # ── Orchestration branch ──────────────────────────────────────────────
         if task.execution_type == "orchestrate_seo_campaign":
-            from agent.orchestrator import run_campaign_orchestration
             try:
-                await run_campaign_orchestration(db, task, run)
+                await _execute_campaign_with_timeout(db, task, run)
             except Exception as e:
                 _finalize_run_failure(db, run, task, str(e))
                 _refresh_context_view(db, task_id=task.id)

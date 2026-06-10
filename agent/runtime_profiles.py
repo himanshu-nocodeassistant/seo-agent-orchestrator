@@ -4,6 +4,7 @@ Execution profiles and output validation for SEO task runs.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -45,12 +46,39 @@ class ExecutionProfile:
     validator: Callable[[str], ValidationResult]
     should_resume_session: bool = True
     procedural_tags: list[str] = field(default_factory=list)
+    requires_approval: bool = False
 
 
 def _validate_non_empty(output: str) -> ValidationResult:
     if output and output.strip():
         return ValidationResult(status="passed")
     return ValidationResult(status="failed", message="Agent returned empty output.")
+
+
+_KEYWORD_TOKENS = re.compile(
+    r"\b(keywords?|query|search terms?|volume|search volume|kw)\b", re.IGNORECASE
+)
+
+
+def _validate_research_output(output: str) -> ValidationResult:
+    """Research output must contain at least one cited URL and one keyword reference.
+
+    Catches the most common hallucination pattern — plausible-sounding recommendations
+    with no web evidence — without being so strict that valid runs fail.
+    """
+    if not output.strip():
+        return ValidationResult(status="failed", message="Agent returned empty output.")
+    if not re.search(r"https?://\S+", output):
+        return ValidationResult(
+            status="failed",
+            message="Research output contains no cited URLs — agent may not have used WebSearch.",
+        )
+    if not _KEYWORD_TOKENS.search(output):
+        return ValidationResult(
+            status="failed",
+            message="Research output contains no keyword data (expected 'keyword', 'query', or 'volume').",
+        )
+    return ValidationResult(status="passed")
 
 
 def _contains_all(output: str, required_fragments: list[str], message: str) -> ValidationResult:
@@ -141,6 +169,7 @@ def _profile(
     validator: Callable[[str], ValidationResult],
     should_resume_session: bool = True,
     procedural_tags: Optional[list[str]] = None,
+    requires_approval: bool = False,
 ) -> ExecutionProfile:
     return ExecutionProfile(
         execution_type=execution_type,
@@ -154,6 +183,7 @@ def _profile(
         validator=validator,
         should_resume_session=should_resume_session,
         procedural_tags=procedural_tags or [],
+        requires_approval=requires_approval,
     )
 
 
@@ -251,8 +281,8 @@ PROFILE_REGISTRY: dict[str, ExecutionProfile] = {
         max_thinking_tokens=6000,
         episodic_limit=4,
         semantic_char_limit=2600,
-        validator=_validate_non_empty,
-        procedural_tags=["brand-voice", "research"],
+        validator=_validate_research_output,
+        procedural_tags=["brand-voice", "research", "grounding-required"],
     ),
     "alt_text": _profile(
         "alt_text",
@@ -326,24 +356,24 @@ PROFILE_REGISTRY: dict[str, ExecutionProfile] = {
         max_thinking_tokens=6000,
         episodic_limit=3,
         semantic_char_limit=2600,
-        validator=_validate_non_empty,
-        procedural_tags=["brand-voice", "research", "campaign"],
+        validator=_validate_research_output,
+        procedural_tags=["brand-voice", "research", "campaign", "grounding-required"],
     ),
-    "campaign_content_writer": _profile(
-        "campaign_content_writer",
-        allowed_tools=EDIT_ALLOWED_TOOLS + WEBFLOW_TOOLS,
+    "campaign_draft_writer": _profile(
+        "campaign_draft_writer",
+        allowed_tools=EDIT_ALLOWED_TOOLS,  # file edits only — no Webflow publish
         max_turns=18,
         max_budget_usd=4.0,
         timeout_seconds=900,
         max_thinking_tokens=8000,
         episodic_limit=3,
         semantic_char_limit=3500,
-        validator=_with_change_log(_validate_blog_write),
+        validator=_validate_blog_write,
         procedural_tags=["brand-voice", "copywriting", "campaign"],
     ),
     "campaign_publisher": _profile(
         "campaign_publisher",
-        allowed_tools=BASE_ALLOWED_TOOLS + WEBFLOW_TOOLS,
+        allowed_tools=BASE_ALLOWED_TOOLS + WEBFLOW_TOOLS,  # read + publish; no Write/Edit
         max_turns=8,
         max_budget_usd=1.5,
         timeout_seconds=300,
@@ -352,6 +382,7 @@ PROFILE_REGISTRY: dict[str, ExecutionProfile] = {
         semantic_char_limit=1200,
         validator=_with_change_log(_validate_non_empty),
         procedural_tags=["publish", "campaign"],
+        requires_approval=True,
     ),
     "campaign_analyst": _profile(
         "campaign_analyst",
@@ -372,4 +403,10 @@ PROFILE_REGISTRY: dict[str, ExecutionProfile] = {
 def get_execution_profile(execution_type: Optional[str]) -> ExecutionProfile:
     if not execution_type:
         return PROFILE_REGISTRY["manual"]
-    return PROFILE_REGISTRY.get(execution_type, PROFILE_REGISTRY["manual"])
+    profile = PROFILE_REGISTRY.get(execution_type)
+    if profile is None:
+        raise ValueError(
+            f"Unknown execution_type '{execution_type}'. "
+            f"Valid types: {sorted(PROFILE_REGISTRY.keys())}"
+        )
+    return profile

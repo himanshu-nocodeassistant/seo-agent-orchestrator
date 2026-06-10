@@ -40,13 +40,19 @@ class AgentConfig:
     permission_mode: str = "acceptEdits"
 
     # Tools allowed for the agent
+    # Bash is intentionally absent — _build_runtime_config stamps the profile's
+    # explicit list before any real run. Direct callers (CLI, tests) should not
+    # get shell access by default.
     allowed_tools: list = field(default_factory=lambda: [
-        "Read", "Write", "Edit", "Bash", "Glob", "Grep",
+        "Read", "Write", "Edit", "Glob", "Grep",
         "WebSearch", "WebFetch", "Skill"
     ])
 
     # Setting sources for loading Skills
     setting_sources: list = field(default_factory=lambda: ["user", "project"])
+
+    # PostToolUse / other SDK hooks — see ClaudeAgentOptions.hooks
+    hooks: Optional[dict] = None
 
     # Max turns per task
     max_turns: Optional[int] = None
