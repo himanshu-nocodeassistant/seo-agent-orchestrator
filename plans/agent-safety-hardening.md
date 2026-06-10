@@ -63,8 +63,8 @@ one keyword-related token in the output.
        validator can actually stop the pipeline on failure
 6. G2.1 — strengthens research validators; safe last because G2.4 is already wired
 
-## Deferred (require product decisions or separate design work)
-- G2.2 — grounding requirement (needs prompt-level + validator changes across profiles)
-- G2.3 — approval gate before publisher (Kanban UI change required)
-- G3.2 — split campaign_content_writer into draft-only + publish-only profiles
-- G3.4 — PostToolUse hook audit log
+## Deferred → now implemented (2026-06-10)
+- G2.2 — grounding requirement: `grounding-required` tag + cite-sources rule in `to_prompt()` ✅
+- G2.3 — approval gate: `requires_approval` on `ExecutionProfile`; orchestrator halts at `campaign_publisher` ✅
+- G3.2 — split `campaign_content_writer` into `campaign_draft_writer` + `campaign_publisher` ✅
+- G3.4 — `PostToolUse` hook audit log via `build_post_tool_use_hook` + `RunEventModel` ✅

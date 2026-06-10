@@ -13,7 +13,7 @@ This project contains an autonomous SEO agent built with Python using Claude Age
 - `agent/seo_agent.py` - Main SEOAgent class using Claude Agent SDK; returns `AgentExecutionResult`
 - `agent/config.py` - Configuration dataclass (AgentConfig); exports `PROJECT_ROOT`; supports `SEO_AGENT_CWD` env var and `max_thinking_tokens`
 - `agent/memory_service.py` - Layered memory composition: builds `ShortTermContext`, `EpisodicContext`, `SemanticContext`, `ProceduralContext` into a `ComposedPromptContext` for prompt injection
-- `agent/runtime_profiles.py` - `ExecutionProfile` registry; maps each execution type to tool policy, budget, timeout, turn limit, validator, and semantic char limits
+- `agent/runtime_profiles.py` - `ExecutionProfile` registry; maps each execution type to tool policy, budget, timeout, turn limit, validator, semantic char limits, and `requires_approval` flag
 - `agent/orchestrator.py` - Multi-agent campaign dispatch loop; DAG tier resolution (`_resolve_execution_tiers`), structured inter-agent handoffs (`_extract_summary_block`), retry with backoff (`_run_with_retry`), parallel execution via `asyncio.gather`
 - `main.py` - CLI entry point; uses `PROJECT_ROOT` for portable working directory
 - `agent/api/main.py` - FastAPI Kanban server; includes `AgentRunModel`, `RunEventModel`, `TaskSessionModel`, `OrchestrationStateModel` DB tables for full run tracking
@@ -30,9 +30,10 @@ Trigger: create a Kanban task with `execution_type = "orchestrate_seo_campaign"`
 2. Python (`agent/orchestrator.py`) parses the plan and resolves execution tiers via Kahn's topological sort
 3. Child `TaskModel` rows are created (one per phase, with `parent_task_id` set)
 4. Tiers execute sequentially; phases within a tier run concurrently via `asyncio.gather`
-5. Each phase agent receives prior outputs via structured `## Summary for Next Phase` blocks (falls back to 1500-char truncation)
-6. `OrchestrationStateModel` persists state: plan JSON, current phase, all phase outputs, child run IDs, and final status
-7. All child `AgentRunModel` rows carry `parent_run_id` pointing to the orchestrator run
+5. **Approval gate**: before dispatching any phase whose `ExecutionProfile.requires_approval=True`, the orchestrator checks `parent_task.approved_at`. If unset, sets `state.status='awaiting_approval'` and halts. Campaign resumes when `approved_at` is set via `PATCH /tasks/{id}`.
+6. Each phase agent receives prior outputs via structured `## Summary for Next Phase` blocks (falls back to 1500-char truncation)
+7. `OrchestrationStateModel` persists state: plan JSON, current phase, all phase outputs, child run IDs, and final status (`running | awaiting_approval | completed | error`)
+8. All child `AgentRunModel` rows carry `parent_run_id` pointing to the orchestrator run
 
 **Phase plan schema** (what the orchestrator agent must output):
 ```json
@@ -46,7 +47,8 @@ Trigger: create a Kanban task with `execution_type = "orchestrate_seo_campaign"`
       "execution_type": "campaign_researcher",
       "depends_on": []
     },
-    { "phase": "content_writer", "depends_on": ["researcher"], ... }
+    { "phase": "draft_writer", "execution_type": "campaign_draft_writer", "depends_on": ["researcher"], ... },
+    { "phase": "publisher", "execution_type": "campaign_publisher", "depends_on": ["draft_writer"], ... }
   ]
 }
 ```
@@ -58,7 +60,13 @@ Trigger: create a Kanban task with `execution_type = "orchestrate_seo_campaign"`
 ## End Summary
 ```
 
-**Retry policy:** transient errors (timeouts, 503s, rate limits) are retried up to 2 times with exponential backoff. Non-retryable: budget exceeded, malformed plan, circular dependency.
+**Retry policy:** transient errors (timeouts, 503s, rate limits) are retried up to 2 times with exponential backoff with an optional `max_total_seconds` wall-clock cap. Non-retryable: budget exceeded, malformed plan, circular dependency.
+
+**Approval gate:** `campaign_publisher` has `requires_approval=True`. The orchestrator halts before that tier and sets `state.status='awaiting_approval'`. Set `approved_at` on the parent task via the Kanban UI (PATCH) to resume.
+
+**Grounding requirement:** `research` and `campaign_researcher` profiles carry the `grounding-required` procedural tag. The injected system prompt requires every factual claim to cite a source URL; the validator also checks for at least one `https://` URL in the output.
+
+**Audit log:** every tool call made during a run is written to `RunEventModel` via a `PostToolUse` SDK hook wired in `_build_runtime_config`.
 
 **Scalability boundaries** (annotated in source with `# Scalability note`):
 - `#1` — move `run_campaign_orchestration` call to a task queue (Celery/arq) for production; return 202 + polling
@@ -153,14 +161,15 @@ python -m pytest tests/test_seo_agent.py -v
 Edit `agent/config.py` to customize:
 - `model`: Claude model (default, sonnet, opus, haiku)
 - `permission_mode`: Permission mode (acceptEdits, etc.)
-- `allowed_tools`: Tools the agent can use (Read, Write, Edit, Bash, Glob, Grep, Skill)
+- `allowed_tools`: Tools the agent can use (Read, Write, Edit, Glob, Grep, Skill, WebSearch, WebFetch — Bash excluded by default)
+- `hooks`: Optional SDK hook dict (e.g. `PostToolUse` audit log); set by `_build_runtime_config` automatically
 - `setting_sources`: Sources for settings (user, project)
 
 ## Available Tools
 
 ### Default Tools
-The agent has these tools available by default:
-- Read, Write, Edit, Bash, Glob, Grep - File operations
+The agent has these tools available by default (Bash intentionally excluded — runtime profiles stamp the exact allowed list):
+- Read, Write, Edit, Glob, Grep - File operations
 - Skill - Execute SEO skills
 - WebSearch, WebFetch - Web browsing
 

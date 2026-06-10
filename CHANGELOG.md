@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-06-10
+
+### Added
+- **`campaign_draft_writer` execution profile** — write-only (EDIT tools, no Webflow publish); replaces the monolithic `campaign_content_writer` that could write files and publish in a single unguarded step
+- **`requires_approval` flag on `ExecutionProfile`** — when `True`, the orchestrator tier loop pauses before that phase and sets `OrchestrationStateModel.status = 'awaiting_approval'`; the campaign resumes only when `parent_task.approved_at` is set. Set on `campaign_publisher` by default.
+- **`grounding-required` procedural tag** — `research` and `campaign_researcher` profiles carry this tag; `ComposedPromptContext.to_prompt()` emits a cite-sources rule that requires every factual claim to be backed by a retrieved URL
+- **`build_post_tool_use_hook(db, run_id)`** in `agent/api/main.py` — returns a `PostToolUse` hook that writes a `RunEventModel` row for every tool call the agent makes; wired into `_build_runtime_config` when `db`/`run_id` are provided
+- **`SEOAgent.create_and_run_result`** classmethod — runs a prompt via the SDK and returns an object with `.result_text` and `.session_id`; used by `_run_agent_prompt` so hooks and config go through one code path
+- **`AgentConfig.hooks`** field — passes SDK hook dict through to `ClaudeAgentOptions.hooks`
+- **18 new tests** in `tests/test_safety_hardening.py` (10 pre-existing + 8 new): `TestContentWriterSplit` (6), `TestGroundingInstruction` (4), `TestApprovalGate` (4), `TestPostToolUseHook` (5)
+
+### Changed
+- `campaign_content_writer` profile **removed** — replaced by `campaign_draft_writer` (file edits) + `campaign_publisher` (Webflow publish, requires approval). Any orchestrator plan using `campaign_content_writer` must be updated to `campaign_draft_writer`.
+- `campaign_publisher` now has `requires_approval=True` — will halt every campaign before publish unless the parent task has `approved_at` set
+- `_build_prompt_with_context` accepts an optional `prompt_context` argument — when provided, skips file-based memory load (context is already embedded in the prompt string by the caller)
+
+### Security
+- `campaign_publisher` can no longer write or edit files — `Write`/`Edit` tools removed from its allowed set; it can only read and publish to Webflow CMS
+- Validator failures now halt the entire campaign pipeline (raised in `_dispatch_phase`) — a phase producing malformed output cannot pass context forward to downstream phases
+
 ## [2.1.0] - 2026-06-08
 
 ### Added
