@@ -372,4 +372,10 @@ PROFILE_REGISTRY: dict[str, ExecutionProfile] = {
 def get_execution_profile(execution_type: Optional[str]) -> ExecutionProfile:
     if not execution_type:
         return PROFILE_REGISTRY["manual"]
-    return PROFILE_REGISTRY.get(execution_type, PROFILE_REGISTRY["manual"])
+    profile = PROFILE_REGISTRY.get(execution_type)
+    if profile is None:
+        raise ValueError(
+            f"Unknown execution_type '{execution_type}'. "
+            f"Valid types: {sorted(PROFILE_REGISTRY.keys())}"
+        )
+    return profile
