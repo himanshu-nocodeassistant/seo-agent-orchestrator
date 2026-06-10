@@ -86,7 +86,7 @@ def mock_run_agent_prompt():
     """
     results = [
         _make_exec_result(PLAN_OUTPUT, "s0"),
-        _make_exec_result("Research complete: found 10 keywords.", "s1"),
+        _make_exec_result("Research complete: found 10 keywords. Source: https://ahrefs.com/keywords?q=no-code", "s1"),
         _make_exec_result(WRITER_OUTPUT, "s2"),
         _make_exec_result(
             "Published item 123.\n<!-- CHANGE_LOG\n"
@@ -117,7 +117,7 @@ def mock_run_agent_prompt_writer_fails():
         if idx == 0:
             return _make_exec_result(PLAN_OUTPUT, "s0")
         if idx == 1:
-            return _make_exec_result("Research complete.", "s1")
+            return _make_exec_result("Research complete. Top keyword: no-code automation. Source: https://ahrefs.com/kw", "s1")
         raise RuntimeError("Writer agent timed out")
 
     with patch("agent.api.main._run_agent_prompt", side_effect=_side_effect):
@@ -666,8 +666,8 @@ def mock_parallel_agent_prompt():
     )
     results = [
         _make_exec_result(PARALLEL_PLAN_OUTPUT, "s0"),    # orchestrator plan
-        _make_exec_result("Keyword research done.", "s1"),  # keyword_researcher
-        _make_exec_result("Competitor analysis done.", "s2"),  # competitor_researcher
+        _make_exec_result("Keyword research done. Top keyword: no-code tools. Source: https://ahrefs.com/kw", "s1"),  # keyword_researcher
+        _make_exec_result("Competitor analysis done. Top keyword: workflow automation. Source: https://semrush.com/kw", "s2"),  # competitor_researcher
         _make_exec_result(WRITER_OUT, "s3"),               # content_writer
     ]
     call_index = {"n": 0}
@@ -738,7 +738,7 @@ class TestParallelOrchestration:
             if idx == 0:
                 return _make_exec_result(PARALLEL_PLAN_OUTPUT, "s0")
             if idx == 1:
-                return _make_exec_result("Keyword research done.", "s1")
+                return _make_exec_result("Keyword research done. Top keyword: no-code. Source: https://ahrefs.com/kw", "s1")
             raise RuntimeError("Competitor agent failed")
 
         db = main_module.get_db_session()

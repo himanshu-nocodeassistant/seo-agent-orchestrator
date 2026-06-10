@@ -4,6 +4,7 @@ Execution profiles and output validation for SEO task runs.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -51,6 +52,32 @@ def _validate_non_empty(output: str) -> ValidationResult:
     if output and output.strip():
         return ValidationResult(status="passed")
     return ValidationResult(status="failed", message="Agent returned empty output.")
+
+
+_KEYWORD_TOKENS = re.compile(
+    r"\b(keywords?|query|search terms?|volume|search volume|kw)\b", re.IGNORECASE
+)
+
+
+def _validate_research_output(output: str) -> ValidationResult:
+    """Research output must contain at least one cited URL and one keyword reference.
+
+    Catches the most common hallucination pattern — plausible-sounding recommendations
+    with no web evidence — without being so strict that valid runs fail.
+    """
+    if not output.strip():
+        return ValidationResult(status="failed", message="Agent returned empty output.")
+    if not re.search(r"https?://\S+", output):
+        return ValidationResult(
+            status="failed",
+            message="Research output contains no cited URLs — agent may not have used WebSearch.",
+        )
+    if not _KEYWORD_TOKENS.search(output):
+        return ValidationResult(
+            status="failed",
+            message="Research output contains no keyword data (expected 'keyword', 'query', or 'volume').",
+        )
+    return ValidationResult(status="passed")
 
 
 def _contains_all(output: str, required_fragments: list[str], message: str) -> ValidationResult:
@@ -251,7 +278,7 @@ PROFILE_REGISTRY: dict[str, ExecutionProfile] = {
         max_thinking_tokens=6000,
         episodic_limit=4,
         semantic_char_limit=2600,
-        validator=_validate_non_empty,
+        validator=_validate_research_output,
         procedural_tags=["brand-voice", "research"],
     ),
     "alt_text": _profile(
@@ -326,7 +353,7 @@ PROFILE_REGISTRY: dict[str, ExecutionProfile] = {
         max_thinking_tokens=6000,
         episodic_limit=3,
         semantic_char_limit=2600,
-        validator=_validate_non_empty,
+        validator=_validate_research_output,
         procedural_tags=["brand-voice", "research", "campaign"],
     ),
     "campaign_content_writer": _profile(
