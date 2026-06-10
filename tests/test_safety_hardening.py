@@ -329,3 +329,60 @@ class TestContentWriterSplit:
         # Validator should be blog-write aware (wrapped or direct)
         bad = profile.validator("some draft without required fields")
         assert bad.status == "failed"
+
+
+# ============================================================================
+# Fix 8 — G2.2: Grounding instruction injected for research profiles
+# ============================================================================
+
+class TestGroundingInstruction:
+    def test_research_profile_has_grounding_tag(self):
+        from agent.runtime_profiles import PROFILE_REGISTRY
+        profile = PROFILE_REGISTRY["research"]
+        assert "grounding-required" in profile.procedural_tags
+
+    def test_campaign_researcher_profile_has_grounding_tag(self):
+        from agent.runtime_profiles import PROFILE_REGISTRY
+        profile = PROFILE_REGISTRY["campaign_researcher"]
+        assert "grounding-required" in profile.procedural_tags
+
+    def test_grounding_instruction_appears_in_prompt(self):
+        """When profile has grounding-required tag, to_prompt() must include the cite-sources rule."""
+        from agent.memory_service import (
+            ComposedPromptContext, EpisodicContext, ProceduralContext,
+            SemanticContext, ShortTermContext,
+        )
+        procedural = ProceduralContext(
+            execution_type="research",
+            profile_name="research",
+            tool_policy=["WebSearch", "WebFetch"],
+            validator_name="_validate_research_output",
+            max_turns=12,
+            timeout_seconds=480,
+            procedural_tags=["grounding-required", "research"],
+            workflow_prompt="Do keyword research.",
+        )
+        ctx = ComposedPromptContext(
+            short_term=ShortTermContext(
+                run_id="r1", task_id=1, execution_type="research",
+                trigger_source="test", session_id=None, validator_status=None,
+                task_title="Test", task_description=None,
+            ),
+            episodic=EpisodicContext(task_id=1, execution_type="research"),
+            semantic=SemanticContext(
+                project_overview="", strategy="", learnings="", context_view=""
+            ),
+            procedural=procedural,
+        )
+        prompt = ctx.to_prompt()
+        assert "cite" in prompt.lower() or "source" in prompt.lower(), (
+            "Grounding instruction missing from prompt for grounding-required profile"
+        )
+
+    def test_non_research_profiles_do_not_have_grounding_tag(self):
+        from agent.runtime_profiles import PROFILE_REGISTRY
+        for name in ["blog_write", "rewrite_title", "campaign_publisher", "manual"]:
+            profile = PROFILE_REGISTRY[name]
+            assert "grounding-required" not in profile.procedural_tags, (
+                f"{name} should not have grounding-required tag"
+            )

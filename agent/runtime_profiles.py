@@ -279,7 +279,7 @@ PROFILE_REGISTRY: dict[str, ExecutionProfile] = {
         episodic_limit=4,
         semantic_char_limit=2600,
         validator=_validate_research_output,
-        procedural_tags=["brand-voice", "research"],
+        procedural_tags=["brand-voice", "research", "grounding-required"],
     ),
     "alt_text": _profile(
         "alt_text",
@@ -354,7 +354,7 @@ PROFILE_REGISTRY: dict[str, ExecutionProfile] = {
         episodic_limit=3,
         semantic_char_limit=2600,
         validator=_validate_research_output,
-        procedural_tags=["brand-voice", "research", "campaign"],
+        procedural_tags=["brand-voice", "research", "campaign", "grounding-required"],
     ),
     "campaign_draft_writer": _profile(
         "campaign_draft_writer",
