@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **DataForSEO batch extraction pipeline** (`agent/dataforseo/`) — ported from the sibling `seo-bot` project as a standalone sync pipeline, not agent-facing MCP tools. Replaces guessed keyword volumes/SERP data with measured DataForSEO API responses.
+  - `client.py` — `DataForSEOClient`: retry+backoff on 429/502/503/504, Standard Queue task_post/task_get polling, crash-safe manifest writes before polling begins
+  - `logger.py` — logs every paid API call to `dataforseo/raw/<tag>/<keyword-slug>/<location_code>/`, grouped for lookup by keyword rather than by endpoint
+  - Coverage: SERP (Google organic), Keywords Data (Google Ads, Bing, Google Trends), DataForSEO Labs (Google), Backlinks, AI Optimization (LLM mentions/visibility across ChatGPT/Claude/Gemini/Perplexity, AI keyword data)
+  - Not ported: YouTube SERP endpoints, Amazon/App Store Labs — out of scope for this project's SEO focus
+  - `scripts/compile_serp_results.py`, `scripts/serp_recover_from_ids.py`, `scripts/purge_stale_poll_logs.py` — campaign-agnostic pipeline utilities; `TARGET_DOMAIN` hardcoding from the source replaced with `--target-domain`/`SEO_TARGET_DOMAIN`
+  - `dataforseo/{raw,manifests,compiled}/` created empty — no keyword intelligence carried over from the source project
+  - `tests/test_dataforseo_logger.py` — 9 tests on the log-grouping logic, ported verbatim (fully isolated via `tmp_path`)
+  - New deps: `requests>=2.31.0`, `python-dotenv>=1.0.0`
+- **`DataForSEOClient.total_cost` real-cost tracking** — accumulates the `cost` field from every API response (`_post`/`_get`), captured even on calls that ultimately raise `DataForSEOError` so billed spend is never dropped just because a call errored. Per-instance, not global. `tests/test_dataforseo_client.py` — 7 tests, all HTTP mocked.
+- **14 per-class API pipeline scripts** (`scripts/pipelines/`) — one CLI script per `agent/dataforseo` class (SERP, Google Ads/Bing/Trends keywords, Labs, Backlinks, LLM Mentions, AI Keyword Data, 4x LLM Responses, 2x LLM Scraper), the first mechanism in this repo that actually pulls fresh DataForSEO data (the 3 utility scripts above only operate on already-fetched files). Every script delegates to a shared harness (`scripts/pipelines/_cli.py`) that introspects the class's public methods and exposes each as a subcommand (`--task '<json>'` or `--tasks-file`), rather than 14 hand-written near-duplicates. Prints `total_cost` after every run; for the 4 `llm_responses_*` pipelines, also sums and prints real per-item `input_tokens`/`output_tokens`/`money_spent` (genuine LLM token spend, distinct from the DataForSEO call cost). `tests/test_pipeline_cli.py` — 15 tests against a fake client class covering every method-shape the harness dispatches.
+- **`SEO_TARGET_DOMAIN`** env var (`.env.example`) — the one domain-flagging parameter used across the pipeline (currently `scripts/serp_recover_from_ids.py --target-domain`); documented in one place so future scripts needing domain matching reuse the same name instead of inventing a new one.
+
 ## [2.2.0] - 2026-06-10
 
 ### Added

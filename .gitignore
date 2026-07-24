@@ -38,3 +38,12 @@ Thumbs.db
 
 # Claude
 .claude/backups/
+
+# DataForSEO pipeline output
+# raw/ and manifests/ are bulky, transient dumps of paid API calls — keep the
+# folders in git, ignore their contents. compiled/ rollups stay tracked because
+# they are the artifacts the agent actually reads.
+dataforseo/raw/*
+!dataforseo/raw/.gitkeep
+dataforseo/manifests/*
+!dataforseo/manifests/.gitkeep
