@@ -1,10 +1,30 @@
 # SEO Agent Orchestrator
 
-An open-source autonomous SEO agent built with Python and the Claude Agent SDK. Point it at your site and it runs audits, rewrites copy, writes blog posts, manages Webflow CMS content, and tracks ranking impact — all through a visual Kanban board.
+*Turn SEO from a manual, hard-to-measure process into a repeatable system that compounds organic growth.*
+
+An autonomous SEO operator for your site: it audits, optimizes, writes, publishes, and — most importantly — **measures whether the changes actually moved rankings**. Built on Python + the Claude Agent SDK and driven through a visual Kanban board, with a human approval gate before anything goes live.
+
+## Why it exists — the business case
+
+- **SEO is measurable but rarely measured.** The agent closes the loop: every CMS change is logged, its ranking impact reviewed against Search Console, and the winning patterns fed back into the next task.
+- **Content work doesn't scale manually.** A researcher → writer → publisher → analyst campaign pipeline turns one campaign request into a coordinated set of specialized tasks that run automatically.
+- **Guardrails protect the business.** Cost ceilings per task, tool permissions per task type, output validators, rate limits, and a human approval step before publishing — automation without losing control.
+- **Decisions come from data, not guesses.** Measured keyword volumes, SERP positions, and backlink data are injected into the agent's context so recommendations are grounded in real numbers.
+
+## What it delivers
+
+| Business outcome | How it's delivered |
+|---|---|
+| Faster page-level optimization | One task rewrites titles, meta descriptions, H1s, alt text, schema — with Webflow publish when configured |
+| Consistent content production | Blog posts and rewrites follow brand voice, SEO workflow, and validator checks |
+| Rank changes you can attribute | Every CMS change is change-logged and reviewed against GSC clicks/impressions/position |
+| Learning that compounds | SEO Feedback Loop extracts learnings from measured outcomes and propagates what works |
+| Team leverage | Comment Autopilot picks up "@agent" revision requests and re-runs automatically |
+| Cost control | Per-task budget ceilings, per-minute rate limits, real cost tracking on data pulls |
 
 ## How it works
 
-The agent uses Claude Code via OAuth (your Claude Pro or Max subscription — no API key required). Each task is mapped to an **execution profile** that controls which tools the agent can use, how many turns it gets, its cost ceiling, and a structured validator that checks the output before marking a run complete.
+The agent runs on your existing Claude Code subscription (OAuth — no API key). Each task maps to an **execution profile** that controls which tools the agent can use, how many turns it gets, its cost ceiling, and a structured validator that checks the output before a run is marked complete.
 
 A four-layer memory system feeds every prompt:
 - **Semantic** — your site overview, keyword strategy, and extracted ranking learnings from `memory/`
@@ -14,8 +34,8 @@ A four-layer memory system feeds every prompt:
 
 ## Features
 
-- **Multi-agent campaign orchestration** — create a single Kanban task with type `orchestrate_seo_campaign`; the orchestrator agent produces a JSON plan, Python dispatches each phase agent (researcher → writer → publisher → analyst) with DAG-based parallelism, structured inter-agent handoffs, and retry on transient failures
-- **14 SEO Skills** — SEO Audit, Content Strategy, Copywriting, Copy Editing, Brand Voice, Competitor Alternatives, Programmatic SEO, Schema Markup, Analytics Tracking, Page CRO, Marketing Psychology, Webflow CMS, Google Docs, SEO Feedback Loop
+- **Multi-agent campaign orchestration** — one campaign task (researcher → writer → publisher → analyst) with DAG-based parallelism, structured handoffs, retry on transient failures, and an approval gate before publishing
+- **15 SEO Skills** — SEO Audit, Content Strategy, Copywriting, Copy Editing, Brand Voice, Competitor Alternatives, Programmatic SEO, Schema Markup, Analytics Tracking, Page CRO, Marketing Psychology, Webflow CMS, Google Docs, SEO Feedback Loop, Task Breakdown
 - **Kanban UI** — visual task board at `http://localhost:8000/kanban`; create tasks, execute them, leave `@agent` comments for revisions
 - **Comment Autopilot** — background worker that picks up `@agent` comments and re-runs the agent automatically
 - **Run tracking** — every execution is recorded with status, session ID, validator result, and a result summary; child campaign runs link back to the orchestrator run via `parent_run_id`
@@ -94,6 +114,13 @@ async def main():
 
 asyncio.run(main())
 ```
+
+## Business guardrails by default
+
+- **Human approval before publishing** — `campaign_publisher` phases pause until a person sets `approved_at`; the campaign resumes from where it stopped (no re-planning, no double-billing).
+- **Spend is bounded** — every execution profile has a max budget and turn limit, API rate limits cap cost-triggering endpoints, and DataForSEO pulls track real billed cost per run.
+- **Nothing ships unverified** — outputs must pass a structured validator (grounded research requires cited URLs; CMS changes require a machine-readable change log) before a run is marked complete.
+- **Published changes are attributable** — the SEO Feedback Loop correlates CMS changes with GSC ranking data so you can see what actually worked.
 
 ## Configuration
 

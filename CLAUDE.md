@@ -1,10 +1,24 @@
 # SEO Bot - Autonomous Agent Project
 
-This project contains an autonomous SEO agent built with Python using Claude Agent Overview
+## Business Context
 
-- ** SDK.
+This project exists to make SEO a measurable, compounding growth channel instead
+of a manual, guess-driven process. Success looks like:
 
-## ProjectLanguage**: Python
+- **Attributable rank changes** — every CMS change is logged and reviewed
+  against Google Search Console data, so we know what actually moved rankings.
+- **Repeatable content production** — audits and keyword research turn into
+  coordinated campaigns (researcher → writer → publisher → analyst) that run
+  with consistent quality and brand voice.
+- **Controlled spend** — per-task budgets, rate limits, real DataForSEO cost
+  tracking, and a human approval gate before anything publishes.
+- **Decisions from measured data** — keyword volumes, SERP positions, and
+  backlink data come from measured sources, never guessed by the agent.
+
+Technical guidance for achieving these outcomes follows; keep business impact
+in mind when choosing between "expedient" and "correct".
+
+## ProjectLanguage: Python
 - **AI Backend**: Claude Agent SDK (uses Claude Code CLI via SDK)
 - **Purpose**: Autonomous SEO tasks (audit, content strategy, copywriting, etc.)
 

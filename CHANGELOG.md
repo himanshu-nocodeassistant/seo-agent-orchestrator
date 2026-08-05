@@ -26,6 +26,7 @@ All notable changes to this project will be documented in this file.
 - Deprecations fixed while restructuring: FastAPI lifespan handlers, SQLAlchemy 2.0 `orm.declarative_base`, Pydantic `model_dump`, `datetime.now(timezone.utc)` helpers
 - `seo_audit` is now an executable profile (previously a nonexistent type referenced by the broken audit endpoint and UI)
 - `main.py` CLI uses `SEO_AGENT_CWD`/repo root instead of a hardcoded path
+- README/CLAUDE.md reframed business-first (what it delivers and why, guardrails, measurable outcomes) with all technical detail preserved below
 
 ### Added
 - **DataForSEO batch extraction pipeline** (`agent/dataforseo/`) — ported from the sibling `seo-bot` project as a standalone sync pipeline, not agent-facing MCP tools. Replaces guessed keyword volumes/SERP data with measured DataForSEO API responses.
