@@ -2,7 +2,7 @@
 
 *Turn SEO from a manual, hard-to-measure process into a repeatable system that compounds organic growth.*
 
-An autonomous SEO operator for your site: it audits, optimizes, writes, publishes, and — most importantly — **measures whether the changes actually moved rankings**. Built on Python + the Claude Agent SDK and driven through a visual Kanban board, with a human approval gate before anything goes live.
+**SEO Agent Orchestrator is an open-source SEO operations platform** — an autonomous operator for your site that audits, optimizes, writes, publishes, and — most importantly — **measures whether the changes actually moved rankings**. Built on Python + the Claude Agent SDK and driven through a visual Kanban board, with a human approval gate before anything goes live.
 
 ## Why it exists — the business case
 
@@ -21,6 +21,10 @@ An autonomous SEO operator for your site: it audits, optimizes, writes, publishe
 | Learning that compounds | SEO Feedback Loop extracts learnings from measured outcomes and propagates what works |
 | Team leverage | Comment Autopilot picks up "@agent" revision requests and re-runs automatically |
 | Cost control | Per-task budget ceilings, per-minute rate limits, real cost tracking on data pulls |
+
+## Open source, self-hosted, no lock-in
+
+SEO Agent Orchestrator is released under the [MIT License](LICENSE). It runs entirely on your own infrastructure against your existing Claude Code subscription — your ranking data, CMS, and credentials never leave your control. As an open-source project, the entire pipeline is inspectable and extensible: agent logic, SEO skills, data integrations, and the API are all yours to read, fork, and extend. No black box, no per-seat pricing, no vendor lock-in.
 
 ## How it works
 

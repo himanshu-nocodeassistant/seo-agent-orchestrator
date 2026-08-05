@@ -1,9 +1,11 @@
-# SEO Bot - Autonomous Agent Project
+# SEO Agent Orchestrator
 
 ## Business Context
 
-This project exists to make SEO a measurable, compounding growth channel instead
-of a manual, guess-driven process. Success looks like:
+SEO Agent Orchestrator is an open-source platform that makes SEO a measurable,
+compounding growth channel. It is built for teams that treat organic search as
+a core revenue channel — not for one-off experiments — and it is judged by four
+outcomes:
 
 - **Attributable rank changes** — every CMS change is logged and reviewed
   against Google Search Console data, so we know what actually moved rankings.
@@ -15,8 +17,10 @@ of a manual, guess-driven process. Success looks like:
 - **Decisions from measured data** — keyword volumes, SERP positions, and
   backlink data come from measured sources, never guessed by the agent.
 
-Technical guidance for achieving these outcomes follows; keep business impact
-in mind when choosing between "expedient" and "correct".
+As an open-source project (MIT), the platform is self-hosted and fully
+inspectable: users can extend the skills, integrations, and pipeline without
+asking permission. Technical guidance for achieving these outcomes follows;
+keep business impact in mind when choosing between "expedient" and "correct".
 
 ## ProjectLanguage: Python
 - **AI Backend**: Claude Agent SDK (uses Claude Code CLI via SDK)
