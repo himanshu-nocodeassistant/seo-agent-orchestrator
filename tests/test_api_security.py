@@ -62,7 +62,7 @@ class TestRateLimit:
 class TestSeoAuditEndpoint:
     def test_audit_runs_through_profile_pipeline(self, client):
         with patch(
-            "agent.api.main._run_agent_prompt",
+            "agent.api.helpers._run_agent_prompt",
             new=AsyncMock(
                 return_value=SimpleNamespace(
                     result_text=(
@@ -97,7 +97,7 @@ class TestSeoAuditEndpoint:
                 session_id=None,
             )
 
-        with patch("agent.api.main._run_agent_prompt", new=_fake_run):
+        with patch("agent.api.helpers._run_agent_prompt", new=_fake_run):
             resp = client.post(
                 "/runs/audit-test-2/seo-audit", json={"days": 28}
             )

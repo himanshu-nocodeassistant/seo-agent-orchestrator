@@ -285,7 +285,7 @@ async def _dispatch_phase(
     phases never share/interleave a SQLAlchemy session (the PostToolUse hook
     and run/task writes all go through the phase-local session).
     """
-    from agent.api.main import SessionLocal, TaskModel
+    from agent.db import SessionLocal, TaskModel
     from agent.runtime_profiles import get_execution_profile
 
     phase_name = phase_spec["phase"]
@@ -409,38 +409,25 @@ async def run_campaign_orchestration(
     """
     # Import here to avoid circular imports (main imports orchestrator, orchestrator
     # needs models and helpers from main).
-    from agent.api.main import (
+    from agent.api import helpers as helpers_module
+    from agent.db import (
         AgentRunModel,
         OrchestrationStateModel,
         TaskModel,
-        add_task_comment,
-        add_task_completed_comment,
-        add_task_failed_comment,
-        build_execution_prompt,
-        _build_runtime_config,
-        _create_run,
-        _finalize_run_failure,
-        _finalize_run_success,
-        _get_task_session_id,
-        _mark_run_started,
-        _normalize_execution_result,
-        _project_root,
-        _refresh_context_view,
-        _resolve_prompt_context,
-        _run_agent_prompt,
     )
+    from agent.prompts import build_execution_prompt
     from agent.runtime_profiles import ValidationResult, get_execution_profile
 
     helpers = {
         "build_execution_prompt": build_execution_prompt,
-        "_build_runtime_config": _build_runtime_config,
-        "_finalize_run_failure": _finalize_run_failure,
-        "_finalize_run_success": _finalize_run_success,
-        "_mark_run_started": _mark_run_started,
-        "_normalize_execution_result": _normalize_execution_result,
-        "_refresh_context_view": _refresh_context_view,
-        "_resolve_prompt_context": _resolve_prompt_context,
-        "_run_agent_prompt": _run_agent_prompt,
+        "_build_runtime_config": helpers_module._build_runtime_config,
+        "_finalize_run_failure": helpers_module._finalize_run_failure,
+        "_finalize_run_success": helpers_module._finalize_run_success,
+        "_mark_run_started": helpers_module._mark_run_started,
+        "_normalize_execution_result": helpers_module._normalize_execution_result,
+        "_refresh_context_view": helpers_module._refresh_context_view,
+        "_resolve_prompt_context": helpers_module._resolve_prompt_context,
+        "_run_agent_prompt": helpers_module._run_agent_prompt,
     }
 
     campaign_goal = parent_task.description or parent_task.title
@@ -462,13 +449,15 @@ async def run_campaign_orchestration(
             phase_outputs = json.loads(state.phase_outputs_json or "{}")
             child_run_ids = json.loads(state.child_run_ids_json or "[]")
         except (ValueError, json.JSONDecodeError) as e:
-            _finalize_run_failure(
+            helpers_module._finalize_run_failure(
                 db, orchestrator_run, parent_task, f"Resume failed: {e}"
             )
-            add_task_failed_comment(db, parent_task.id, f"Resume failed: {e}")
+            helpers_module.add_task_failed_comment(
+                db, parent_task.id, f"Resume failed: {e}"
+            )
             return
         plan_text = state.plan_json or ""
-        add_task_comment(
+        helpers_module.add_task_comment(
             db, parent_task.id, "Campaign resuming after approval.", "agent"
         )
         state.status = "running"
@@ -499,29 +488,29 @@ async def run_campaign_orchestration(
         ]
         if not tiers:
             summary = "Campaign already completed."
-            _finalize_run_success(
+            helpers_module._finalize_run_success(
                 db, orchestrator_run, parent_task, summary, None,
                 ValidationResult(status="passed"),
             )
-            add_task_completed_comment(db, parent_task.id, summary)
+            helpers_module.add_task_completed_comment(db, parent_task.id, summary)
             return
 
     # ── Fresh run: orchestrator produces plan ────────────────────────────────
     else:
         orch_profile = get_execution_profile("orchestrate_seo_campaign")
-        orch_config = _build_runtime_config(orch_profile, None)
+        orch_config = helpers_module._build_runtime_config(orch_profile, None)
 
-        orch_prompt_context = _resolve_prompt_context(
+        orch_prompt_context = helpers_module._resolve_prompt_context(
             db, orchestrator_run, parent_task, [], "", orch_profile
         )
         orchestrator_run.prompt_text = build_execution_prompt(parent_task, comments=[])
-        _mark_run_started(
+        helpers_module._mark_run_started(
             db, orchestrator_run, orch_prompt_context, orch_profile.execution_type, None
         )
 
-        raw_execution = _normalize_execution_result(
+        raw_execution = helpers_module._normalize_execution_result(
             await _run_with_retry(
-                _run_agent_prompt,
+                helpers_module._run_agent_prompt,
                 orchestrator_run.prompt_text,
                 orch_config,
                 orch_prompt_context,
@@ -542,8 +531,8 @@ async def run_campaign_orchestration(
                 )
             tiers = _resolve_execution_tiers(phases)
         except ValueError as e:
-            _finalize_run_failure(db, orchestrator_run, parent_task, str(e))
-            add_task_failed_comment(db, parent_task.id, str(e))
+            helpers_module._finalize_run_failure(db, orchestrator_run, parent_task, str(e))
+            helpers_module.add_task_failed_comment(db, parent_task.id, str(e))
             return
 
         # ── Persist orchestration state ──────────────────────────────────────
@@ -572,7 +561,7 @@ async def run_campaign_orchestration(
         tier_summary = " → ".join(
             "[" + ", ".join(p["phase"] for p in tier) + "]" for tier in tiers
         )
-        add_task_comment(
+        helpers_module.add_task_comment(
             db,
             parent_task.id,
             f"Campaign plan created. Execution order: {tier_summary}",
@@ -596,7 +585,7 @@ async def run_campaign_orchestration(
         state.updated_at = datetime.utcnow().isoformat()
         db.commit()
 
-        add_task_comment(
+        helpers_module.add_task_comment(
             db,
             parent_task.id,
             f"Starting {'phases' if len(pending_in_tier) > 1 else 'phase'}: "
@@ -614,7 +603,7 @@ async def run_campaign_orchestration(
                 state.current_phase = phase_spec["phase"]
                 state.updated_at = datetime.utcnow().isoformat()
                 db.commit()
-                add_task_comment(
+                helpers_module.add_task_comment(
                     db,
                     parent_task.id,
                     f"Campaign paused before phase [{phase_spec['phase']}] — human approval required. "
@@ -651,14 +640,16 @@ async def run_campaign_orchestration(
                 failed_error = result
                 # Mark failed child task
                 child_task = child_tasks[failed_phase]
-                _finalize_run_failure(
+                helpers_module._finalize_run_failure(
                     db,
                     _get_latest_run_for_task(db, AgentRunModel, child_task.id),
                     child_task,
                     str(failed_error),
                 )
-                _refresh_context_view(db, task_id=child_task.id)
-                add_task_failed_comment(db, child_task.id, str(failed_error))
+                helpers_module._refresh_context_view(db, task_id=child_task.id)
+                helpers_module.add_task_failed_comment(
+                    db, child_task.id, str(failed_error)
+                )
             else:
                 phase_name, result_text, degraded = result
                 phase_outputs[phase_name] = result_text
@@ -667,14 +658,14 @@ async def run_campaign_orchestration(
                         db, AgentRunModel, child_tasks[phase_name].id
                     )
                 )
-                add_task_comment(
+                helpers_module.add_task_comment(
                     db, parent_task.id, f"Phase [{phase_name}] complete.", "agent"
                 )
                 if degraded:
                     degraded_map = json.loads(state.handoff_degraded_json or "{}")
                     degraded_map[phase_name] = True
                     state.handoff_degraded_json = json.dumps(degraded_map)
-                    add_task_comment(
+                    helpers_module.add_task_comment(
                         db,
                         parent_task.id,
                         f"Phase [{phase_name}] produced no summary block — "
@@ -693,11 +684,11 @@ async def run_campaign_orchestration(
             state.updated_at = datetime.utcnow().isoformat()
             db.commit()
 
-            _finalize_run_failure(
+            helpers_module._finalize_run_failure(
                 db, orchestrator_run, parent_task,
                 f"Campaign stopped at phase [{failed_phase}]: {failed_error}",
             )
-            add_task_failed_comment(
+            helpers_module.add_task_failed_comment(
                 db, parent_task.id,
                 f"Campaign stopped at phase [{failed_phase}]: {failed_error}",
             )
@@ -715,13 +706,13 @@ async def run_campaign_orchestration(
         summary_lines.append(f"- **{phase_name}**: {snippet}...")
     summary = "\n".join(summary_lines)
 
-    _finalize_run_success(
+    helpers_module._finalize_run_success(
         db, orchestrator_run, parent_task,
         summary,
         raw_execution.session_id if not resume else None,
         ValidationResult(status="passed"),
     )
-    add_task_completed_comment(db, parent_task.id, summary)
+    helpers_module.add_task_completed_comment(db, parent_task.id, summary)
 
 
 def _get_latest_run_for_task(db, AgentRunModel, task_id: int):

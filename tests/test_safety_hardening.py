@@ -225,7 +225,7 @@ class TestValidatorFailureStopsPipeline:
                 db, parent_task, "manual_execute", "orchestrate_seo_campaign"
             )
 
-            with patch("agent.api.main._run_agent_prompt", side_effect=_side_effect):
+            with patch("agent.api.helpers._run_agent_prompt", side_effect=_side_effect):
                 await run_campaign_orchestration(db, parent_task, orch_run)
 
             db.refresh(orch_run)
@@ -568,7 +568,7 @@ class TestApprovalGate:
                 db, parent_task, "manual_execute", "orchestrate_seo_campaign"
             )
 
-            with patch("agent.api.main._run_agent_prompt", side_effect=_side_effect):
+            with patch("agent.api.helpers._run_agent_prompt", side_effect=_side_effect):
                 await run_campaign_orchestration(db, parent_task, orch_run)
 
             db.refresh(orch_run)

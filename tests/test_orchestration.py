@@ -114,7 +114,7 @@ def mock_run_agent_prompt():
         call_index["n"] += 1
         return results[idx]
 
-    with patch("agent.api.main._run_agent_prompt", side_effect=_side_effect):
+    with patch("agent.api.helpers._run_agent_prompt", side_effect=_side_effect):
         yield
 
 
@@ -135,7 +135,7 @@ def mock_run_agent_prompt_writer_fails():
             ), "s1")
         raise RuntimeError("Writer agent timed out")
 
-    with patch("agent.api.main._run_agent_prompt", side_effect=_side_effect):
+    with patch("agent.api.helpers._run_agent_prompt", side_effect=_side_effect):
         yield
 
 
@@ -358,7 +358,7 @@ class TestAPIRouting:
         })
         task_id = resp.json()["id"]
 
-        with patch("agent.api.main._run_agent_prompt") as mock:
+        with patch("agent.api.helpers._run_agent_prompt") as mock:
             mock.return_value = AsyncMock(return_value=_make_exec_result("Research done."))()
             exec_resp = client.post(f"/tasks/{task_id}/execute")
         assert exec_resp.status_code == 200
@@ -702,7 +702,7 @@ def mock_parallel_agent_prompt():
             call_index["n"] += 1
         return results[idx]
 
-    with patch("agent.api.main._run_agent_prompt", side_effect=_side_effect):
+    with patch("agent.api.helpers._run_agent_prompt", side_effect=_side_effect):
         yield
 
 
@@ -784,7 +784,7 @@ class TestParallelOrchestration:
             orch_run = main_module._create_run(
                 db, parent_task, "manual_execute", "orchestrate_seo_campaign"
             )
-            with patch("agent.api.main._run_agent_prompt", side_effect=_side_effect):
+            with patch("agent.api.helpers._run_agent_prompt", side_effect=_side_effect):
                 await run_campaign_orchestration(db, parent_task, orch_run)
 
             db.refresh(orch_run)
@@ -898,7 +898,7 @@ class TestSDKResultHardening:
         import logging
 
         unknown = {"type": "unexpected_sdk_event", "data": "something"}
-        with patch("agent.api.main.logger") as mock_logger:
+        with patch("agent.api.helpers.logger") as mock_logger:
             result = _normalize_execution_result(unknown)
         mock_logger.warning.assert_called_once()
         warning_msg = mock_logger.warning.call_args[0][0]
@@ -1140,7 +1140,7 @@ class TestHandoffRetry:
                 db, parent_task, "manual_execute", "orchestrate_seo_campaign"
             )
 
-            with patch("agent.api.main._run_agent_prompt", side_effect=_side_effect):
+            with patch("agent.api.helpers._run_agent_prompt", side_effect=_side_effect):
                 await run_campaign_orchestration(db, parent_task, orch_run)
 
             db.refresh(orch_run)
@@ -1211,7 +1211,7 @@ class TestHandoffRetry:
                 db, parent_task, "manual_execute", "orchestrate_seo_campaign"
             )
 
-            with patch("agent.api.main._run_agent_prompt", side_effect=_side_effect):
+            with patch("agent.api.helpers._run_agent_prompt", side_effect=_side_effect):
                 await run_campaign_orchestration(db, parent_task, orch_run)
 
             state = db.query(main_module.OrchestrationStateModel).filter(
@@ -1282,7 +1282,7 @@ class TestPlanValidation:
                 db, parent_task, "manual_execute", "orchestrate_seo_campaign"
             )
 
-            with patch("agent.api.main._run_agent_prompt", side_effect=_side_effect):
+            with patch("agent.api.helpers._run_agent_prompt", side_effect=_side_effect):
                 await run_campaign_orchestration(db, parent_task, orch_run)
 
             db.refresh(orch_run)

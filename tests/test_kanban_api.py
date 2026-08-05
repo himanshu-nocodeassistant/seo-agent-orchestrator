@@ -196,7 +196,7 @@ class TestSEOAudit:
         from unittest.mock import AsyncMock, patch
 
         with patch(
-            "agent.api.main._run_agent_prompt",
+            "agent.api.helpers._run_agent_prompt",
             new=AsyncMock(
                 return_value=SimpleNamespace(
                     result_text=(

@@ -15,9 +15,16 @@ This project contains an autonomous SEO agent built with Python using Claude Age
 - `agent/memory_service.py` - Layered memory composition: builds `ShortTermContext`, `EpisodicContext`, `SemanticContext`, `ProceduralContext` into a `ComposedPromptContext` for prompt injection
 - `agent/runtime_profiles.py` - `ExecutionProfile` registry; maps each execution type to tool policy, budget, timeout, turn limit, validator, semantic char limits, and `requires_approval` flag
 - `agent/orchestrator.py` - Multi-agent campaign dispatch loop; DAG tier resolution (`_resolve_execution_tiers`), structured inter-agent handoffs (`_extract_summary_block`), retry with backoff (`_run_with_retry`), parallel execution via `asyncio.gather`
+- `agent/db.py` - SQLAlchemy engine, session factory, ORM models, and Pydantic API schemas (WAL + busy_timeout enabled for SQLite)
+- `agent/prompts.py` - Workflow prompts per execution type (`build_execution_prompt`)
+- `agent/feedback_loop.py` - Change-log/learnings persistence (`seo-changes.json`, `seo-learnings.json`, markdown views)
 - `main.py` - CLI entry point; uses `PROJECT_ROOT` for portable working directory
-- `agent/api/main.py` - FastAPI Kanban server; includes `AgentRunModel`, `RunEventModel`, `TaskSessionModel`, `OrchestrationStateModel` DB tables for full run tracking
-- `skills/` - SEO skills (.skill files are ZIP archives containing SKILL.md)
+- `agent/api/main.py` - FastAPI app assembly: CORS (`ALLOWED_ORIGINS`), optional bearer-token gate (`API_TOKEN`), slowapi rate limits, lifespan (autopilot + DB migrations)
+- `agent/api/helpers.py` - Shared run/comment/autopilot helpers (formerly in main.py)
+- `agent/api/routers/` - `tasks.py`, `comments.py`, `runs.py`, `automation.py` endpoint routers
+- `agent/api/rate_limit.py` - Shared slowapi `limiter` for cost-triggering endpoints
+- `agent/api/static/kanban.html` - Kanban board UI (served as a static file)
+- `skills/` - SEO skills as canonical unpacked `<name>/SKILL.md` directories (no `.skill` ZIP archives)
 - `memory/` - Session memory (CLAUDE.md, seo-strategy.md, seo-context.md, seo-tasks.md)
 - `tests/` - Test suite with pytest
 
@@ -30,8 +37,11 @@ Trigger: create a Kanban task with `execution_type = "orchestrate_seo_campaign"`
 2. Python (`agent/orchestrator.py`) parses the plan and resolves execution tiers via Kahn's topological sort
 3. Child `TaskModel` rows are created (one per phase, with `parent_task_id` set)
 4. Tiers execute sequentially; phases within a tier run concurrently via `asyncio.gather`
+   - Each phase runs on its **own DB session** (closed in `finally`), so concurrent phases never share/interleave a SQLAlchemy session
 5. **Approval gate**: before dispatching any phase whose `ExecutionProfile.requires_approval=True`, the orchestrator checks `parent_task.approved_at`. If unset, sets `state.status='awaiting_approval'` and halts. Campaign resumes when `approved_at` is set via `PATCH /tasks/{id}`.
+   - **Resume is explicit**: `POST /tasks/{id}/execute?resume=true` (or the Resume button in the UI) continues the SAME orchestrator run — the plan is not regenerated and completed phases are not re-run.
 6. Each phase agent receives prior outputs via structured `## Summary for Next Phase` blocks (falls back to 1500-char truncation)
+   - Phases with downstream dependents get ONE correction retry when the block is missing; if still missing, `handoff_degraded` is recorded in the orchestration state (`handoff_degraded_json`) plus a warning comment
 7. `OrchestrationStateModel` persists state: plan JSON, current phase, all phase outputs, child run IDs, and final status (`running | awaiting_approval | completed | error`)
 8. All child `AgentRunModel` rows carry `parent_run_id` pointing to the orchestrator run
 
@@ -61,6 +71,8 @@ Trigger: create a Kanban task with `execution_type = "orchestrate_seo_campaign"`
 ```
 
 **Retry policy:** transient errors (timeouts, 503s, rate limits) are retried up to 2 times with exponential backoff with an optional `max_total_seconds` wall-clock cap. Non-retryable: budget exceeded, malformed plan, circular dependency.
+
+**Plan validation:** every phase's `execution_type` is validated against the profile registry right after parsing — a bad plan fails fast with a clear error before any child task is created.
 
 **Approval gate:** `campaign_publisher` has `requires_approval=True`. The orchestrator halts before that tier and sets `state.status='awaiting_approval'`. Set `approved_at` on the parent task via the Kanban UI (PATCH) to resume.
 
@@ -389,9 +401,37 @@ agent/dataforseo/
 scripts/compile_serp_results.py    # dataforseo/raw/ -> one compiled JSON, deduped to latest per keyword+location
 scripts/serp_recover_from_ids.py   # recover results from a manifest/task_post log without re-billing tasks
 scripts/purge_stale_poll_logs.py   # delete not-ready poll snapshots superseded by a completed task_get
+scripts/pipelines/refresh.py       # scheduled SERP + keyword-volume refresh (reads dataforseo/refresh.tasks.json)
 ```
 These operate on already-fetched local files (or resume an in-flight
 task_post) — they don't pull fresh data from the API themselves.
+
+### Refreshing Measurements on a Schedule
+
+`scripts/pipelines/refresh.py` reads `dataforseo/refresh.tasks.json` (a `serp`
+keyword list and a `keyword_volume` list with locations/tags), runs the
+standard-queue `search` / `search_volume` batches, and writes rollups to
+`dataforseo/compiled/` with the naming the measurement memory layer reads.
+Run it from cron/launchd, e.g. daily at 2am:
+
+```
+0 2 * * * cd /path/to/seo-bot-orchestrator && .venv/bin/python scripts/pipelines/refresh.py >> dataforseo/refresh.log 2>&1
+```
+
+The agent consumes the compiled rollups through the measurement memory layer:
+`agent/dataforseo/memory.py` picks the newest compiled file per pipeline and
+`fetch_semantic_context` injects a `## Measured Data (DataForSEO)` section for
+profiles tagged `dataforseo-measurements` (`research`, `campaign_researcher`,
+`campaign_analyst`, `seo_impact_review`) — so keyword volumes/SERP positions
+come from measured responses, not guesses.
+
+**Client hardening:** `DataForSEOClient` chunks `task_post` payloads into
+`DATAFORSEO_MAX_TASKS_PER_REQUEST` (default 100) batches, polls all pending
+tasks per round with a global `max_wait` deadline, uses full-jitter backoff
+honoring `Retry-After`, writes manifests atomically, and rate-limits task
+creation via a shared token bucket (`DATAFORSEO_TASKS_PER_MINUTE`, default
+100). Never run pipeline scripts without explicit user permission — every
+`task_post` bills real API spend.
 
 **Not ported:** the ~30 one-off campaign report scripts (e.g. white-label
 keyword volume, bubble-migration keyword suggestions) that lived in the source
@@ -502,14 +542,26 @@ Comment automation environment variables:
 - `COMMENT_AUTOPILOT_INTERVAL_SECONDS` (default `300` — 5 minutes)
 - `AGENT_EXECUTION_TIMEOUT_SECONDS` (default `900`)
 
+API hardening environment variables:
+- `ALLOWED_ORIGINS` (comma-separated CORS origins; default localhost:8000)
+- `API_TOKEN` (optional bearer token; when set every request needs `Authorization: Bearer <token>`)
+- `API_RATE_LIMIT_EXECUTE` (per-minute slowapi limit on execute/process-one; default `5/minute`)
+- `SEO_AGENT_CWD` (agent working directory; defaults to repo root)
+- `CLAUDE_CLI_PATH` (Claude CLI override; auto-detected from PATH if unset)
+
 Testing isolation:
-- `tests/conftest.py` forces API tests to use in-memory SQLite with `StaticPool` so tests never write into production/staging DB files.
+- `tests/conftest.py` forces API tests to use in-memory SQLite with `StaticPool` (patching `agent.db` engine/session) so tests never write into production/staging DB files, and raises the rate limit so the shared TestClient key never trips it.
 
 ### Module Structure
 ```
 agent/api/
 ├── __init__.py    # Module init
-└── main.py        # FastAPI app with all endpoints and embedded Kanban HTML
+├── main.py        # FastAPI app assembly + backwards-compat re-exports
+├── helpers.py     # Shared run/comment/autopilot helpers
+├── rate_limit.py  # slowapi limiter
+├── routers/       # tasks.py, comments.py, runs.py, automation.py
+└── static/
+    └── kanban.html
 ```
 
 ## Testing

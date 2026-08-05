@@ -120,6 +120,9 @@ Copy `.env.example` to `.env` and fill in the values you need.
 | `COMMENT_AUTOPILOT_ENABLED` | Enable `@agent` comment background worker | `true` |
 | `COMMENT_AUTOPILOT_INTERVAL_SECONDS` | Poll interval for comment autopilot | `900` |
 | `AGENT_EXECUTION_TIMEOUT_SECONDS` | Timeout per agent execution | `900` |
+| `ALLOWED_ORIGINS` | Comma-separated CORS origins for the local API | `http://localhost:8000,http://127.0.0.1:8000` |
+| `API_TOKEN` | Optional bearer token; when set every request needs `Authorization: Bearer <token>` | unset |
+| `API_RATE_LIMIT_EXECUTE` | Per-minute rate limit on endpoints that start paid agent runs | `5/minute` |
 | `WEBFLOW_ACCESS_TOKEN` | Webflow API token | unset |
 | `WEBFLOW_SITE_ID` | Webflow site ID | unset |
 | `WEBFLOW_COLLECTION_ID` | Webflow CMS collection ID | unset |
@@ -127,6 +130,8 @@ Copy `.env.example` to `.env` and fill in the values you need.
 | `GOOGLE_APPLICATION_CREDENTIALS` | Alternative credentials path (same SA JSON) | unset |
 | `GSC_SITE_URL` | GSC property (`sc-domain:example.com` or `https://www.example.com/`) | unset |
 | `GSC_CREDENTIALS_PATH` | SA credentials for GSC (falls back to `GOOGLE_DOCS_CREDENTIALS_PATH`) | unset |
+| `DATAFORSEO_MAX_TASKS_PER_REQUEST` | Max tasks per DataForSEO `task_post` batch | `100` |
+| `DATAFORSEO_TASKS_PER_MINUTE` | Shared per-process rate limit for DataForSEO task creation | `100` |
 
 ## Execution Profiles
 
@@ -175,8 +180,15 @@ seo-agent-orchestrator/
 │   ├── memory_service.py     # Four-layer prompt composition
 │   ├── runtime_profiles.py   # ExecutionProfile registry (incl. campaign profiles)
 │   ├── orchestrator.py       # Multi-agent dispatch loop; DAG resolution; retry
+│   ├── db.py                 # SQLAlchemy engine, models, and API schemas
+│   ├── prompts.py            # Workflow prompts per execution type
+│   ├── feedback_loop.py      # Change-log/learnings persistence
 │   ├── api/
-│   │   └── main.py           # FastAPI Kanban server + all endpoints
+│   │   ├── main.py           # FastAPI app assembly (CORS, token, rate limits, lifespan)
+│   │   ├── helpers.py        # Shared run/comment/autopilot helpers
+│   │   ├── rate_limit.py     # slowapi limiter for cost-triggering endpoints
+│   │   ├── routers/          # tasks, comments, runs, automation routers
+│   │   └── static/           # kanban.html board
 │   ├── webflow/              # Webflow CMS MCP integration
 │   ├── google_docs/          # Google Docs MCP integration
 │   └── gsc/                  # Google Search Console MCP integration (read-only)
@@ -185,7 +197,7 @@ seo-agent-orchestrator/
 │   ├── seo-strategy.md       # Strategy (committed as a template)
 │   ├── seo-context.md        # Auto-updated after each run
 │   └── seo-tasks.md          # Auto-generated from audits
-├── skills/                   # SEO skills (.skill ZIP archives)
+├── skills/                   # SEO skills (unpacked <name>/SKILL.md dirs)
 ├── .claude/
 │   └── seo-learnings.md      # Auto-extracted ranking learnings
 ├── tests/                    # pytest test suite
@@ -252,7 +264,7 @@ Two workers writing at the same time will fight. I used SQLite because there are
 `asyncio.gather` runs them on the same thread, and SQLite only allows one writer at a time anyway. But the actual bottleneck is the Claude API call, which takes seconds to minutes. The DB write takes microseconds. So the parallelism still delivers real time savings. With Postgres and async SQLAlchemy each phase gets its own connection and you get the full benefit.
 
 **4. If an agent skips the summary block, the next agent gets raw truncated output.**
-I ask each agent to write a `## Summary for Next Phase` block at the end of its output so the next agent gets a clean handoff. If it doesn't, I fall back to taking the first 1500 chars. That fallback is silent — the pipeline doesn't know the handoff was degraded. The fix would be a validator that rejects the output and retries with a correction prompt. I skipped it because it costs extra turns. Good enough for now.
+Phases with downstream dependents must end with a `## Summary for Next Phase` block. If it's missing, the orchestrator retries once with a correction prompt asking for the block (only for phases that have dependents, so final phases cost nothing extra). If it's still missing, the campaign continues with the 1500-char truncation fallback, but records `handoff_degraded` in the orchestration state and posts a warning comment on the task — the pipeline now knows the handoff was degraded.
 
 **5. Unknown SDK result types get logged but not alerted.**
 If the SDK ships a new event type we don't handle, we log a warning and wrap it gracefully — nothing crashes. But in production that warning would be invisible. Wire the logger to Sentry or Datadog if you care about SDK contract changes.

@@ -24,6 +24,7 @@ from sqlalchemy.pool import StaticPool
 import pytest
 from fastapi.testclient import TestClient
 import agent.api.main as main_module
+import agent.db as db_module
 
 # StaticPool ensures all connections reuse the same in-memory SQLite database
 _test_engine = create_engine(
@@ -33,7 +34,10 @@ _test_engine = create_engine(
 )
 _test_session_factory = sessionmaker(autocommit=False, autoflush=False, bind=_test_engine)
 
-# Patch module-level globals
+# Patch the real owners of the engine/session (db.py), plus the compatibility
+# re-exports on main, so every code path hits the in-memory DB.
+db_module.engine = _test_engine
+db_module.SessionLocal = _test_session_factory
 main_module.engine = _test_engine
 main_module.SessionLocal = _test_session_factory
 
