@@ -259,12 +259,37 @@ class OrchestrationStateModel(Base):
     child_run_ids_json = Column(Text, nullable=True)
     status = Column(String(30), nullable=False, default="planning")
     error = Column(Text, nullable=True)
+    handoff_degraded_json = Column(Text, nullable=True)
     created_at = Column(String(20), default=lambda: datetime.utcnow().isoformat())
     updated_at = Column(String(20), default=lambda: datetime.utcnow().isoformat())
 
 
 # Create tables
 Base.metadata.create_all(bind=engine)
+
+
+def _ensure_orchestration_handoff_column() -> None:
+    """Add handoff_degraded_json to pre-existing SQLite DBs.
+
+    Fresh DBs get the column from the model via create_all; existing DBs
+    need an ALTER TABLE. Best-effort so an old kanban.db never blocks startup.
+    """
+    if not DATABASE_URL.startswith("sqlite"):
+        return
+    try:
+        with engine.connect() as conn:
+            existing = [
+                row[1]
+                for row in conn.exec_driver_sql("PRAGMA table_info(orchestration_states)")
+            ]
+            if "handoff_degraded_json" not in existing:
+                conn.exec_driver_sql(
+                    "ALTER TABLE orchestration_states "
+                    "ADD COLUMN handoff_degraded_json TEXT"
+                )
+                conn.commit()
+    except Exception as e:  # pragma: no cover - best-effort migration
+        logger.warning("Could not ensure handoff_degraded_json column: %s", e)
 
 
 # ============================================================================
@@ -318,6 +343,7 @@ class TaskResponse(BaseModel):
     active_run_id: Optional[str]
     created_at: str
     updated_at: str
+    resume_available: bool = False
 
 
 class TaskListResponse(BaseModel):
@@ -551,7 +577,7 @@ def _campaign_timeout_seconds() -> int:
     return max(value, 1)
 
 
-async def _execute_campaign_with_timeout(db, task, run) -> None:
+async def _execute_campaign_with_timeout(db, task, run, resume: bool = False) -> None:
     """Run the campaign orchestration with a top-level wall-clock timeout.
 
     Raises RuntimeError if the campaign exceeds CAMPAIGN_TIMEOUT_SECONDS so the
@@ -562,7 +588,7 @@ async def _execute_campaign_with_timeout(db, task, run) -> None:
     timeout = _campaign_timeout_seconds()
     try:
         await asyncio.wait_for(
-            run_campaign_orchestration(db, task, run),
+            run_campaign_orchestration(db, task, run, resume=resume),
             timeout=timeout,
         )
     except asyncio.TimeoutError as e:
@@ -582,8 +608,22 @@ def _serialize_prompt_context(prompt_context) -> str:
     return json.dumps(prompt_context.as_dict(), ensure_ascii=False)
 
 
-def _task_response(task) -> dict:
+def _task_response(task, db=None) -> dict:
     """Serialize task model into API response shape."""
+    resume_available = False
+    if task.execution_type == "orchestrate_seo_campaign" and task.last_run_id:
+        owns_db = db is None
+        if owns_db:
+            db = SessionLocal()
+        try:
+            state = db.query(OrchestrationStateModel).filter(
+                OrchestrationStateModel.orchestrator_run_id == task.last_run_id
+            ).first()
+            resume_available = bool(state and state.status == "awaiting_approval")
+        finally:
+            if owns_db:
+                db.close()
+
     return {
         "id": task.id,
         "title": task.title,
@@ -603,6 +643,7 @@ def _task_response(task) -> dict:
         "active_run_id": task.active_run_id,
         "created_at": task.created_at,
         "updated_at": task.updated_at,
+        "resume_available": resume_available,
     }
 
 
@@ -1053,6 +1094,7 @@ async def _api_token_check(request: Request, call_next):
 @app.on_event("startup")
 async def startup_comment_autopilot():
     """Start comment autopilot loop when enabled."""
+    _ensure_orchestration_handoff_column()
     if not _autopilot_enabled():
         return
     if app.state.comment_autopilot_task is None or app.state.comment_autopilot_task.done():
@@ -2242,7 +2284,7 @@ def _resolve_prompt_context(db, run, task, comments, workflow_prompt, profile):
 
 @app.post("/tasks/{task_id}/execute", response_model=RunResponse)
 @limiter.limit(lambda: _rate_limit_value())
-async def execute_task(request: Request, task_id: int):
+async def execute_task(request: Request, task_id: int, resume: bool = False):
     """Execute a task via SEOAgent and return the run record."""
     db = get_db_session()
     try:
@@ -2250,14 +2292,59 @@ async def execute_task(request: Request, task_id: int):
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
 
-        run = _create_run(db, task, "manual_execute", task.execution_type or "manual")
-        task.status = "in_progress"
-        task.updated_at = datetime.utcnow().isoformat()
-        db.commit()
-        add_task_started_comment(db, task_id, task.title)
-
         # ── Orchestration branch ──────────────────────────────────────────────
         if task.execution_type == "orchestrate_seo_campaign":
+            if resume:
+                # Resume a campaign paused at the approval gate: reuse the
+                # existing orchestrator run and its saved orchestration state.
+                run = (
+                    db.query(AgentRunModel)
+                    .filter(
+                        AgentRunModel.task_id == task.id,
+                        AgentRunModel.execution_type == "orchestrate_seo_campaign",
+                    )
+                    .order_by(AgentRunModel.id.desc())
+                    .first()
+                )
+                if run is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="No existing campaign run to resume.",
+                    )
+                state = db.query(OrchestrationStateModel).filter(
+                    OrchestrationStateModel.orchestrator_run_id == run.run_id
+                ).first()
+                if state is None or state.status != "awaiting_approval":
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Campaign is not paused awaiting approval.",
+                    )
+                if not task.approved_at:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Task not approved yet — set approved_at first.",
+                    )
+                task.status = "in_progress"
+                task.updated_at = datetime.utcnow().isoformat()
+                db.commit()
+                add_task_comment(
+                    db, task_id, "🤖 Campaign resuming after approval", "agent"
+                )
+                try:
+                    await _execute_campaign_with_timeout(db, task, run, resume=True)
+                except Exception as e:
+                    _finalize_run_failure(db, run, task, str(e))
+                    _refresh_context_view(db, task_id=task.id)
+                    add_task_failed_comment(db, task_id, str(e))
+                db.refresh(run)
+                return _run_response(run)
+
+            run = _create_run(db, task, "manual_execute", task.execution_type or "manual")
+            task.status = "in_progress"
+            task.updated_at = datetime.utcnow().isoformat()
+            db.commit()
+            add_task_started_comment(db, task_id, task.title)
+
             try:
                 await _execute_campaign_with_timeout(db, task, run)
             except Exception as e:
@@ -2267,6 +2354,12 @@ async def execute_task(request: Request, task_id: int):
             db.refresh(run)
             return _run_response(run)
         # ── End orchestration branch ──────────────────────────────────────────
+
+        run = _create_run(db, task, "manual_execute", task.execution_type or "manual")
+        task.status = "in_progress"
+        task.updated_at = datetime.utcnow().isoformat()
+        db.commit()
+        add_task_started_comment(db, task_id, task.title)
 
         try:
             task_comments = db.query(CommentModel).filter(CommentModel.task_id == task_id).order_by(CommentModel.created_at).all()
@@ -3079,7 +3172,7 @@ function createTaskCard(task) {
     const commentBadge = task.comment_count > 0 ? '<span class="comment-chip">💬 ' + task.comment_count + '</span>' : '';
     const canExecute = task.execution_type && task.execution_type !== 'manual' && task.status !== 'completed' && task.status !== 'in_progress';
     
-    card.innerHTML = '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:6px;"><div class="card-title" style="margin:0;flex:1;">' + escapeHtml(task.title) + '</div><span class="pill ' + prioClass + '" style="flex-shrink:0;margin-top:1px;">' + prioLabel + '</span></div><div class="card-meta-row"><div class="exec-label"><span>' + (execLabel || '—') + '</span></div><div class="card-meta-right">' + commentBadge + (task.due_date ? '<span class="card-date">' + formatDate(task.due_date) + '</span>' : '') + (task.assignee ? '<span class="card-date">' + escapeHtml(task.assignee) + '</span>' : '') + '</div></div><div class="card-actions">' + (canExecute ? '<button onclick="event.stopPropagation();executeTask(' + task.id + ')" class="btn btn-sm" style="background:#4f46e5;color:#fff;">▶ Execute</button>' : '') + '<button onclick="event.stopPropagation();openDetailModal(' + task.id + ')" class="btn btn-sm btn-ghost" style="margin-left:auto;">Open →</button></div>';
+    card.innerHTML = '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:6px;"><div class="card-title" style="margin:0;flex:1;">' + escapeHtml(task.title) + '</div><span class="pill ' + prioClass + '" style="flex-shrink:0;margin-top:1px;">' + prioLabel + '</span></div><div class="card-meta-row"><div class="exec-label"><span>' + (execLabel || '—') + '</span></div><div class="card-meta-right">' + commentBadge + (task.due_date ? '<span class="card-date">' + formatDate(task.due_date) + '</span>' : '') + (task.assignee ? '<span class="card-date">' + escapeHtml(task.assignee) + '</span>' : '') + '</div></div><div class="card-actions">' + (task.resume_available ? '<button onclick="event.stopPropagation();resumeTask(' + task.id + ')" class="btn btn-sm" style="background:#059669;color:#fff;">↻ Resume</button>' : '') + (canExecute ? '<button onclick="event.stopPropagation();executeTask(' + task.id + ')" class="btn btn-sm" style="background:#4f46e5;color:#fff;">▶ Execute</button>' : '') + '<button onclick="event.stopPropagation();openDetailModal(' + task.id + ')" class="btn btn-sm btn-ghost" style="margin-left:auto;">Open →</button></div>';
     card.addEventListener('click', () => openDetailModal(task.id));
     return card;
 }
@@ -3119,6 +3212,7 @@ async function openDetailModal(taskId) {
     const actionsDiv = document.getElementById('detail-actions');
     actionsDiv.innerHTML = '';
     const canExecute = task.execution_type && task.execution_type !== 'manual' && task.status !== 'completed' && task.status !== 'in_progress';
+    if (task.resume_available) { const rb = document.createElement('button'); rb.className = 'btn'; rb.style.background = '#059669'; rb.style.color = '#fff'; rb.textContent = '↻ Resume campaign'; rb.onclick = () => resumeTask(task.id); actionsDiv.appendChild(rb); }
     if (canExecute) { const b = document.createElement('button'); b.className = 'btn'; b.style.background = '#4f46e5'; b.style.color = '#fff'; b.textContent = '▶ Execute task'; b.onclick = () => executeTask(task.id); actionsDiv.appendChild(b); }
     if (task.status !== 'completed') { const b = document.createElement('button'); b.className = 'btn btn-success'; b.textContent = '✓ Mark Complete'; b.onclick = () => completeTaskFromDetail(task.id); actionsDiv.appendChild(b); }
     switchTab('details');
@@ -3206,6 +3300,21 @@ async function executeTask(id) {
         const d = await r.json();
         if (!r.ok) throw new Error(d.detail || r.statusText);
         showToast('Task executed', 'success');
+        fetchTasks();
+    } catch(e) { showToast('Error: ' + e.message, 'error'); fetchTasks(); }
+}
+
+async function resumeTask(id) {
+    if (!confirm('Resume this campaign after approval?')) return;
+    showToast('Resuming campaign…');
+    currentTasks = currentTasks.map(t => t.id === id ? {...t, status:'in_progress', resume_available:false} : t);
+    renderTasks(currentTasks);
+    if (detailTaskId === id) closeDetailModal();
+    try {
+        const r = await fetch(API_BASE + '/tasks/' + id + '/execute?resume=true', { method: 'POST' });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.detail || r.statusText);
+        showToast('Campaign resumed', 'success');
         fetchTasks();
     } catch(e) { showToast('Error: ' + e.message, 'error'); fetchTasks(); }
 }

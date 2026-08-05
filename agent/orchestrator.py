@@ -265,79 +265,147 @@ def _build_child_prompt_with_prior_outputs(
 async def _dispatch_phase(
     db,
     phase_spec: dict,
-    child_task,
+    child_task_id: int,
     orchestrator_run_id: str,
     phase_outputs: dict[str, str],
     campaign_goal: str,
     helpers: dict,
-) -> tuple[str, str]:
+    phase_has_dependents: bool,
+) -> tuple[str, str, bool]:
     """
-    Run a single child agent phase and return (phase_name, result_text).
+    Run a single child agent phase and return (phase_name, result_text, degraded).
+
+    ``degraded`` is True when the phase had downstream dependents but its final
+    output still lacked a ``## Summary for Next Phase`` block after one
+    correction retry, so the next agent will receive a truncated handoff.
 
     Raises on failure so the caller can apply fail-fast logic.
+
+    Session isolation: each phase gets its own DB session so concurrent tier
+    phases never share/interleave a SQLAlchemy session (the PostToolUse hook
+    and run/task writes all go through the phase-local session).
     """
+    from agent.api.main import SessionLocal, TaskModel
     from agent.runtime_profiles import get_execution_profile
 
     phase_name = phase_spec["phase"]
     child_exec_type = phase_spec.get("execution_type", phase_name)
     child_profile = get_execution_profile(child_exec_type)
 
-    base_child_prompt = helpers["build_execution_prompt"](child_task, comments=[])
-    child_prompt = _build_child_prompt_with_prior_outputs(
-        base_child_prompt, phase_name, phase_outputs, campaign_goal
-    )
+    phase_db = SessionLocal()
+    try:
+        child_task = phase_db.query(TaskModel).filter(TaskModel.id == child_task_id).first()
+        if child_task is None:
+            raise RuntimeError(f"Child task {child_task_id} not found for phase [{phase_name}]")
 
-    child_run = _create_child_run(db, child_task, orchestrator_run_id, child_exec_type)
-
-    child_prompt_context = helpers["_resolve_prompt_context"](
-        db, child_run, child_task, [], child_prompt, child_profile
-    )
-    child_run.prompt_text = child_prompt
-    helpers["_mark_run_started"](db, child_run, child_prompt_context, child_profile.execution_type, None)
-    child_config = helpers["_build_runtime_config"](child_profile, None)
-
-    child_execution = helpers["_normalize_execution_result"](
-        await _run_with_retry(
-            helpers["_run_agent_prompt"],
-            child_prompt,
-            child_config,
-            child_prompt_context,
-            max_retries=2,
-            base_delay=1.0,
-            max_total_seconds=child_profile.timeout_seconds,
+        base_child_prompt = helpers["build_execution_prompt"](child_task, comments=[])
+        child_prompt = _build_child_prompt_with_prior_outputs(
+            base_child_prompt, phase_name, phase_outputs, campaign_goal
         )
-    )
-    child_validation = child_profile.validator(child_execution.result_text or "")
-    if child_validation.status == "failed":
-        raise RuntimeError(
-            f"Phase [{phase_name}] output failed validation: {child_validation.message}"
+
+        child_run = _create_child_run(
+            phase_db, child_task, orchestrator_run_id, child_exec_type
         )
-    helpers["_finalize_run_success"](
-        db, child_run, child_task,
-        child_execution.result_text or "",
-        child_execution.session_id,
-        child_validation,
-    )
-    helpers["_refresh_context_view"](db, task_id=child_task.id)
-    return phase_name, child_execution.result_text or ""
+
+        child_prompt_context = helpers["_resolve_prompt_context"](
+            phase_db, child_run, child_task, [], child_prompt, child_profile
+        )
+        child_run.prompt_text = child_prompt
+        helpers["_mark_run_started"](
+            phase_db, child_run, child_prompt_context, child_profile.execution_type, None
+        )
+        child_config = helpers["_build_runtime_config"](
+            child_profile, None, db=phase_db, run_id=child_run.run_id
+        )
+
+        child_execution = helpers["_normalize_execution_result"](
+            await _run_with_retry(
+                helpers["_run_agent_prompt"],
+                child_prompt,
+                child_config,
+                child_prompt_context,
+                max_retries=2,
+                base_delay=1.0,
+                max_total_seconds=child_profile.timeout_seconds,
+            )
+        )
+        result_text = child_execution.result_text or ""
+        session_id = child_execution.session_id
+
+        # Handoff protocol (#4): phases with dependents must end with a
+        # '## Summary for Next Phase' block. If missing, run ONE correction
+        # retry asking only for the block — no extra cost for final phases.
+        if phase_has_dependents and _extract_summary_block(result_text) is None:
+            retry_prompt = (
+                f"{child_prompt}\n\nIMPORTANT: Your previous output did not include "
+                "a structured handoff for the next phase. Keep everything you "
+                "produced, but append this block at the very end of your final "
+                "output:\n\n"
+                "## Summary for Next Phase\n"
+                "<concise handoff notes for the next agent>\n"
+                "## End Summary"
+            )
+            retry_execution = helpers["_normalize_execution_result"](
+                await _run_with_retry(
+                    helpers["_run_agent_prompt"],
+                    retry_prompt,
+                    child_config,
+                    child_prompt_context,
+                    max_retries=1,
+                    base_delay=1.0,
+                    max_total_seconds=child_profile.timeout_seconds,
+                )
+            )
+            if retry_execution.result_text:
+                result_text = retry_execution.result_text
+                session_id = retry_execution.session_id or session_id
+
+        child_validation = child_profile.validator(result_text)
+        if child_validation.status == "failed":
+            raise RuntimeError(
+                f"Phase [{phase_name}] output failed validation: {child_validation.message}"
+            )
+        helpers["_finalize_run_success"](
+            phase_db, child_run, child_task,
+            result_text,
+            session_id,
+            child_validation,
+        )
+        helpers["_refresh_context_view"](phase_db, task_id=child_task.id)
+
+        degraded = phase_has_dependents and _extract_summary_block(result_text) is None
+        return phase_name, result_text, degraded
+    finally:
+        phase_db.close()
 
 
-async def run_campaign_orchestration(db, parent_task, orchestrator_run) -> None:
+async def run_campaign_orchestration(
+    db, parent_task, orchestrator_run, resume: bool = False
+) -> None:
     """
     Drive a full multi-agent SEO campaign from a single orchestrator run.
 
-    Flow:
+    Flow (fresh run):
     1. Run the orchestrator agent to produce a JSON plan.
-    2. Parse the plan and resolve execution tiers (DAG-based).
+    2. Parse the plan, validate every phase's execution_type, and resolve
+       execution tiers (DAG-based).
     3. Create child TaskModel rows (one per phase).
     4. Dispatch each tier: phases within a tier run concurrently via asyncio.gather.
        Fail-fast: if any phase in a tier fails, remaining tiers are skipped.
     5. Finalize the orchestrator run.
 
+    Resume flow (``resume=True``):
+    - Requires an OrchestrationStateModel with status='awaiting_approval' for
+      this run and ``parent_task.approved_at`` set.
+    - Skips plan creation; reloads the saved plan, phase outputs and child runs;
+      continues from the first tier with pending phases on the SAME orchestrator
+      run (no re-billing the orchestrator).
+
     Args:
         db: SQLAlchemy session (caller owns lifecycle).
         parent_task: TaskModel for the orchestrate_seo_campaign task.
         orchestrator_run: AgentRunModel created by execute_task for this run.
+        resume: Whether this call is resuming a paused campaign.
     """
     # Import here to avoid circular imports (main imports orchestrator, orchestrator
     # needs models and helpers from main).
@@ -377,90 +445,168 @@ async def run_campaign_orchestration(db, parent_task, orchestrator_run) -> None:
 
     campaign_goal = parent_task.description or parent_task.title
 
-    # ── Phase 1: orchestrator produces plan ───────────────────────────────────
-    orch_profile = get_execution_profile("orchestrate_seo_campaign")
-    orch_config = _build_runtime_config(orch_profile, None)
-
-    orch_prompt_context = _resolve_prompt_context(
-        db, orchestrator_run, parent_task, [], "", orch_profile
-    )
-    orchestrator_run.prompt_text = build_execution_prompt(parent_task, comments=[])
-    _mark_run_started(db, orchestrator_run, orch_prompt_context, orch_profile.execution_type, None)
-
-    raw_execution = _normalize_execution_result(
-        await _run_with_retry(
-            _run_agent_prompt,
-            orchestrator_run.prompt_text,
-            orch_config,
-            orch_prompt_context,
-            max_retries=2,
-            base_delay=1.0,
-            max_total_seconds=orch_profile.timeout_seconds,
+    # ── Resume path: reuse the saved plan/state from the paused run ───────────
+    if resume:
+        state = db.query(OrchestrationStateModel).filter(
+            OrchestrationStateModel.orchestrator_run_id == orchestrator_run.run_id
+        ).first()
+        if state is None or state.status != "awaiting_approval":
+            raise RuntimeError(
+                "Cannot resume: no campaign paused awaiting approval for this run."
+            )
+        if not parent_task.approved_at:
+            raise RuntimeError("Cannot resume: task has not been approved yet.")
+        try:
+            phases = _parse_orchestration_plan(state.plan_json or "")
+            tiers = _resolve_execution_tiers(phases)
+            phase_outputs = json.loads(state.phase_outputs_json or "{}")
+            child_run_ids = json.loads(state.child_run_ids_json or "[]")
+        except (ValueError, json.JSONDecodeError) as e:
+            _finalize_run_failure(
+                db, orchestrator_run, parent_task, f"Resume failed: {e}"
+            )
+            add_task_failed_comment(db, parent_task.id, f"Resume failed: {e}")
+            return
+        plan_text = state.plan_json or ""
+        add_task_comment(
+            db, parent_task.id, "Campaign resuming after approval.", "agent"
         )
-    )
-    plan_text = raw_execution.result_text or ""
+        state.status = "running"
+        state.updated_at = datetime.utcnow().isoformat()
+        db.commit()
 
-    try:
-        phases = _parse_orchestration_plan(plan_text)
-        tiers = _resolve_execution_tiers(phases)
-    except ValueError as e:
-        _finalize_run_failure(db, orchestrator_run, parent_task, str(e))
-        add_task_failed_comment(db, parent_task.id, str(e))
-        return
+        # Reload existing child tasks (matched by the deterministic title scheme
+        # used in _create_child_task) and drop tiers that are fully completed.
+        existing_children = db.query(TaskModel).filter(
+            TaskModel.parent_task_id == parent_task.id
+        ).all()
+        by_title = {c.title: c for c in existing_children}
+        child_tasks: dict[str, TaskModel] = {}
+        for phase_spec in phases:
+            title = phase_spec.get("task_title", f"Campaign: {phase_spec['phase']}")
+            child_task = by_title.get(title)
+            if child_task is None:
+                raise RuntimeError(
+                    f"Cannot resume: child task for phase [{phase_spec['phase']}] is missing."
+                )
+            child_tasks[phase_spec["phase"]] = child_task
 
-    # ── Phase 2: persist orchestration state ──────────────────────────────────
-    now = datetime.utcnow().isoformat()
-    state = OrchestrationStateModel(
-        orchestrator_run_id=orchestrator_run.run_id,
-        campaign_goal=campaign_goal,
-        plan_json=plan_text,
-        current_phase=phases[0]["phase"] if phases else None,
-        phase_outputs_json=json.dumps({}),
-        child_run_ids_json=json.dumps([]),
-        status="running",
-        created_at=now,
-        updated_at=now,
-    )
-    db.add(state)
-    db.commit()
-    db.refresh(state)
+        completed = set(phase_outputs)
+        tiers = [
+            tier
+            for tier in tiers
+            if any(p["phase"] not in completed for p in tier)
+        ]
+        if not tiers:
+            summary = "Campaign already completed."
+            _finalize_run_success(
+                db, orchestrator_run, parent_task, summary, None,
+                ValidationResult(status="passed"),
+            )
+            add_task_completed_comment(db, parent_task.id, summary)
+            return
 
-    # ── Phase 3: create child tasks ───────────────────────────────────────────
-    child_tasks: dict[str, TaskModel] = {}
-    for phase_spec in phases:
-        child_task = _create_child_task(db, parent_task, phase_spec)
-        child_tasks[phase_spec["phase"]] = child_task
+    # ── Fresh run: orchestrator produces plan ────────────────────────────────
+    else:
+        orch_profile = get_execution_profile("orchestrate_seo_campaign")
+        orch_config = _build_runtime_config(orch_profile, None)
 
-    tier_summary = " → ".join(
-        "[" + ", ".join(p["phase"] for p in tier) + "]" for tier in tiers
-    )
-    add_task_comment(
-        db,
-        parent_task.id,
-        f"Campaign plan created. Execution order: {tier_summary}",
-        "agent",
-    )
+        orch_prompt_context = _resolve_prompt_context(
+            db, orchestrator_run, parent_task, [], "", orch_profile
+        )
+        orchestrator_run.prompt_text = build_execution_prompt(parent_task, comments=[])
+        _mark_run_started(
+            db, orchestrator_run, orch_prompt_context, orch_profile.execution_type, None
+        )
 
-    # ── Phase 4: tier-by-tier dispatch (parallel within tier) ─────────────────
-    phase_outputs: dict[str, str] = {}
-    child_run_ids: list[str] = []
+        raw_execution = _normalize_execution_result(
+            await _run_with_retry(
+                _run_agent_prompt,
+                orchestrator_run.prompt_text,
+                orch_config,
+                orch_prompt_context,
+                max_retries=2,
+                base_delay=1.0,
+                max_total_seconds=orch_profile.timeout_seconds,
+            )
+        )
+        plan_text = raw_execution.result_text or ""
 
+        try:
+            phases = _parse_orchestration_plan(plan_text)
+            # Fail fast: every phase execution_type must resolve before any
+            # child task is created or any tier is dispatched.
+            for phase_spec in phases:
+                get_execution_profile(
+                    phase_spec.get("execution_type", phase_spec["phase"])
+                )
+            tiers = _resolve_execution_tiers(phases)
+        except ValueError as e:
+            _finalize_run_failure(db, orchestrator_run, parent_task, str(e))
+            add_task_failed_comment(db, parent_task.id, str(e))
+            return
+
+        # ── Persist orchestration state ──────────────────────────────────────
+        now = datetime.utcnow().isoformat()
+        state = OrchestrationStateModel(
+            orchestrator_run_id=orchestrator_run.run_id,
+            campaign_goal=campaign_goal,
+            plan_json=plan_text,
+            current_phase=phases[0]["phase"] if phases else None,
+            phase_outputs_json=json.dumps({}),
+            child_run_ids_json=json.dumps([]),
+            status="running",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(state)
+        db.commit()
+        db.refresh(state)
+
+        # ── Create child tasks ───────────────────────────────────────────────
+        child_tasks = {}
+        for phase_spec in phases:
+            child_task = _create_child_task(db, parent_task, phase_spec)
+            child_tasks[phase_spec["phase"]] = child_task
+
+        tier_summary = " → ".join(
+            "[" + ", ".join(p["phase"] for p in tier) + "]" for tier in tiers
+        )
+        add_task_comment(
+            db,
+            parent_task.id,
+            f"Campaign plan created. Execution order: {tier_summary}",
+            "agent",
+        )
+        phase_outputs: dict[str, str] = {}
+        child_run_ids: list[str] = []
+
+    # Phases that some other phase depends on need a structured handoff block.
+    dependents = {dep for p in phases for dep in p.get("depends_on", [])}
+
+    # ── Tier-by-tier dispatch (parallel within tier) ─────────────────────────
     for tier in tiers:
-        tier_names = [p["phase"] for p in tier]
-        state.current_phase = tier_names[0] if len(tier_names) == 1 else f"parallel:{','.join(tier_names)}"
+        pending_in_tier = [p for p in tier if p["phase"] not in phase_outputs]
+        if not pending_in_tier:
+            continue
+        tier_names = [p["phase"] for p in pending_in_tier]
+        state.current_phase = (
+            tier_names[0] if len(tier_names) == 1 else f"parallel:{','.join(tier_names)}"
+        )
         state.updated_at = datetime.utcnow().isoformat()
         db.commit()
 
         add_task_comment(
             db,
             parent_task.id,
-            f"Starting {'phases' if len(tier) > 1 else 'phase'}: {', '.join(tier_names)}",
+            f"Starting {'phases' if len(pending_in_tier) > 1 else 'phase'}: "
+            f"{', '.join(tier_names)}",
             "agent",
         )
 
         # Approval gate: if any phase in this tier requires approval and the
         # parent task has not been approved, pause the campaign.
-        for phase_spec in tier:
+        for phase_spec in pending_in_tier:
             child_exec_type = phase_spec.get("execution_type", phase_spec["phase"])
             child_profile = get_execution_profile(child_exec_type)
             if child_profile.requires_approval and not parent_task.approved_at:
@@ -472,25 +618,26 @@ async def run_campaign_orchestration(db, parent_task, orchestrator_run) -> None:
                     db,
                     parent_task.id,
                     f"Campaign paused before phase [{phase_spec['phase']}] — human approval required. "
-                    "Set approved_at on this task to resume.",
+                    "Set approved_at on this task, then POST /tasks/{id}/execute?resume=true to continue.",
                     "agent",
                 )
                 return
 
         # Mark all phases in this tier as in_progress
-        for phase_spec in tier:
+        for phase_spec in pending_in_tier:
             child_task = child_tasks[phase_spec["phase"]]
             child_task.status = "in_progress"
             child_task.updated_at = datetime.utcnow().isoformat()
         db.commit()
 
-        # Dispatch all phases in this tier concurrently
+        # Dispatch all phases in this tier concurrently (each with its own session)
         tasks_coros = [
             _dispatch_phase(
-                db, phase_spec, child_tasks[phase_spec["phase"]],
+                db, phase_spec, child_tasks[phase_spec["phase"]].id,
                 orchestrator_run.run_id, phase_outputs, campaign_goal, helpers,
+                phase_spec["phase"] in dependents,
             )
-            for phase_spec in tier
+            for phase_spec in pending_in_tier
         ]
 
         tier_results = await asyncio.gather(*tasks_coros, return_exceptions=True)
@@ -498,7 +645,7 @@ async def run_campaign_orchestration(db, parent_task, orchestrator_run) -> None:
         # Check for failures (fail-fast)
         failed_phase = None
         failed_error = None
-        for phase_spec, result in zip(tier, tier_results):
+        for phase_spec, result in zip(pending_in_tier, tier_results):
             if isinstance(result, BaseException):
                 failed_phase = phase_spec["phase"]
                 failed_error = result
@@ -513,10 +660,27 @@ async def run_campaign_orchestration(db, parent_task, orchestrator_run) -> None:
                 _refresh_context_view(db, task_id=child_task.id)
                 add_task_failed_comment(db, child_task.id, str(failed_error))
             else:
-                phase_name, result_text = result
+                phase_name, result_text, degraded = result
                 phase_outputs[phase_name] = result_text
-                child_run_ids.append(_get_latest_run_id_for_task(db, AgentRunModel, child_tasks[phase_name].id))
-                add_task_comment(db, parent_task.id, f"Phase [{phase_name}] complete.", "agent")
+                child_run_ids.append(
+                    _get_latest_run_id_for_task(
+                        db, AgentRunModel, child_tasks[phase_name].id
+                    )
+                )
+                add_task_comment(
+                    db, parent_task.id, f"Phase [{phase_name}] complete.", "agent"
+                )
+                if degraded:
+                    degraded_map = json.loads(state.handoff_degraded_json or "{}")
+                    degraded_map[phase_name] = True
+                    state.handoff_degraded_json = json.dumps(degraded_map)
+                    add_task_comment(
+                        db,
+                        parent_task.id,
+                        f"Phase [{phase_name}] produced no summary block — "
+                        "the next agent will receive a truncated handoff.",
+                        "agent",
+                    )
 
         state.phase_outputs_json = json.dumps(phase_outputs)
         state.child_run_ids_json = json.dumps(child_run_ids)
@@ -539,7 +703,7 @@ async def run_campaign_orchestration(db, parent_task, orchestrator_run) -> None:
             )
             return
 
-    # ── Phase 5: finalize campaign ────────────────────────────────────────────
+    # ── Finalize campaign ─────────────────────────────────────────────────────
     state.status = "completed"
     state.current_phase = None
     state.updated_at = datetime.utcnow().isoformat()
@@ -554,7 +718,7 @@ async def run_campaign_orchestration(db, parent_task, orchestrator_run) -> None:
     _finalize_run_success(
         db, orchestrator_run, parent_task,
         summary,
-        raw_execution.session_id,
+        raw_execution.session_id if not resume else None,
         ValidationResult(status="passed"),
     )
     add_task_completed_comment(db, parent_task.id, summary)
