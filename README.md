@@ -9,7 +9,7 @@
 - **SEO is measurable but rarely measured.** The agent closes the loop: every CMS change is logged, its ranking impact reviewed against Search Console, and the winning patterns fed back into the next task.
 - **Content work doesn't scale manually.** A researcher → writer → publisher → analyst campaign pipeline turns one campaign request into a coordinated set of specialized tasks that run automatically.
 - **Guardrails protect the business.** Cost ceilings per task, tool permissions per task type, output validators, rate limits, and a human approval step before publishing — automation without losing control.
-- **Decisions come from data, not guesses.** Measured keyword volumes, SERP positions, and backlink data are injected into the agent's context so recommendations are grounded in real numbers.
+- **Decisions come from data, not guesses.** Measured keyword volumes, SERP positions, backlink data, and AI-search visibility (via DataForSEO) are injected into the agent's context so recommendations are grounded in real numbers.
 
 ## What it delivers
 
@@ -47,6 +47,7 @@ A four-layer memory system feeds every prompt:
 - **Webflow CMS** — create, update, and publish CMS items directly via the agent
 - **Google Docs** — save audit reports and blog drafts to Google Docs (read/write only — no delete)
 - **Google Search Console** — query live clicks, impressions, CTR, and position; inspect URL indexing status; list sitemaps (read-only)
+- **Measured ranking data (DataForSEO)** — SERP positions, keyword volumes, backlinks, and AI-search visibility come from measured API responses, not estimates, and are injected into the agent's context for research and impact reviews
 - **SEO Feedback Loop** — log CMS changes, review ranking impact using GSC data, extract learnings, propagate winning patterns
 
 ## Requirements
@@ -125,6 +126,16 @@ asyncio.run(main())
 - **Spend is bounded** — every execution profile has a max budget and turn limit, API rate limits cap cost-triggering endpoints, and DataForSEO pulls track real billed cost per run.
 - **Nothing ships unverified** — outputs must pass a structured validator (grounded research requires cited URLs; CMS changes require a machine-readable change log) before a run is marked complete.
 - **Published changes are attributable** — the SEO Feedback Loop correlates CMS changes with GSC ranking data so you can see what actually worked.
+
+## Measured data, not guesses (DataForSEO)
+
+Keyword volumes, SERP positions, backlink counts, and AI-search visibility come from **measured DataForSEO API responses**, never from the agent guessing at numbers. A batch extraction pipeline pulls the data, rollups are compiled under `dataforseo/compiled/`, and the newest results per pipeline are injected into the agent's context as a "Measured Data" section for research, campaign-research, and impact-review tasks.
+
+- **What it powers** — keyword research grounded in real volume/CPC, SERP position tracking, competitor and backlink analysis, and AI-search (LLM mention) visibility; the SEO Feedback Loop reviews ranking impact against this measured data.
+- **How it runs** — one CLI script per data source under `scripts/pipelines/` (SERP, keyword volume, backlinks, AI visibility), plus `scripts/pipelines/refresh.py` for scheduled refreshes via cron/launchd (see the script's header for a ready-made schedule line).
+- **Cost is controlled and visible** — every pipeline prints the real billed cost of the run (from the API's `cost` field, not an estimate); task creation is rate-limited (`DATAFORSEO_TASKS_PER_MINUTE`) and batched (`DATAFORSEO_MAX_TASKS_PER_REQUEST`) to stay inside API quotas.
+
+Configuration: `DATAFORSEO_LOGIN` / `DATAFORSEO_PASSWORD` (API password from the DataForSEO dashboard) plus the rate-limit env vars in the Configuration table below. Full pipeline design and reliability notes live in `agent/dataforseo/RELIABILITY.md` and `agent/dataforseo/LOG_ORGANIZATION.md`.
 
 ## Configuration
 
