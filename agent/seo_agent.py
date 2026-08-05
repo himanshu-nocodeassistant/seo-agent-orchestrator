@@ -199,11 +199,6 @@ Use the Edit tool to update memory/seo-context.md before ending your response.
     
     def _create_sdk_options(self) -> ClaudeAgentOptions:
         """Create ClaudeAgentOptions from AgentConfig."""
-        if not self.config.cli_path:
-            raise FileNotFoundError(
-                "Claude CLI not found. Install Claude Code "
-                "(npm install -g @anthropic-ai/claude-code) or set CLAUDE_CLI_PATH."
-            )
         return ClaudeAgentOptions(
             cwd=self.config.cwd,
             cli_path=self.config.cli_path,
