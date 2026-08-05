@@ -24,16 +24,16 @@ class TestGoogleDocsConfig:
         config = GoogleDocsConfig.from_env()
         assert config is None
 
-    def test_google_docs_config_from_env(self, monkeypatch):
+    def test_google_docs_config_from_env(self, monkeypatch, fake_credentials_path):
         """Test GoogleDocsConfig creates from environment variable."""
-        monkeypatch.setenv("GOOGLE_DOCS_CREDENTIALS_PATH", "Google SA Credentials/tinyclaw-487419-d5ab318833bb.json")
+        monkeypatch.setenv("GOOGLE_DOCS_CREDENTIALS_PATH", str(fake_credentials_path))
         
         from agent.google_docs import GoogleDocsConfig
         
         config = GoogleDocsConfig.from_env()
         
         assert config is not None
-        assert "tinyclaw-487419-d5ab318833bb.json" in str(config.credentials_path)
+        assert "test-service-account.json" in str(config.credentials_path)
 
     def test_google_docs_config_validation_missing_file(self):
         """Test GoogleDocsConfig validates that credentials file exists."""
@@ -45,21 +45,20 @@ class TestGoogleDocsConfig:
                 credentials_path="nonexistent/credentials.json"
             )
 
-    def test_google_docs_config_with_valid_credentials(self, monkeypatch):
+    def test_google_docs_config_with_valid_credentials(self, monkeypatch, fake_credentials_path):
         """Test GoogleDocsConfig with valid credentials path."""
-        # Use the actual credentials file that exists
-        monkeypatch.setenv("GOOGLE_DOCS_CREDENTIALS_PATH", "Google SA Credentials/tinyclaw-487419-d5ab318833bb.json")
+        monkeypatch.setenv("GOOGLE_DOCS_CREDENTIALS_PATH", str(fake_credentials_path))
         
         from agent.google_docs import GoogleDocsConfig
         
         config = GoogleDocsConfig.from_env()
         
         assert config is not None
-        assert config.credentials_path.name == "tinyclaw-487419-d5ab318833bb.json"
+        assert config.credentials_path.name == "test-service-account.json"
 
-    def test_google_docs_config_masked_in_repr(self, monkeypatch):
+    def test_google_docs_config_masked_in_repr(self, monkeypatch, fake_credentials_path):
         """Test that sensitive data is masked in repr."""
-        monkeypatch.setenv("GOOGLE_DOCS_CREDENTIALS_PATH", "Google SA Credentials/tinyclaw-487419-d5ab318833bb.json")
+        monkeypatch.setenv("GOOGLE_DOCS_CREDENTIALS_PATH", str(fake_credentials_path))
         
         from agent.google_docs import GoogleDocsConfig
         
@@ -79,13 +78,13 @@ class TestGoogleDocsConfigImports:
         
         assert GoogleDocsConfig is not None
 
-    def test_google_docs_config_is_dataclass(self):
+    def test_google_docs_config_is_dataclass(self, fake_credentials_path):
         """Test GoogleDocsConfig is a dataclass."""
         from agent.google_docs import GoogleDocsConfig
         
         # Should have credentials_path attribute
         config = GoogleDocsConfig(
-            credentials_path=Path(__file__).parent.parent / "Google SA Credentials" / "tinyclaw-487419-d5ab318833bb.json"
+            credentials_path=fake_credentials_path
         )
         
         assert hasattr(config, 'credentials_path')

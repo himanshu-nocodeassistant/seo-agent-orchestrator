@@ -14,9 +14,9 @@ class TestGoogleDocsServer:
     """Test MCP server creation."""
 
     @pytest.fixture
-    def credentials_path(self):
+    def credentials_path(self, fake_credentials_path):
         """Return path to test credentials."""
-        return Path(__file__).parent.parent / "Google SA Credentials" / "tinyclaw-487419-d5ab318833bb.json"
+        return fake_credentials_path
 
     def test_server_module_exists(self):
         """Test server module can be imported."""
@@ -67,9 +67,9 @@ class TestGoogleDocsAgentIntegration:
         
         assert config.google_docs_config is None
 
-    def test_agent_config_from_env_with_google_docs(self, monkeypatch):
+    def test_agent_config_from_env_with_google_docs(self, monkeypatch, fake_credentials_path):
         """Test AgentConfig with Google Docs env vars."""
-        monkeypatch.setenv("GOOGLE_DOCS_CREDENTIALS_PATH", "Google SA Credentials/tinyclaw-487419-d5ab318833bb.json")
+        monkeypatch.setenv("GOOGLE_DOCS_CREDENTIALS_PATH", str(fake_credentials_path))
         
         from agent.config import AgentConfig
         
@@ -85,9 +85,9 @@ class TestGoogleDocsAgentIntegration:
         
         assert config.google_docs_config is None
 
-    def test_agent_config_mcp_servers_google_docs(self, monkeypatch):
+    def test_agent_config_mcp_servers_google_docs(self, monkeypatch, fake_credentials_path):
         """Test that Google Docs MCP server is added when configured."""
-        monkeypatch.setenv("GOOGLE_DOCS_CREDENTIALS_PATH", "Google SA Credentials/tinyclaw-487419-d5ab318833bb.json")
+        monkeypatch.setenv("GOOGLE_DOCS_CREDENTIALS_PATH", str(fake_credentials_path))
         
         from agent.config import AgentConfig
         
@@ -96,9 +96,9 @@ class TestGoogleDocsAgentIntegration:
         # MCP server should be set up
         assert "google_docs" in config.mcp_servers
 
-    def test_google_docs_tools_in_allowed_tools(self, monkeypatch):
+    def test_google_docs_tools_in_allowed_tools(self, monkeypatch, fake_credentials_path):
         """Test that Google Docs tools are added to allowed_tools."""
-        monkeypatch.setenv("GOOGLE_DOCS_CREDENTIALS_PATH", "Google SA Credentials/tinyclaw-487419-d5ab318833bb.json")
+        monkeypatch.setenv("GOOGLE_DOCS_CREDENTIALS_PATH", str(fake_credentials_path))
         
         from agent.config import AgentConfig
         
@@ -113,9 +113,9 @@ class TestGoogleDocsServerAsync:
     """Test async server creation."""
 
     @pytest.fixture
-    def credentials_path(self):
+    def credentials_path(self, fake_credentials_path):
         """Return path to test credentials."""
-        return Path(__file__).parent.parent / "Google SA Credentials" / "tinyclaw-487419-d5ab318833bb.json"
+        return fake_credentials_path
 
     @pytest.mark.asyncio
     async def test_create_server_async(self, credentials_path):

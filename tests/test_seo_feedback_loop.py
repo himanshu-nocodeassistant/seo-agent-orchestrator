@@ -579,9 +579,12 @@ class TestExecuteTaskLogging:
         entry = data["entries"][0]
         assert entry["extraction_status"] == "failed"
         assert entry["failure_reason"] == "missing_block"
-        # Task still completed (not blocked)
+        # Validators are authoritative: rewrite_title requires a CHANGE_LOG
+        # block, so the run is blocked while the failed extraction is logged.
         task_resp = client.get(f"/tasks/{task_id}")
-        assert task_resp.json()["status"] == "completed"
+        assert task_resp.json()["status"] == "blocked"
+        run = client.get(f"/runs/{exec_resp.json()['run_id']}")
+        assert run.json()["validator_status"] == "failed"
 
 
 # ---------------------------------------------------------------------------

@@ -36,8 +36,21 @@ Thumbs.db
 .env
 .env.local
 
+# Local runtime state (created on first server start)
+kanban.db
+kanban.db-*
+kanban.staging.db
+*.sqlite3
+
+# Secrets — never commit service-account keys
+google-sa-credentials/
+
 # Claude
 .claude/backups/
+
+# Generated agent views (regenerated from memory/seo-*.json on every run)
+.claude/seo-changes-log.md
+.claude/seo-learnings.md
 
 # DataForSEO pipeline output
 # raw/ and manifests/ are bulky, transient dumps of paid API calls — keep the

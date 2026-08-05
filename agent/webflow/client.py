@@ -7,6 +7,8 @@ the Webflow Data API v2.0 for CRUD operations on CMS items.
 
 import json
 import logging
+import asyncio
+import random
 from typing import Any, Optional
 
 import aiohttp
@@ -14,6 +16,10 @@ import aiohttp
 from .config import WebflowConfig
 
 logger = logging.getLogger(__name__)
+
+# Retryable transient statuses (rate limits + upstream hiccups).
+_RETRYABLE_STATUSES = {429, 502, 503, 504}
+_MAX_ATTEMPTS = 4
 
 
 class WebflowAPIError(Exception):
@@ -86,29 +92,62 @@ class WebflowAPIClient:
 
         logger.debug(f"Webflow API: {method} {url}")
 
-        try:
-            async with session.request(
-                method,
-                url,
-                json=data,
-                params=params,
-            ) as response:
-                response_data = await response.json() if response.content_type == "application/json" else {}
-
-                if not response.ok:
-                    error_msg = response_data.get("msg", f"HTTP {response.status}")
-                    raise WebflowAPIError(
-                        f"Webflow API error: {error_msg}",
-                        status=response.status,
-                        response=response_data,
+        for attempt in range(_MAX_ATTEMPTS):
+            try:
+                async with session.request(
+                    method,
+                    url,
+                    json=data,
+                    params=params,
+                ) as response:
+                    response_data = (
+                        await response.json()
+                        if response.content_type == "application/json"
+                        else {}
                     )
 
-                logger.debug(f"Webflow API response: {response_data}")
-                return response_data
+                    if response.status in _RETRYABLE_STATUSES and attempt < _MAX_ATTEMPTS - 1:
+                        await self._backoff(response, attempt)
+                        continue
 
-        except aiohttp.ClientError as e:
-            logger.error(f"Webflow API request failed: {e}")
-            raise WebflowAPIError(f"Request failed: {e}")
+                    if not response.ok:
+                        error_msg = response_data.get("msg", f"HTTP {response.status}")
+                        raise WebflowAPIError(
+                            f"Webflow API error: {error_msg}",
+                            status=response.status,
+                            response=response_data,
+                        )
+
+                    logger.debug(f"Webflow API response: {response_data}")
+                    return response_data
+
+            except aiohttp.ClientError as e:
+                if attempt < _MAX_ATTEMPTS - 1:
+                    logger.warning(
+                        "Webflow request failed (attempt %d/%d): %s — retrying",
+                        attempt + 1,
+                        _MAX_ATTEMPTS,
+                        e,
+                    )
+                    await asyncio.sleep(min(2 ** attempt, 30) * (0.5 + random.random() / 2))
+                    continue
+                logger.error(f"Webflow API request failed: {e}")
+                raise WebflowAPIError(f"Request failed: {e}")
+
+        raise WebflowAPIError("Webflow API request failed after retries")
+
+    @staticmethod
+    async def _backoff(response, attempt: int) -> None:
+        """Sleep honoring Retry-After when present, else jittered exponential."""
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                delay = float(retry_after)
+            except ValueError:
+                delay = min(2 ** attempt, 30)
+        else:
+            delay = min(2 ** attempt, 30) * (0.5 + random.random() / 2)
+        await asyncio.sleep(delay)
 
     # -------------------------------------------------------------------------
     # CMS Collection Item Operations

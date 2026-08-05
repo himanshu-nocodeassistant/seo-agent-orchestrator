@@ -17,11 +17,14 @@ from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+from sqlalchemy import create_engine, event, Column, Integer, String, Boolean, DateTime, Text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -47,7 +50,7 @@ EXECUTABLE_TYPES = {
     "research", "rewrite_title", "rewrite_meta_desc", "rewrite_h1",
     "update_schema", "blog_write", "rewrite_blog_content",
     "webflow_publish", "internal_links", "alt_text", "seo_impact_review",
-    "orchestrate_seo_campaign",
+    "orchestrate_seo_campaign", "seo_audit",
     # Scalability note (#6): child campaign types intentionally expose only the tools
     # their profile needs (campaign_researcher = BASE+GSC read-only; campaign_publisher =
     # BASE+WEBFLOW write). Never grant all tools to child agents — blast radius grows with
@@ -118,6 +121,21 @@ DATABASE_URL = resolve_database_url()
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
+
+@event.listens_for(engine, "connect")
+def _set_sqlite_pragmas(dbapi_connection, connection_record):
+    """Enable WAL + busy timeout for SQLite so long agent runs don't lock
+    the DB against concurrent API requests or campaign phases."""
+    if not DATABASE_URL.startswith("sqlite"):
+        return
+    try:
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=5000")
+        cursor.close()
+    except Exception:  # pragma: no cover - pragmas are best-effort
+        pass
 
 
 # ========================================================================= MODELS
@@ -346,6 +364,12 @@ class TaskMemoryResponse(BaseModel):
     run_id: Optional[str]
     execution_type: Optional[str]
     memory: dict
+
+
+class SeoAuditRequest(BaseModel):
+    """Body for POST /runs/{run_id}/seo-audit."""
+
+    days: int = 28
 
 
 # ============================================================================
@@ -979,18 +1003,51 @@ async def _comment_autopilot_loop():
 # FASTAPI APP
 # ============================================================================
 
+
+def _allowed_origins() -> list[str]:
+    """CORS origins from ALLOWED_ORIGINS (comma-separated), localhost default."""
+    raw = os.environ.get(
+        "ALLOWED_ORIGINS", "http://localhost:8000,http://127.0.0.1:8000"
+    )
+    return [o.strip() for o in raw.split(",") if o.strip()]
+
+
+def _rate_limit_value() -> str:
+    """Per-minute rate limit for cost-triggering endpoints."""
+    return os.environ.get("API_RATE_LIMIT_EXECUTE", "5/minute")
+
+
 app = FastAPI(title="SEO Bot Kanban API")
 app.state.comment_autopilot_lock = asyncio.Lock()
 app.state.comment_autopilot_task = None
 
-# Add CORS middleware
+# Rate limiting (slowapi) — applied only to endpoints that start paid runs.
+limiter = Limiter(key_func=get_remote_address, default_limits=[])
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# Add CORS middleware — explicit origins, never "*" + credentials.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allowed_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _api_token_check(request: Request, call_next):
+    """Optional bearer-token gate. Enabled only when API_TOKEN is set."""
+    token = os.environ.get("API_TOKEN")
+    if token:
+        expected = f"Bearer {token}"
+        if request.headers.get("Authorization") != expected:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Invalid or missing API token"},
+            )
+    return await call_next(request)
 
 
 @app.on_event("startup")
@@ -1920,6 +1977,41 @@ Step 4 — Save findings to task notes.
 No CMS changes needed for this task type."""
         return _append_user_notes(_prompt, comments)
 
+    elif etype == "seo_audit":
+        _prompt = base + """
+You are executing an SEO audit task. This is research-only — no CMS changes.
+
+WORKFLOW — execute every step in order:
+
+Step 1 — Fetch and inventory
+Use WebFetch on the site/page(s) referenced in the task to inspect:
+- Titles, meta descriptions, H1s, and heading structure
+- URL structure and internal linking
+- Schema/structured data present
+- Content quality signals and obvious gaps
+
+Step 2 — Technical checks
+Use WebSearch/WebFetch to verify indexing signals where possible:
+- Sitemap and robots.txt presence
+- Canonical tags and duplicate-content risk
+- Page-speed red flags visible from markup
+
+Step 3 — Keyword and competitive context
+Use WebSearch to identify which queries the page/site should target and how
+competitors cover them. Cite source URLs for any volume/position claims.
+
+Step 4 — Report findings
+Produce a structured audit report:
+- Critical issues (with evidence URLs)
+- Opportunities, each mapped to an execution_type
+  (rewrite_title, rewrite_meta_desc, update_schema, blog_write,
+  internal_links, alt_text, etc.)
+- Priorities ordered by impact
+- A copy-paste-ready list of suggested next tasks
+
+Every factual claim must cite a source URL. No CMS changes for this task type."""
+        return _append_user_notes(_prompt, comments)
+
     elif etype == "alt_text":
         _prompt = base + """
 You are executing an SEO task: write descriptive alt text for images on a page.
@@ -2149,7 +2241,8 @@ def _resolve_prompt_context(db, run, task, comments, workflow_prompt, profile):
 
 
 @app.post("/tasks/{task_id}/execute", response_model=RunResponse)
-async def execute_task(task_id: int):
+@limiter.limit(lambda: _rate_limit_value())
+async def execute_task(request: Request, task_id: int):
     """Execute a task via SEOAgent and return the run record."""
     db = get_db_session()
     try:
@@ -2365,7 +2458,8 @@ def create_comment(task_id: int, comment: CommentCreate):
 
 
 @app.post("/automation/comments/process-one")
-async def process_one_comment_action_endpoint():
+@limiter.limit(lambda: _rate_limit_value())
+async def process_one_comment_action_endpoint(request: Request):
     """Process one pending @agent trigger comment action."""
     return await process_one_comment_action()
 
@@ -2375,15 +2469,19 @@ async def process_one_comment_action_endpoint():
 # ============================================================================
 
 @app.post("/runs/{run_id}/seo-audit")
-async def run_seo_audit(run_id: str, days: int = 28, max_rows: int = 1000):
-    """Run SEO audit and create tasks."""
+async def run_seo_audit(run_id: str, payload: SeoAuditRequest = SeoAuditRequest()):
+    """Run an SEO audit through the standard profile pipeline.
+
+    Creates a task + run of type ``seo_audit`` and executes it with the same
+    profile machinery as every other task (timeouts, validator, audit log).
+    No Bash tool, no agent-driven localhost task creation.
+    """
     db = get_db_session()
     try:
-        # Create SEO audit task
         now = datetime.utcnow().isoformat()
         task = TaskModel(
             title=f"SEO Audit - {run_id}",
-            description=f"Run comprehensive SEO audit for the last {days} days",
+            description=f"Run comprehensive SEO audit for the last {payload.days} days",
             status="in_progress",
             priority=0,
             execution_type="seo_audit",
@@ -2392,59 +2490,37 @@ async def run_seo_audit(run_id: str, days: int = 28, max_rows: int = 1000):
         )
         db.add(task)
         db.commit()
-        
-        # Execute SEO audit
+        run = _create_run(db, task, "seo_audit", "seo_audit")
+        task.status = "in_progress"
+        task.updated_at = datetime.utcnow().isoformat()
+        db.commit()
+        add_task_started_comment(db, task.id, task.title)
+
         try:
-            prompt = f"Run a comprehensive SEO audit analyzing data from the last {days} days. Focus on identifying issues and opportunities."
-            result = await _run_agent_prompt(prompt)
-
-            # Update task
-            task.status = "completed"
-            task.notes = result
-            task.updated_at = datetime.utcnow().isoformat()
-            db.commit()
-
-            # Auto-trigger task breakdown: parse audit findings into Kanban tasks
-            breakdown_prompt = f"""The SEO audit has just completed. Here are the findings:
-
-{result}
-
-Now use the Task Breakdown skill to break these findings into actionable tasks.
-
-After creating the task breakdown, create each task in the Kanban board by calling the local API:
-- POST http://localhost:8000/tasks
-- Body: {{"title": "...", "description": "...", "priority": <0=critical,1=high,2=medium,3=low>, "execution_type": "<see mapping below>"}}
-
-Map priorities as: 🔴 Critical → 0, 🟠 High → 1, 🟡 Medium → 2, 🟢 Low → 3
-
-Map execution_type based on the task category:
-- Title tag rewrites (meta title / SEO title) → "rewrite_title"
-- Meta description writes or rewrites → "rewrite_meta_desc"
-- H1 heading rewrites → "rewrite_h1"
-- Alt text for images → "alt_text"
-- Schema markup / JSON-LD structured data → "update_schema"
-- Writing new blog posts → "blog_write"
-- Editing or rewriting existing blog content → "rewrite_blog_content"
-- Publishing a CMS item to live → "webflow_publish"
-- Adding internal links between pages → "internal_links"
-- Keyword research or competitor research → "research"
-- Tasks requiring Webflow Designer access (custom code, static page templates, favicon, global settings) → "manual"
-- Scheduling a periodic review of SEO change outcomes (2-4 weeks after changes) → "seo_impact_review"
-
-            Use the Bash tool to make curl requests for each task. Create one Kanban card per actionable task (not subtasks — only parent tasks or standalone tasks).
-"""
-            try:
-                await _run_agent_prompt(breakdown_prompt)
-            except Exception as e:
-                print(f"Task breakdown failed: {e}")
-
+            workflow_prompt = build_execution_prompt(task, comments=[])
+            profile = get_execution_profile("seo_audit")
+            prompt_context = _resolve_prompt_context(
+                db, run, task, [], workflow_prompt, profile
+            )
+            run.prompt_text = workflow_prompt
+            _mark_run_started(db, run, prompt_context, profile.execution_type, None)
+            config = _build_runtime_config(profile, None, db=db, run_id=run.run_id)
+            execution = _normalize_execution_result(
+                await _run_agent_prompt(workflow_prompt, config, prompt_context)
+            )
+            validation = profile.validator(execution.result_text)
+            _finalize_run_success(
+                db, run, task, execution.result_text, execution.session_id, validation
+            )
+            _refresh_context_view(db, task_id=task.id)
+            add_task_completed_comment(db, task.id, execution.result_text)
         except Exception as e:
-            task.status = "blocked"
-            task.notes = f"Audit error: {str(e)}"
-            task.updated_at = datetime.utcnow().isoformat()
-            db.commit()
+            _finalize_run_failure(db, run, task, str(e))
+            _refresh_context_view(db, task_id=task.id)
+            add_task_failed_comment(db, task.id, str(e))
 
-        return {"message": "Audit complete", "tasks": [task.id]}
+        db.refresh(run)
+        return {"message": "Audit complete", "task_id": task.id, "run_id": run.run_id}
     finally:
         db.close()
 
@@ -3001,7 +3077,7 @@ function createTaskCard(task) {
     const prioLabel = PRIORITY_LABELS[task.priority] || 'P' + task.priority;
     const execLabel = task.execution_type ? (EXEC_LABELS[task.execution_type] || task.execution_type) : '';
     const commentBadge = task.comment_count > 0 ? '<span class="comment-chip">💬 ' + task.comment_count + '</span>' : '';
-    const canExecute = task.execution_type && task.execution_type !== 'manual' && task.execution_type !== 'seo_audit' && task.status !== 'completed' && task.status !== 'in_progress';
+    const canExecute = task.execution_type && task.execution_type !== 'manual' && task.status !== 'completed' && task.status !== 'in_progress';
     
     card.innerHTML = '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:6px;"><div class="card-title" style="margin:0;flex:1;">' + escapeHtml(task.title) + '</div><span class="pill ' + prioClass + '" style="flex-shrink:0;margin-top:1px;">' + prioLabel + '</span></div><div class="card-meta-row"><div class="exec-label"><span>' + (execLabel || '—') + '</span></div><div class="card-meta-right">' + commentBadge + (task.due_date ? '<span class="card-date">' + formatDate(task.due_date) + '</span>' : '') + (task.assignee ? '<span class="card-date">' + escapeHtml(task.assignee) + '</span>' : '') + '</div></div><div class="card-actions">' + (canExecute ? '<button onclick="event.stopPropagation();executeTask(' + task.id + ')" class="btn btn-sm" style="background:#4f46e5;color:#fff;">▶ Execute</button>' : '') + '<button onclick="event.stopPropagation();openDetailModal(' + task.id + ')" class="btn btn-sm btn-ghost" style="margin-left:auto;">Open →</button></div>';
     card.addEventListener('click', () => openDetailModal(task.id));
@@ -3014,7 +3090,7 @@ async function runAudit() {
     btn.disabled = true;
     label.textContent = 'Running…';
     try {
-        const r = await fetch(API_BASE + '/runs/audit-' + Date.now() + '/seo-audit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ days: 28, max_rows: 1000 }) });
+        const r = await fetch(API_BASE + '/runs/audit-' + Date.now() + '/seo-audit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ days: 28 }) });
         const d = await r.json();
         if (!r.ok) throw new Error(d.detail || r.statusText);
         showToast('Audit complete', 'success');
@@ -3042,7 +3118,7 @@ async function openDetailModal(taskId) {
     else { document.getElementById('detail-notes-section').style.display = 'none'; }
     const actionsDiv = document.getElementById('detail-actions');
     actionsDiv.innerHTML = '';
-    const canExecute = task.execution_type && task.execution_type !== 'manual' && task.execution_type !== 'seo_audit' && task.status !== 'completed' && task.status !== 'in_progress';
+    const canExecute = task.execution_type && task.execution_type !== 'manual' && task.status !== 'completed' && task.status !== 'in_progress';
     if (canExecute) { const b = document.createElement('button'); b.className = 'btn'; b.style.background = '#4f46e5'; b.style.color = '#fff'; b.textContent = '▶ Execute task'; b.onclick = () => executeTask(task.id); actionsDiv.appendChild(b); }
     if (task.status !== 'completed') { const b = document.createElement('button'); b.className = 'btn btn-success'; b.textContent = '✓ Mark Complete'; b.onclick = () => completeTaskFromDetail(task.id); actionsDiv.appendChild(b); }
     switchTab('details');

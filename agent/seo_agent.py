@@ -199,8 +199,14 @@ Use the Edit tool to update memory/seo-context.md before ending your response.
     
     def _create_sdk_options(self) -> ClaudeAgentOptions:
         """Create ClaudeAgentOptions from AgentConfig."""
+        if not self.config.cli_path:
+            raise FileNotFoundError(
+                "Claude CLI not found. Install Claude Code "
+                "(npm install -g @anthropic-ai/claude-code) or set CLAUDE_CLI_PATH."
+            )
         return ClaudeAgentOptions(
             cwd=self.config.cwd,
+            cli_path=self.config.cli_path,
             permission_mode=self.config.permission_mode,
             allowed_tools=self.config.allowed_tools,
             setting_sources=self.config.setting_sources,
@@ -243,7 +249,8 @@ Use the Edit tool to update memory/seo-context.md before ending your response.
                     if message.session_id:
                         self.session_id = message.session_id
         except MessageParseError as e:
-            logger.warning(f"SDK message parse error: {e}")
+            logger.error("SDK message parse error in execute_task: %s", e)
+            raise RuntimeError(f"Claude SDK message parse error: {e}") from e
         
         # Update context after task completion
         if result_text:
@@ -305,7 +312,8 @@ Use the Edit tool to update memory/seo-context.md before ending your response.
                     if message.result:
                         yield message.result
         except MessageParseError as e:
-            logger.warning(f"SDK message parse error in streaming (likely rate limit event): {e}")
+            logger.error("SDK message parse error in streaming: %s", e)
+            raise RuntimeError(f"Claude SDK message parse error: {e}") from e
     
     async def interrupt(self) -> None:
         """Interrupt the current task using ClaudeSDKClient."""
@@ -371,12 +379,8 @@ Use the Edit tool to update memory/seo-context.md before ending your response.
                 {"result_text": result_text, "session_id": session_id},
             )()
         except MessageParseError as e:
-            logger.warning("SDK message parse error in create_and_run_result: %s", e)
-            return type(
-                "AgentExecutionResult",
-                (),
-                {"result_text": "", "session_id": None},
-            )()
+            logger.error("SDK message parse error in create_and_run_result: %s", e)
+            raise RuntimeError(f"Claude SDK message parse error: {e}") from e
         finally:
             await agent.disconnect()
 
@@ -397,4 +401,3 @@ Use the Edit tool to update memory/seo-context.md before ending your response.
             return await agent.execute_task(prompt)
         finally:
             await agent.disconnect()
-

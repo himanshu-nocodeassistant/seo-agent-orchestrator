@@ -27,8 +27,7 @@ async def main():
     
     # Create agent configuration (auto-detects Webflow from env vars)
     config = AgentConfig.from_env()
-    # Ensure working directory is set
-    config.cwd = "/Users/himanshusharma/Code/Codex/seo-bot"
+    # Working directory comes from SEO_AGENT_CWD or defaults to this repo root.
     
     # Check for command line arguments
     if len(sys.argv) > 1:

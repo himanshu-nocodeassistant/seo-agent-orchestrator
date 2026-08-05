@@ -8,18 +8,48 @@ permissions, and working directory.
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import shutil
 from typing import TYPE_CHECKING, Optional
 
 import os
 
 
-# Claude Code CLI path - uses OAuth via Claude Code
-CLAUDE_CLI_PATH = "/Users/himanshusharma/.npm-global/bin/claude"
+# Last-resort fallback only (legacy machine-specific path). Real resolution
+# order: explicit arg > CLAUDE_CLI_PATH env > PATH lookup > this fallback.
+_DEFAULT_CLI_PATH = "/Users/himanshusharma/.npm-global/bin/claude"
 
 # Import config types only for type hints
 if TYPE_CHECKING:
     from .webflow import WebflowConfig
     from .google_docs import GoogleDocsConfig
+
+
+def _resolve_cli_path(explicit: Optional[str]) -> Optional[str]:
+    """Resolve the Claude Code CLI path with environment/PATH fallbacks.
+
+    Returns None when no usable CLI is found — validation happens lazily at
+    run time so configs can be constructed for introspection/tests without a
+    Claude install.
+    """
+    candidate = explicit or os.environ.get("CLAUDE_CLI_PATH")
+    if candidate:
+        path = Path(candidate).expanduser()
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Claude CLI not found at {path}. "
+                "Set CLAUDE_CLI_PATH to the claude executable, or install "
+                "Claude Code: npm install -g @anthropic-ai/claude-code"
+            )
+        return str(path)
+
+    which = shutil.which("claude")
+    if which:
+        return which
+
+    if Path(_DEFAULT_CLI_PATH).exists():
+        return _DEFAULT_CLI_PATH
+
+    return None
 
 
 @dataclass
@@ -29,8 +59,9 @@ class AgentConfig:
     # Working directory for the agent
     cwd: str = str(Path(__file__).parent.parent)
 
-    # Claude CLI path - uses OAuth via Claude Code (no API key needed)
-    cli_path: str = CLAUDE_CLI_PATH
+    # Claude CLI path - uses OAuth via Claude Code (no API key needed).
+    # None means auto-detect: CLAUDE_CLI_PATH env > PATH > legacy default.
+    cli_path: Optional[str] = None
 
     # Model to use (default, sonnet, opus, haiku)
     # Use "default" for Claude Code's default model
@@ -80,12 +111,8 @@ class AgentConfig:
 
     def __post_init__(self):
         """Set defaults after initialization."""
-        # Verify CLI path exists
-        if not Path(self.cli_path).exists():
-            raise FileNotFoundError(
-                f"Claude CLI not found at {self.cli_path}. "
-                "Please install Claude Code: npm install -g @anthropic-ai/claude-code"
-            )
+        # Resolve CLI path (env/PATH/legacy fallbacks); validated at run time
+        self.cli_path = _resolve_cli_path(self.cli_path)
 
         # Auto-configure Webflow MCP server if config is provided
         if self.webflow_config is not None:
@@ -154,6 +181,14 @@ class AgentConfig:
         Returns:
             AgentConfig instance with integrations configured if env vars present
         """
+        # SEO_AGENT_CWD overrides the repo-root working directory
+        cwd = os.environ.get("SEO_AGENT_CWD")
+        if cwd:
+            if not Path(cwd).exists():
+                raise FileNotFoundError(
+                    f"SEO_AGENT_CWD points to a missing directory: {cwd}"
+                )
+
         # Check for Webflow env vars
         webflow_config = None
         if os.environ.get("WEBFLOW_ACCESS_TOKEN"):
@@ -167,6 +202,7 @@ class AgentConfig:
             google_docs_config = GoogleDocsConfig.from_env()
 
         return cls(
+            cwd=cwd or str(Path(__file__).parent.parent),
             webflow_config=webflow_config,
             google_docs_config=google_docs_config,
         )
