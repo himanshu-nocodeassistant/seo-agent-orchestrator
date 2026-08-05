@@ -14,9 +14,9 @@ class TestGoogleDocsClient:
     """Test GoogleDocsAPIClient class."""
 
     @pytest.fixture
-    def credentials_path(self):
+    def credentials_path(self, fake_credentials_path):
         """Return path to test credentials."""
-        return Path(__file__).parent.parent / "Google SA Credentials" / "tinyclaw-487419-d5ab318833bb.json"
+        return fake_credentials_path
 
     def test_google_docs_client_initialization(self, credentials_path):
         """Test GoogleDocsAPIClient can be initialized."""
@@ -57,9 +57,9 @@ class TestGoogleDocsClientOperations:
     """Test document operations (NO delete - by design)."""
 
     @pytest.fixture
-    def credentials_path(self):
+    def credentials_path(self, fake_credentials_path):
         """Return path to test credentials."""
-        return Path(__file__).parent.parent / "Google SA Credentials" / "tinyclaw-487419-d5ab318833bb.json"
+        return fake_credentials_path
 
     @pytest.fixture
     def client(self, credentials_path):
@@ -98,22 +98,34 @@ class TestGoogleDocsClientAsync:
     """Test async operations."""
 
     @pytest.fixture
-    def credentials_path(self):
+    def credentials_path(self, fake_credentials_path):
         """Return path to test credentials."""
-        return Path(__file__).parent.parent / "Google SA Credentials" / "tinyclaw-487419-d5ab318833bb.json"
+        return fake_credentials_path
 
     @pytest.mark.asyncio
     async def test_client_can_build_service(self, credentials_path):
         """Test client can build Google Docs service."""
         from agent.google_docs import GoogleDocsConfig, GoogleDocsAPIClient
+        import agent.google_docs.client as client_module
         
         config = GoogleDocsConfig(credentials_path=credentials_path)
         client = GoogleDocsAPIClient(config)
         
-        # Service should be built on demand
-        service = await client._get_service()
-        
-        assert service is not None
+        mock_service = MagicMock()
+        with patch.object(
+            client_module.service_account.Credentials,
+            "from_service_account_file",
+            return_value=MagicMock(),
+        ), patch.object(
+            client_module.discovery,
+            "build",
+            return_value=mock_service,
+        ) as mock_build:
+            service = await client._get_service()
+
+        assert service is mock_service
+        mock_build.assert_called_once()
+        assert mock_build.call_args.kwargs.get("num_retries") == 3
 
     @pytest.mark.asyncio
     async def test_create_document_returns_doc_id(self, credentials_path):
@@ -178,9 +190,9 @@ class TestGoogleDocsServiceAccount:
     """Test service account authentication."""
 
     @pytest.fixture
-    def credentials_path(self):
+    def credentials_path(self, fake_credentials_path):
         """Return path to test credentials."""
-        return Path(__file__).parent.parent / "Google SA Credentials" / "tinyclaw-487419-d5ab318833bb.json"
+        return fake_credentials_path
 
     @pytest.mark.asyncio
     async def test_service_uses_credentials(self, credentials_path):

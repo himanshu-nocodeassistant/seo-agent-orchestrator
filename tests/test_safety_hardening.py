@@ -225,7 +225,7 @@ class TestValidatorFailureStopsPipeline:
                 db, parent_task, "manual_execute", "orchestrate_seo_campaign"
             )
 
-            with patch("agent.api.main._run_agent_prompt", side_effect=_side_effect):
+            with patch("agent.api.helpers._run_agent_prompt", side_effect=_side_effect):
                 await run_campaign_orchestration(db, parent_task, orch_run)
 
             db.refresh(orch_run)
@@ -460,7 +460,7 @@ class TestPostToolUseHook:
             }
             fake_ctx = MagicMock()
 
-            asyncio.get_event_loop().run_until_complete(hook_fn(fake_input, "sess-1", fake_ctx))
+            asyncio.run(hook_fn(fake_input, "sess-1", fake_ctx))
 
             events = db.query(main_module.RunEventModel).filter(
                 main_module.RunEventModel.run_id == run.run_id
@@ -568,7 +568,7 @@ class TestApprovalGate:
                 db, parent_task, "manual_execute", "orchestrate_seo_campaign"
             )
 
-            with patch("agent.api.main._run_agent_prompt", side_effect=_side_effect):
+            with patch("agent.api.helpers._run_agent_prompt", side_effect=_side_effect):
                 await run_campaign_orchestration(db, parent_task, orch_run)
 
             db.refresh(orch_run)

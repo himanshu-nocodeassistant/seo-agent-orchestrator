@@ -1,10 +1,28 @@
-# SEO Bot - Autonomous Agent Project
+# SEO Agent Orchestrator
 
-This project contains an autonomous SEO agent built with Python using Claude Agent Overview
+## Business Context
 
-- ** SDK.
+SEO Agent Orchestrator is an open-source platform that makes SEO a measurable,
+compounding growth channel. It is built for teams that treat organic search as
+a core revenue channel — not for one-off experiments — and it is judged by four
+outcomes:
 
-## ProjectLanguage**: Python
+- **Attributable rank changes** — every CMS change is logged and reviewed
+  against Google Search Console data, so we know what actually moved rankings.
+- **Repeatable content production** — audits and keyword research turn into
+  coordinated campaigns (researcher → writer → publisher → analyst) that run
+  with consistent quality and brand voice.
+- **Controlled spend** — per-task budgets, rate limits, real DataForSEO cost
+  tracking, and a human approval gate before anything publishes.
+- **Decisions from measured data** — keyword volumes, SERP positions, and
+  backlink data come from measured sources, never guessed by the agent.
+
+As an open-source project (MIT), the platform is self-hosted and fully
+inspectable: users can extend the skills, integrations, and pipeline without
+asking permission. Technical guidance for achieving these outcomes follows;
+keep business impact in mind when choosing between "expedient" and "correct".
+
+## ProjectLanguage: Python
 - **AI Backend**: Claude Agent SDK (uses Claude Code CLI via SDK)
 - **Purpose**: Autonomous SEO tasks (audit, content strategy, copywriting, etc.)
 
@@ -15,9 +33,16 @@ This project contains an autonomous SEO agent built with Python using Claude Age
 - `agent/memory_service.py` - Layered memory composition: builds `ShortTermContext`, `EpisodicContext`, `SemanticContext`, `ProceduralContext` into a `ComposedPromptContext` for prompt injection
 - `agent/runtime_profiles.py` - `ExecutionProfile` registry; maps each execution type to tool policy, budget, timeout, turn limit, validator, semantic char limits, and `requires_approval` flag
 - `agent/orchestrator.py` - Multi-agent campaign dispatch loop; DAG tier resolution (`_resolve_execution_tiers`), structured inter-agent handoffs (`_extract_summary_block`), retry with backoff (`_run_with_retry`), parallel execution via `asyncio.gather`
+- `agent/db.py` - SQLAlchemy engine, session factory, ORM models, and Pydantic API schemas (WAL + busy_timeout enabled for SQLite)
+- `agent/prompts.py` - Workflow prompts per execution type (`build_execution_prompt`)
+- `agent/feedback_loop.py` - Change-log/learnings persistence (`seo-changes.json`, `seo-learnings.json`, markdown views)
 - `main.py` - CLI entry point; uses `PROJECT_ROOT` for portable working directory
-- `agent/api/main.py` - FastAPI Kanban server; includes `AgentRunModel`, `RunEventModel`, `TaskSessionModel`, `OrchestrationStateModel` DB tables for full run tracking
-- `skills/` - SEO skills (.skill files are ZIP archives containing SKILL.md)
+- `agent/api/main.py` - FastAPI app assembly: CORS (`ALLOWED_ORIGINS`), optional bearer-token gate (`API_TOKEN`), slowapi rate limits, lifespan (autopilot + DB migrations)
+- `agent/api/helpers.py` - Shared run/comment/autopilot helpers (formerly in main.py)
+- `agent/api/routers/` - `tasks.py`, `comments.py`, `runs.py`, `automation.py` endpoint routers
+- `agent/api/rate_limit.py` - Shared slowapi `limiter` for cost-triggering endpoints
+- `agent/api/static/kanban.html` - Kanban board UI (served as a static file)
+- `skills/` - SEO skills as canonical unpacked `<name>/SKILL.md` directories (no `.skill` ZIP archives)
 - `memory/` - Session memory (CLAUDE.md, seo-strategy.md, seo-context.md, seo-tasks.md)
 - `tests/` - Test suite with pytest
 
@@ -30,8 +55,11 @@ Trigger: create a Kanban task with `execution_type = "orchestrate_seo_campaign"`
 2. Python (`agent/orchestrator.py`) parses the plan and resolves execution tiers via Kahn's topological sort
 3. Child `TaskModel` rows are created (one per phase, with `parent_task_id` set)
 4. Tiers execute sequentially; phases within a tier run concurrently via `asyncio.gather`
+   - Each phase runs on its **own DB session** (closed in `finally`), so concurrent phases never share/interleave a SQLAlchemy session
 5. **Approval gate**: before dispatching any phase whose `ExecutionProfile.requires_approval=True`, the orchestrator checks `parent_task.approved_at`. If unset, sets `state.status='awaiting_approval'` and halts. Campaign resumes when `approved_at` is set via `PATCH /tasks/{id}`.
+   - **Resume is explicit**: `POST /tasks/{id}/execute?resume=true` (or the Resume button in the UI) continues the SAME orchestrator run — the plan is not regenerated and completed phases are not re-run.
 6. Each phase agent receives prior outputs via structured `## Summary for Next Phase` blocks (falls back to 1500-char truncation)
+   - Phases with downstream dependents get ONE correction retry when the block is missing; if still missing, `handoff_degraded` is recorded in the orchestration state (`handoff_degraded_json`) plus a warning comment
 7. `OrchestrationStateModel` persists state: plan JSON, current phase, all phase outputs, child run IDs, and final status (`running | awaiting_approval | completed | error`)
 8. All child `AgentRunModel` rows carry `parent_run_id` pointing to the orchestrator run
 
@@ -62,6 +90,8 @@ Trigger: create a Kanban task with `execution_type = "orchestrate_seo_campaign"`
 
 **Retry policy:** transient errors (timeouts, 503s, rate limits) are retried up to 2 times with exponential backoff with an optional `max_total_seconds` wall-clock cap. Non-retryable: budget exceeded, malformed plan, circular dependency.
 
+**Plan validation:** every phase's `execution_type` is validated against the profile registry right after parsing — a bad plan fails fast with a clear error before any child task is created.
+
 **Approval gate:** `campaign_publisher` has `requires_approval=True`. The orchestrator halts before that tier and sets `state.status='awaiting_approval'`. Set `approved_at` on the parent task via the Kanban UI (PATCH) to resume.
 
 **Grounding requirement:** `research` and `campaign_researcher` profiles carry the `grounding-required` procedural tag. The injected system prompt requires every factual claim to cite a source URL; the validator also checks for at least one `https://` URL in the output.
@@ -78,7 +108,7 @@ Trigger: create a Kanban task with `execution_type = "orchestrate_seo_campaign"`
 
 - **Python**: 3.11+
 - **SDK**: claude-agent-sdk>=0.1.44
-- **HTTP Client**: aiohttp>=3.9.0 (for Webflow API)
+- **HTTP Client**: aiohttp>=3.9.0 (for Webflow API); requests>=2.31.0 (for DataForSEO pipeline)
 - **Web Server**: FastAPI, Uvicorn (for Kanban UI)
 - **Database**: SQLite with SQLAlchemy ORM
 - **Testing**: pytest>=9.0.0, pytest-asyncio>=1.3.0
@@ -342,6 +372,135 @@ agent/gsc/
 └── server.py      # MCP server factory
 ```
 
+## DataForSEO Integration
+
+Unlike GSC/Webflow/Google Docs, DataForSEO is **not** wired into the agent as live
+MCP tools. It's a batch extraction pipeline: standalone scripts call
+`agent/dataforseo/` classes to pull SERP rankings, keyword volume, backlinks, and
+AI-search-visibility data, log every paid API call to disk, and compile the
+results into files the agent reads via `memory/`. This exists so keyword
+volumes, SERP positions, and ranking data come from measured DataForSEO
+responses instead of the agent guessing at them.
+
+`agent/dataforseo/__init__.py` is deliberately **not** re-exported from
+`agent/__init__.py` — importing the agent must not require `requests`/`python-dotenv`.
+
+### Environment Variables
+```bash
+DATAFORSEO_LOGIN=your_login_email
+DATAFORSEO_PASSWORD=your_api_password   # API password from the DataForSEO dashboard, not your account password
+SEO_TARGET_DOMAIN=yoursite.com          # optional — flags your own domain's rows in recovery/report output
+```
+
+### Storage Layout
+```
+dataforseo/
+├── raw/        # one file per API call, grouped tag/keyword-slug/location_code/ (gitignored contents)
+├── manifests/  # {task_id: request} written immediately on task_post, so a crash never loses billed task IDs (gitignored contents)
+└── compiled/   # rolled-up JSON/CSV output — what scripts and the agent actually read (tracked in git)
+```
+See `agent/dataforseo/LOG_ORGANIZATION.md` for why `raw/` is grouped this way, and
+`agent/dataforseo/RELIABILITY.md` for the retry/manifest/recovery design.
+
+### Module Structure
+```
+agent/dataforseo/
+├── client.py                    # DataForSEOClient — sync requests, retry+backoff, task_post/task_get polling, manifest writes
+├── logger.py                    # log_result() — writes every call to dataforseo/raw/
+├── serp/google_organic.py       # SERP rankings
+├── keywords_data/               # google_ads.py, bing.py, google_trends.py — keyword volume/CPC/trends
+├── dataforseo_labs/google.py    # keyword ideas, ranked keywords, competitor domains
+├── backlinks/backlinks.py       # backlink data
+└── ai_optimization/             # LLM mentions/visibility (ChatGPT, Claude, Gemini, Perplexity) + AI keyword data
+```
+
+### Utility Scripts
+```
+scripts/compile_serp_results.py    # dataforseo/raw/ -> one compiled JSON, deduped to latest per keyword+location
+scripts/serp_recover_from_ids.py   # recover results from a manifest/task_post log without re-billing tasks
+scripts/purge_stale_poll_logs.py   # delete not-ready poll snapshots superseded by a completed task_get
+scripts/pipelines/refresh.py       # scheduled SERP + keyword-volume refresh (reads dataforseo/refresh.tasks.json)
+```
+These operate on already-fetched local files (or resume an in-flight
+task_post) — they don't pull fresh data from the API themselves.
+
+### Refreshing Measurements on a Schedule
+
+`scripts/pipelines/refresh.py` reads `dataforseo/refresh.tasks.json` (a `serp`
+keyword list and a `keyword_volume` list with locations/tags), runs the
+standard-queue `search` / `search_volume` batches, and writes rollups to
+`dataforseo/compiled/` with the naming the measurement memory layer reads.
+Run it from cron/launchd, e.g. daily at 2am:
+
+```
+0 2 * * * cd /path/to/seo-bot-orchestrator && .venv/bin/python scripts/pipelines/refresh.py >> dataforseo/refresh.log 2>&1
+```
+
+The agent consumes the compiled rollups through the measurement memory layer:
+`agent/dataforseo/memory.py` picks the newest compiled file per pipeline and
+`fetch_semantic_context` injects a `## Measured Data (DataForSEO)` section for
+profiles tagged `dataforseo-measurements` (`research`, `campaign_researcher`,
+`campaign_analyst`, `seo_impact_review`) — so keyword volumes/SERP positions
+come from measured responses, not guesses.
+
+**Client hardening:** `DataForSEOClient` chunks `task_post` payloads into
+`DATAFORSEO_MAX_TASKS_PER_REQUEST` (default 100) batches, polls all pending
+tasks per round with a global `max_wait` deadline, uses full-jitter backoff
+honoring `Retry-After`, writes manifests atomically, and rate-limits task
+creation via a shared token bucket (`DATAFORSEO_TASKS_PER_MINUTE`, default
+100). Never run pipeline scripts without explicit user permission — every
+`task_post` bills real API spend.
+
+**Not ported:** the ~30 one-off campaign report scripts (e.g. white-label
+keyword volume, bubble-migration keyword suggestions) that lived in the source
+project's `scripts/` — those encode a specific client's already-extracted
+keyword intelligence, not reusable pipeline logic. Write new campaign-specific
+scripts against `agent/dataforseo/` as needed; keep them out of `CLAUDE.md`
+unless they become reusable infrastructure.
+
+### API Pipelines (fresh data pulls)
+
+`scripts/pipelines/` has one CLI script per `agent/dataforseo` class — these are
+what actually calls the API to pull new data. Every script is a ~25-line wrapper
+around the shared harness in `scripts/pipelines/_cli.py`, which introspects the
+class's public methods and exposes each as a subcommand:
+
+```
+python scripts/pipelines/<name>.py <method> --task '{"...": "..."}'          # single ad-hoc task
+python scripts/pipelines/<name>.py <method> --tasks-file tasks.json          # batch, from a JSON list
+python scripts/pipelines/<name>.py <method> --help                           # per-method arg/field docs
+```
+
+Output writes to `dataforseo/compiled/<pipeline>-<method>-<date>.json` by default
+(override with `--output`). The 14 scripts:
+
+```
+scripts/pipelines/serp_google_organic.py         # GoogleOrganicSERP
+scripts/pipelines/keywords_google_ads.py         # GoogleAdsKeywords
+scripts/pipelines/keywords_bing.py                # BingKeywords
+scripts/pipelines/keywords_google_trends.py      # GoogleTrends
+scripts/pipelines/labs_google.py                  # GoogleLabs (keyword ideas, ranked keywords, competitors)
+scripts/pipelines/backlinks.py                    # BacklinksAPI
+scripts/pipelines/llm_mentions.py                 # LLMMentions (AI Overviews / ChatGPT mention search)
+scripts/pipelines/ai_keyword_data.py              # AIKeywordData (AI-assistant search volume)
+scripts/pipelines/llm_responses_chat_gpt.py       # ChatGPTResponses
+scripts/pipelines/llm_responses_claude.py         # ClaudeResponses
+scripts/pipelines/llm_responses_gemini.py         # GeminiResponses
+scripts/pipelines/llm_responses_perplexity.py     # PerplexityResponses (no task_post — API doesn't support it)
+scripts/pipelines/llm_scraper_chat_gpt.py         # ChatGPTScraper
+scripts/pipelines/llm_scraper_gemini.py           # GeminiScraper
+```
+
+**Cost tracking:** `DataForSEOClient.total_cost` accumulates the real `cost`
+field from every response (`agent/dataforseo/client.py`) — not a hardcoded
+per-endpoint estimate. Every pipeline run prints `DataForSEO API cost this run: $X.XXXX`
+at the end. For the four `llm_responses_*` pipelines specifically, each result
+item also carries real `input_tokens`/`output_tokens`/`money_spent` (genuine LLM
+token usage, distinct from the DataForSEO call cost); those are summed and
+printed as `LLM token usage: ... input / ... output tokens, $X.XXXX money_spent`
+whenever present. Cost is captured even on a call that ultimately errors —
+billed spend is real regardless of whether the call succeeded.
+
 ## Kanban UI
 
 The project includes a visual Kanban board for task management.
@@ -401,14 +560,26 @@ Comment automation environment variables:
 - `COMMENT_AUTOPILOT_INTERVAL_SECONDS` (default `300` — 5 minutes)
 - `AGENT_EXECUTION_TIMEOUT_SECONDS` (default `900`)
 
+API hardening environment variables:
+- `ALLOWED_ORIGINS` (comma-separated CORS origins; default localhost:8000)
+- `API_TOKEN` (optional bearer token; when set every request needs `Authorization: Bearer <token>`)
+- `API_RATE_LIMIT_EXECUTE` (per-minute slowapi limit on execute/process-one; default `5/minute`)
+- `SEO_AGENT_CWD` (agent working directory; defaults to repo root)
+- `CLAUDE_CLI_PATH` (Claude CLI override; auto-detected from PATH if unset)
+
 Testing isolation:
-- `tests/conftest.py` forces API tests to use in-memory SQLite with `StaticPool` so tests never write into production/staging DB files.
+- `tests/conftest.py` forces API tests to use in-memory SQLite with `StaticPool` (patching `agent.db` engine/session) so tests never write into production/staging DB files, and raises the rate limit so the shared TestClient key never trips it.
 
 ### Module Structure
 ```
 agent/api/
 ├── __init__.py    # Module init
-└── main.py        # FastAPI app with all endpoints and embedded Kanban HTML
+├── main.py        # FastAPI app assembly + backwards-compat re-exports
+├── helpers.py     # Shared run/comment/autopilot helpers
+├── rate_limit.py  # slowapi limiter
+├── routers/       # tasks.py, comments.py, runs.py, automation.py
+└── static/
+    └── kanban.html
 ```
 
 ## Testing

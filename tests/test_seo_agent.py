@@ -220,32 +220,27 @@ This is a test skill for SEO tasks.
             mock_query.assert_called_once()
     
     def test_skill_directory_structure(self):
-        """Test that Skills directory exists and has expected structure.
-        
-        .skill files are ZIP archives containing SKILL.md with frontmatter.
-        """
-        skills_dir = Path("Skills")
-        
-        if skills_dir.exists():
-            skill_files = list(skills_dir.glob("*.skill"))
-            assert len(skill_files) > 0, "Should have at least one skill file"
-            
-            # Each .skill file is a ZIP archive containing SKILL.md
-            for skill_file in skill_files:
-                try:
-                    with zipfile.ZipFile(skill_file, 'r') as zf:
-                        # Look for SKILL.md inside the archive
-                        namelist = zf.namelist()
-                        skill_md_files = [n for n in namelist if n.endswith('SKILL.md')]
-                        assert len(skill_md_files) > 0, f"Skill {skill_file.name} should contain SKILL.md"
-                        
-                        # Read SKILL.md content and check for frontmatter
-                        with zf.open(skill_md_files[0]) as f:
-                            content = f.read().decode('utf-8')
-                        assert "---" in content, f"Skill {skill_file.name} should have frontmatter"
-                except zipfile.BadZipFile:
-                    # Not a valid ZIP - skip or fail appropriately
-                    assert False, f"Skill file {skill_file.name} is not a valid ZIP archive"
+        """Skills are canonical unpacked dirs: <name>/SKILL.md with frontmatter,
+        flat (no nested <name>/<name>/ layout), and no .skill ZIP archives."""
+        skills_dir = Path("skills")
+        assert skills_dir.exists(), "skills/ directory must exist"
+
+        skill_dirs = [d for d in skills_dir.iterdir() if d.is_dir()]
+        assert len(skill_dirs) >= 15, (
+            f"Expected at least 15 unpacked skills, found {len(skill_dirs)}"
+        )
+
+        for skill_dir in skill_dirs:
+            md = skill_dir / "SKILL.md"
+            assert md.exists(), f"{skill_dir.name} should contain SKILL.md"
+            content = md.read_text(encoding="utf-8")
+            assert "---" in content, (
+                f"{skill_dir.name} SKILL.md should have frontmatter"
+            )
+
+        assert list(skills_dir.glob("*.skill")) == [], (
+            "No .skill ZIP archives should remain"
+        )
 
 
 # ============================================================================

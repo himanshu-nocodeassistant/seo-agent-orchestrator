@@ -192,13 +192,32 @@ class TestSEOAudit:
     
     def test_run_seo_audit(self, client):
         """Test: POST /runs/{run_id}/seo-audit triggers SEO audit."""
-        response = client.post("/runs/test-audit-123/seo-audit", json={
-            "days": 28,
-            "max_rows": 1000
-        })
-        
-        # Either succeeds or returns error (agent may not be available in test)
-        assert response.status_code in [200, 500]
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, patch
+
+        with patch(
+            "agent.api.helpers._run_agent_prompt",
+            new=AsyncMock(
+                return_value=SimpleNamespace(
+                    result_text=(
+                        "Audit complete. Top keyword: no-code. "
+                        "Source: https://example.com/audit"
+                    ),
+                    session_id=None,
+                )
+            ),
+        ):
+            response = client.post(
+                "/runs/test-audit-123/seo-audit",
+                json={"days": 28, "max_rows": 1000},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["task_id"]
+
+        task = client.get(f"/tasks/{response.json()['task_id']}").json()
+        assert task["status"] == "completed"
+        assert task["execution_type"] == "seo_audit"
 
 
 # ============================================================================

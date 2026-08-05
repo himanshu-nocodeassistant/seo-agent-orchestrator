@@ -238,25 +238,28 @@ class TestLoadFunctions:
     """Tests for _load_seo_changes() and _load_seo_learnings()"""
 
     def test_load_changes_returns_empty_structure_if_missing(self, tmp_path, monkeypatch):
-        from agent.api import main as main_module
-        monkeypatch.setattr(main_module, "SEO_CHANGES_PATH", tmp_path / "nonexistent.json")
+        from agent import feedback_loop as feedback_module
+        from agent.api import helpers as helpers_module
+        monkeypatch.setattr(feedback_module, "SEO_CHANGES_PATH", tmp_path / "nonexistent.json")
         fn = _import_targets()["_load_seo_changes"]
         result = fn()
         assert result == {"version": 1, "entries": []}
 
     def test_load_learnings_returns_empty_structure_if_missing(self, tmp_path, monkeypatch):
-        from agent.api import main as main_module
-        monkeypatch.setattr(main_module, "SEO_LEARNINGS_PATH", tmp_path / "nonexistent.json")
+        from agent import feedback_loop as feedback_module
+        from agent.api import helpers as helpers_module
+        monkeypatch.setattr(feedback_module, "SEO_LEARNINGS_PATH", tmp_path / "nonexistent.json")
         fn = _import_targets()["_load_seo_learnings"]
         result = fn()
         assert result == {"version": 1, "learnings": {}}
 
     def test_load_changes_reads_existing_file(self, tmp_path, monkeypatch):
-        from agent.api import main as main_module
+        from agent import feedback_loop as feedback_module
+        from agent.api import helpers as helpers_module
         path = tmp_path / "seo-changes.json"
         data = {"version": 1, "entries": [{"id": "1-rewrite_title-test"}]}
         path.write_text(json.dumps(data))
-        monkeypatch.setattr(main_module, "SEO_CHANGES_PATH", path)
+        monkeypatch.setattr(feedback_module, "SEO_CHANGES_PATH", path)
         fn = _import_targets()["_load_seo_changes"]
         result = fn()
         assert result["entries"][0]["id"] == "1-rewrite_title-test"
@@ -297,11 +300,12 @@ class TestWriteChangeLogEntry:
 -->"""
 
     def test_creates_new_entry_for_cms_type(self, tmp_path, monkeypatch):
-        from agent.api import main as main_module
-        monkeypatch.setattr(main_module, "SEO_CHANGES_PATH", tmp_path / "seo-changes.json")
-        monkeypatch.setattr(main_module, "SEO_CHANGES_MD_PATH", tmp_path / "log.md")
-        monkeypatch.setattr(main_module, "SEO_LEARNINGS_PATH", tmp_path / "seo-learnings.json")
-        monkeypatch.setattr(main_module, "SEO_LEARNINGS_MD_PATH", tmp_path / "learnings.md")
+        from agent import feedback_loop as feedback_module
+        from agent.api import helpers as helpers_module
+        monkeypatch.setattr(feedback_module, "SEO_CHANGES_PATH", tmp_path / "seo-changes.json")
+        monkeypatch.setattr(feedback_module, "SEO_CHANGES_MD_PATH", tmp_path / "log.md")
+        monkeypatch.setattr(feedback_module, "SEO_LEARNINGS_PATH", tmp_path / "seo-learnings.json")
+        monkeypatch.setattr(feedback_module, "SEO_LEARNINGS_MD_PATH", tmp_path / "learnings.md")
 
         fn = _import_targets()["_write_change_log_entry"]
         task = self._make_task()
@@ -322,11 +326,12 @@ class TestWriteChangeLogEntry:
         assert entry["user_notes"][0]["body"] == "keep it concise"
 
     def test_upsert_increments_attempts(self, tmp_path, monkeypatch):
-        from agent.api import main as main_module
-        monkeypatch.setattr(main_module, "SEO_CHANGES_PATH", tmp_path / "seo-changes.json")
-        monkeypatch.setattr(main_module, "SEO_CHANGES_MD_PATH", tmp_path / "log.md")
-        monkeypatch.setattr(main_module, "SEO_LEARNINGS_PATH", tmp_path / "seo-learnings.json")
-        monkeypatch.setattr(main_module, "SEO_LEARNINGS_MD_PATH", tmp_path / "learnings.md")
+        from agent import feedback_loop as feedback_module
+        from agent.api import helpers as helpers_module
+        monkeypatch.setattr(feedback_module, "SEO_CHANGES_PATH", tmp_path / "seo-changes.json")
+        monkeypatch.setattr(feedback_module, "SEO_CHANGES_MD_PATH", tmp_path / "log.md")
+        monkeypatch.setattr(feedback_module, "SEO_LEARNINGS_PATH", tmp_path / "seo-learnings.json")
+        monkeypatch.setattr(feedback_module, "SEO_LEARNINGS_MD_PATH", tmp_path / "learnings.md")
 
         fn = _import_targets()["_write_change_log_entry"]
         task = self._make_task()
@@ -339,7 +344,8 @@ class TestWriteChangeLogEntry:
         assert data["entries"][0]["attempts"] == 2
 
     def test_upsert_preserves_reviewed_status(self, tmp_path, monkeypatch):
-        from agent.api import main as main_module
+        from agent import feedback_loop as feedback_module
+        from agent.api import helpers as helpers_module
         path = tmp_path / "seo-changes.json"
         existing_id = "42-rewrite_title-nocodeassistant-agency-weweb-agency"
         existing_data = {
@@ -356,10 +362,10 @@ class TestWriteChangeLogEntry:
             }]
         }
         path.write_text(json.dumps(existing_data))
-        monkeypatch.setattr(main_module, "SEO_CHANGES_PATH", path)
-        monkeypatch.setattr(main_module, "SEO_CHANGES_MD_PATH", tmp_path / "log.md")
-        monkeypatch.setattr(main_module, "SEO_LEARNINGS_PATH", tmp_path / "seo-learnings.json")
-        monkeypatch.setattr(main_module, "SEO_LEARNINGS_MD_PATH", tmp_path / "learnings.md")
+        monkeypatch.setattr(feedback_module, "SEO_CHANGES_PATH", path)
+        monkeypatch.setattr(feedback_module, "SEO_CHANGES_MD_PATH", tmp_path / "log.md")
+        monkeypatch.setattr(feedback_module, "SEO_LEARNINGS_PATH", tmp_path / "seo-learnings.json")
+        monkeypatch.setattr(feedback_module, "SEO_LEARNINGS_MD_PATH", tmp_path / "learnings.md")
 
         fn = _import_targets()["_write_change_log_entry"]
         task = self._make_task()
@@ -372,9 +378,10 @@ class TestWriteChangeLogEntry:
         assert entry["attempts"] == 2
 
     def test_non_cms_type_is_noop(self, tmp_path, monkeypatch):
-        from agent.api import main as main_module
+        from agent import feedback_loop as feedback_module
+        from agent.api import helpers as helpers_module
         changes_path = tmp_path / "seo-changes.json"
-        monkeypatch.setattr(main_module, "SEO_CHANGES_PATH", changes_path)
+        monkeypatch.setattr(feedback_module, "SEO_CHANGES_PATH", changes_path)
 
         fn = _import_targets()["_write_change_log_entry"]
         task = self._make_task(execution_type="research")  # not in CMS_CHANGE_FIELD_MAP
@@ -383,11 +390,12 @@ class TestWriteChangeLogEntry:
         assert not changes_path.exists()  # file never created
 
     def test_failed_extraction_still_writes_entry(self, tmp_path, monkeypatch):
-        from agent.api import main as main_module
-        monkeypatch.setattr(main_module, "SEO_CHANGES_PATH", tmp_path / "seo-changes.json")
-        monkeypatch.setattr(main_module, "SEO_CHANGES_MD_PATH", tmp_path / "log.md")
-        monkeypatch.setattr(main_module, "SEO_LEARNINGS_PATH", tmp_path / "seo-learnings.json")
-        monkeypatch.setattr(main_module, "SEO_LEARNINGS_MD_PATH", tmp_path / "learnings.md")
+        from agent import feedback_loop as feedback_module
+        from agent.api import helpers as helpers_module
+        monkeypatch.setattr(feedback_module, "SEO_CHANGES_PATH", tmp_path / "seo-changes.json")
+        monkeypatch.setattr(feedback_module, "SEO_CHANGES_MD_PATH", tmp_path / "log.md")
+        monkeypatch.setattr(feedback_module, "SEO_LEARNINGS_PATH", tmp_path / "seo-learnings.json")
+        monkeypatch.setattr(feedback_module, "SEO_LEARNINGS_MD_PATH", tmp_path / "learnings.md")
 
         fn = _import_targets()["_write_change_log_entry"]
         task = self._make_task()
@@ -402,11 +410,12 @@ class TestWriteChangeLogEntry:
         assert entry["after"] is None
 
     def test_only_user_comments_stored(self, tmp_path, monkeypatch):
-        from agent.api import main as main_module
-        monkeypatch.setattr(main_module, "SEO_CHANGES_PATH", tmp_path / "seo-changes.json")
-        monkeypatch.setattr(main_module, "SEO_CHANGES_MD_PATH", tmp_path / "log.md")
-        monkeypatch.setattr(main_module, "SEO_LEARNINGS_PATH", tmp_path / "seo-learnings.json")
-        monkeypatch.setattr(main_module, "SEO_LEARNINGS_MD_PATH", tmp_path / "learnings.md")
+        from agent import feedback_loop as feedback_module
+        from agent.api import helpers as helpers_module
+        monkeypatch.setattr(feedback_module, "SEO_CHANGES_PATH", tmp_path / "seo-changes.json")
+        monkeypatch.setattr(feedback_module, "SEO_CHANGES_MD_PATH", tmp_path / "log.md")
+        monkeypatch.setattr(feedback_module, "SEO_LEARNINGS_PATH", tmp_path / "seo-learnings.json")
+        monkeypatch.setattr(feedback_module, "SEO_LEARNINGS_MD_PATH", tmp_path / "learnings.md")
 
         fn = _import_targets()["_write_change_log_entry"]
         task = self._make_task()
@@ -511,11 +520,12 @@ class TestExecuteTaskLogging:
 -->"""
 
     def test_cms_task_creates_change_log_entry(self, client, tmp_path, monkeypatch):
-        from agent.api import main as main_module
-        monkeypatch.setattr(main_module, "SEO_CHANGES_PATH", tmp_path / "seo-changes.json")
-        monkeypatch.setattr(main_module, "SEO_CHANGES_MD_PATH", tmp_path / "log.md")
-        monkeypatch.setattr(main_module, "SEO_LEARNINGS_PATH", tmp_path / "seo-learnings.json")
-        monkeypatch.setattr(main_module, "SEO_LEARNINGS_MD_PATH", tmp_path / "learnings.md")
+        from agent import feedback_loop as feedback_module
+        from agent.api import helpers as helpers_module
+        monkeypatch.setattr(feedback_module, "SEO_CHANGES_PATH", tmp_path / "seo-changes.json")
+        monkeypatch.setattr(feedback_module, "SEO_CHANGES_MD_PATH", tmp_path / "log.md")
+        monkeypatch.setattr(feedback_module, "SEO_LEARNINGS_PATH", tmp_path / "seo-learnings.json")
+        monkeypatch.setattr(feedback_module, "SEO_LEARNINGS_MD_PATH", tmp_path / "learnings.md")
 
         # Create task
         resp = client.post("/tasks", json={
@@ -526,7 +536,7 @@ class TestExecuteTaskLogging:
         task_id = resp.json()["id"]
 
         # Mock agent to return valid structured output
-        with patch.object(main_module, "_run_agent_prompt",
+        with patch.object(helpers_module, "_run_agent_prompt",
                           new=AsyncMock(return_value=self.VALID_AGENT_OUTPUT)):
             exec_resp = client.post(f"/tasks/{task_id}/execute")
             assert exec_resp.status_code == 200
@@ -539,9 +549,10 @@ class TestExecuteTaskLogging:
         assert data["entries"][0]["task_id"] == task_id
 
     def test_non_cms_task_does_not_create_log(self, client, tmp_path, monkeypatch):
-        from agent.api import main as main_module
+        from agent import feedback_loop as feedback_module
+        from agent.api import helpers as helpers_module
         changes_path = tmp_path / "seo-changes.json"
-        monkeypatch.setattr(main_module, "SEO_CHANGES_PATH", changes_path)
+        monkeypatch.setattr(feedback_module, "SEO_CHANGES_PATH", changes_path)
 
         resp = client.post("/tasks", json={
             "title": "Research internal tools keywords",
@@ -549,18 +560,19 @@ class TestExecuteTaskLogging:
         })
         task_id = resp.json()["id"]
 
-        with patch.object(main_module, "_run_agent_prompt",
+        with patch.object(helpers_module, "_run_agent_prompt",
                           new=AsyncMock(return_value="Research complete.")):
             client.post(f"/tasks/{task_id}/execute")
 
         assert not changes_path.exists()
 
     def test_failed_extraction_logs_with_failure_reason(self, client, tmp_path, monkeypatch):
-        from agent.api import main as main_module
-        monkeypatch.setattr(main_module, "SEO_CHANGES_PATH", tmp_path / "seo-changes.json")
-        monkeypatch.setattr(main_module, "SEO_CHANGES_MD_PATH", tmp_path / "log.md")
-        monkeypatch.setattr(main_module, "SEO_LEARNINGS_PATH", tmp_path / "seo-learnings.json")
-        monkeypatch.setattr(main_module, "SEO_LEARNINGS_MD_PATH", tmp_path / "learnings.md")
+        from agent import feedback_loop as feedback_module
+        from agent.api import helpers as helpers_module
+        monkeypatch.setattr(feedback_module, "SEO_CHANGES_PATH", tmp_path / "seo-changes.json")
+        monkeypatch.setattr(feedback_module, "SEO_CHANGES_MD_PATH", tmp_path / "log.md")
+        monkeypatch.setattr(feedback_module, "SEO_LEARNINGS_PATH", tmp_path / "seo-learnings.json")
+        monkeypatch.setattr(feedback_module, "SEO_LEARNINGS_MD_PATH", tmp_path / "learnings.md")
 
         resp = client.post("/tasks", json={
             "title": "Rewrite /bubble-agency title",
@@ -569,7 +581,7 @@ class TestExecuteTaskLogging:
         task_id = resp.json()["id"]
 
         # Agent output with no CHANGE_LOG block
-        with patch.object(main_module, "_run_agent_prompt",
+        with patch.object(helpers_module, "_run_agent_prompt",
                           new=AsyncMock(return_value="Done. New title: Bubble Agency | NCA")):
             exec_resp = client.post(f"/tasks/{task_id}/execute")
             assert exec_resp.status_code == 200
@@ -579,9 +591,12 @@ class TestExecuteTaskLogging:
         entry = data["entries"][0]
         assert entry["extraction_status"] == "failed"
         assert entry["failure_reason"] == "missing_block"
-        # Task still completed (not blocked)
+        # Validators are authoritative: rewrite_title requires a CHANGE_LOG
+        # block, so the run is blocked while the failed extraction is logged.
         task_resp = client.get(f"/tasks/{task_id}")
-        assert task_resp.json()["status"] == "completed"
+        assert task_resp.json()["status"] == "blocked"
+        run = client.get(f"/runs/{exec_resp.json()['run_id']}")
+        assert run.json()["validator_status"] == "failed"
 
 
 # ---------------------------------------------------------------------------

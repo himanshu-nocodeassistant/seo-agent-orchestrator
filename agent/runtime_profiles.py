@@ -282,7 +282,7 @@ PROFILE_REGISTRY: dict[str, ExecutionProfile] = {
         episodic_limit=4,
         semantic_char_limit=2600,
         validator=_validate_research_output,
-        procedural_tags=["brand-voice", "research", "grounding-required"],
+        procedural_tags=["brand-voice", "research", "grounding-required", "dataforseo-measurements"],
     ),
     "alt_text": _profile(
         "alt_text",
@@ -319,7 +319,20 @@ PROFILE_REGISTRY: dict[str, ExecutionProfile] = {
         semantic_char_limit=2500,
         validator=_validate_non_empty,
         should_resume_session=False,
-        procedural_tags=["feedback-loop", "impact-review"],
+        procedural_tags=["feedback-loop", "impact-review", "dataforseo-measurements"],
+    ),
+    "seo_audit": _profile(
+        "seo_audit",
+        allowed_tools=BASE_ALLOWED_TOOLS,
+        max_turns=16,
+        max_budget_usd=2.5,
+        timeout_seconds=600,
+        max_thinking_tokens=6000,
+        episodic_limit=3,
+        semantic_char_limit=2600,
+        validator=_validate_research_output,
+        should_resume_session=False,
+        procedural_tags=["audit", "research", "grounding-required"],
     ),
     "manual": _profile(
         "manual",
@@ -357,7 +370,10 @@ PROFILE_REGISTRY: dict[str, ExecutionProfile] = {
         episodic_limit=3,
         semantic_char_limit=2600,
         validator=_validate_research_output,
-        procedural_tags=["brand-voice", "research", "campaign", "grounding-required"],
+        procedural_tags=[
+            "brand-voice", "research", "campaign", "grounding-required",
+            "dataforseo-measurements",
+        ],
     ),
     "campaign_draft_writer": _profile(
         "campaign_draft_writer",
@@ -395,7 +411,7 @@ PROFILE_REGISTRY: dict[str, ExecutionProfile] = {
         semantic_char_limit=2800,
         validator=_validate_non_empty,
         should_resume_session=False,
-        procedural_tags=["feedback-loop", "campaign"],
+        procedural_tags=["feedback-loop", "campaign", "dataforseo-measurements"],
     ),
 }
 

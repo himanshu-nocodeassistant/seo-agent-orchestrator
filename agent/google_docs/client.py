@@ -62,7 +62,8 @@ class GoogleDocsAPIClient:
                 'docs',
                 'v1',
                 credentials=credentials,
-                cache_discovery=False
+                cache_discovery=False,
+                num_retries=3,
             )
         
         return self._service

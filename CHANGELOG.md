@@ -4,6 +4,44 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-08-05
+
+### Added
+- **Green, non-hanging test suite** — `pytest.ini` registers the `integration` marker and excludes it by default (`addopts = -m "not integration"`); stale mocks now patch `SEOAgent.create_and_run_result` (the method the app actually calls); Google Docs tests use a fake service-account fixture; GitHub Actions CI runs `pytest tests/` on Python 3.11
+- **API hardening** — CORS restricted to `ALLOWED_ORIGINS` (no more `*` + credentials), optional `API_TOKEN` bearer gate, slowapi rate limits (`API_RATE_LIMIT_EXECUTE`, default `5/minute`) on `POST /tasks/{id}/execute` and `POST /automation/comments/process-one`
+- **SQLite WAL + busy_timeout** — long agent runs no longer lock the DB against concurrent API requests or campaign phases
+- **Fixed `/runs/{run_id}/seo-audit`** — runs through the standard profile pipeline with a new read-only `seo_audit` profile (research validator); removed the Bash/localhost task-creation step
+- **Client retries** — Webflow client retries 429/502/503/504 with jittered backoff honoring `Retry-After`; GSC/Google Docs `discovery.build` uses `num_retries=3`; SDK `MessageParseError` now surfaces in the run's error instead of silently returning empty results
+- **Portability** — `SEO_AGENT_CWD` is now functional; Claude CLI auto-detected from PATH (`CLAUDE_CLI_PATH` override); removed the hardcoded `cwd` pointing at a different repo
+- **Approval-gate resume** — `POST /tasks/{id}/execute?resume=true` (and a Resume button in the UI) continues a paused campaign on the same orchestrator run without regenerating the plan or re-running completed phases
+- **Handoff validation** — phases with dependents get one correction retry when the `## Summary for Next Phase` block is missing; persistent misses are recorded in `OrchestrationStateModel.handoff_degraded_json` with a warning comment
+- **Per-phase DB session isolation** — concurrent tier phases no longer share/interleave a SQLAlchemy session
+- **Fail-fast plan validation** — every phase `execution_type` is checked against the profile registry before child tasks are created
+- **DataForSEO client hardening** — `task_post` chunking (≤`DATAFORSEO_MAX_TASKS_PER_REQUEST`), parallel round polling with a global deadline (was N×max_wait), full-jitter backoff, atomic manifests with microsecond timestamps, and a shared token-bucket rate limiter (`DATAFORSEO_TASKS_PER_MINUTE`)
+- **Measurement memory layer** — `agent/dataforseo/memory.py` renders the newest compiled rollup per pipeline into a `## Measured Data (DataForSEO)` prompt section for profiles tagged `dataforseo-measurements` (`research`, `campaign_researcher`, `campaign_analyst`, `seo_impact_review`)
+- **Refresh scheduler** — `scripts/pipelines/refresh.py` + `dataforseo/refresh.tasks.json` for scheduled SERP/keyword-volume refreshes (cron/launchd)
+- **Codebase organization** — `agent/api/main.py` split into `agent/db.py` (models/session/schemas), `agent/prompts.py`, `agent/feedback_loop.py`, `agent/api/helpers.py`, `agent/api/rate_limit.py`, `agent/api/routers/`, and `agent/api/static/kanban.html`; skills canonicalized to flat `<name>/SKILL.md` dirs (`.skill` ZIPs removed, `.claude/skills` symlink now repo-relative); `PLAN.md` and stale `References/` docs removed
+
+### Changed
+- Deprecations fixed while restructuring: FastAPI lifespan handlers, SQLAlchemy 2.0 `orm.declarative_base`, Pydantic `model_dump`, `datetime.now(timezone.utc)` helpers
+- `seo_audit` is now an executable profile (previously a nonexistent type referenced by the broken audit endpoint and UI)
+- `main.py` CLI uses `SEO_AGENT_CWD`/repo root instead of a hardcoded path
+- README/CLAUDE.md reframed business-first (open-source platform positioning, what it delivers and why, guardrails, measurable outcomes) with all technical detail preserved below
+
+### Added
+- **DataForSEO batch extraction pipeline** (`agent/dataforseo/`) — ported from the sibling `seo-bot` project as a standalone sync pipeline, not agent-facing MCP tools. Replaces guessed keyword volumes/SERP data with measured DataForSEO API responses.
+  - `client.py` — `DataForSEOClient`: retry+backoff on 429/502/503/504, Standard Queue task_post/task_get polling, crash-safe manifest writes before polling begins
+  - `logger.py` — logs every paid API call to `dataforseo/raw/<tag>/<keyword-slug>/<location_code>/`, grouped for lookup by keyword rather than by endpoint
+  - Coverage: SERP (Google organic), Keywords Data (Google Ads, Bing, Google Trends), DataForSEO Labs (Google), Backlinks, AI Optimization (LLM mentions/visibility across ChatGPT/Claude/Gemini/Perplexity, AI keyword data)
+  - Not ported: YouTube SERP endpoints, Amazon/App Store Labs — out of scope for this project's SEO focus
+  - `scripts/compile_serp_results.py`, `scripts/serp_recover_from_ids.py`, `scripts/purge_stale_poll_logs.py` — campaign-agnostic pipeline utilities; `TARGET_DOMAIN` hardcoding from the source replaced with `--target-domain`/`SEO_TARGET_DOMAIN`
+  - `dataforseo/{raw,manifests,compiled}/` created empty — no keyword intelligence carried over from the source project
+  - `tests/test_dataforseo_logger.py` — 9 tests on the log-grouping logic, ported verbatim (fully isolated via `tmp_path`)
+  - New deps: `requests>=2.31.0`, `python-dotenv>=1.0.0`
+- **`DataForSEOClient.total_cost` real-cost tracking** — accumulates the `cost` field from every API response (`_post`/`_get`), captured even on calls that ultimately raise `DataForSEOError` so billed spend is never dropped just because a call errored. Per-instance, not global. `tests/test_dataforseo_client.py` — 7 tests, all HTTP mocked.
+- **14 per-class API pipeline scripts** (`scripts/pipelines/`) — one CLI script per `agent/dataforseo` class (SERP, Google Ads/Bing/Trends keywords, Labs, Backlinks, LLM Mentions, AI Keyword Data, 4x LLM Responses, 2x LLM Scraper), the first mechanism in this repo that actually pulls fresh DataForSEO data (the 3 utility scripts above only operate on already-fetched files). Every script delegates to a shared harness (`scripts/pipelines/_cli.py`) that introspects the class's public methods and exposes each as a subcommand (`--task '<json>'` or `--tasks-file`), rather than 14 hand-written near-duplicates. Prints `total_cost` after every run; for the 4 `llm_responses_*` pipelines, also sums and prints real per-item `input_tokens`/`output_tokens`/`money_spent` (genuine LLM token spend, distinct from the DataForSEO call cost). `tests/test_pipeline_cli.py` — 15 tests against a fake client class covering every method-shape the harness dispatches.
+- **`SEO_TARGET_DOMAIN`** env var (`.env.example`) — the one domain-flagging parameter used across the pipeline (currently `scripts/serp_recover_from_ids.py --target-domain`); documented in one place so future scripts needing domain matching reuse the same name instead of inventing a new one.
+
 ## [2.2.0] - 2026-06-10
 
 ### Added

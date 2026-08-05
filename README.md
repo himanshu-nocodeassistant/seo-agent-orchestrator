@@ -1,10 +1,34 @@
 # SEO Agent Orchestrator
 
-An open-source autonomous SEO agent built with Python and the Claude Agent SDK. Point it at your site and it runs audits, rewrites copy, writes blog posts, manages Webflow CMS content, and tracks ranking impact — all through a visual Kanban board.
+*Turn SEO from a manual, hard-to-measure process into a repeatable system that compounds organic growth.*
+
+**SEO Agent Orchestrator is an open-source SEO operations platform** — an autonomous operator for your site that audits, optimizes, writes, publishes, and — most importantly — **measures whether the changes actually moved rankings**. Built on Python + the Claude Agent SDK and driven through a visual Kanban board, with a human approval gate before anything goes live.
+
+## Why it exists — the business case
+
+- **SEO is measurable but rarely measured.** The agent closes the loop: every CMS change is logged, its ranking impact reviewed against Search Console, and the winning patterns fed back into the next task.
+- **Content work doesn't scale manually.** A researcher → writer → publisher → analyst campaign pipeline turns one campaign request into a coordinated set of specialized tasks that run automatically.
+- **Guardrails protect the business.** Cost ceilings per task, tool permissions per task type, output validators, rate limits, and a human approval step before publishing — automation without losing control.
+- **Decisions come from data, not guesses.** Measured keyword volumes, SERP positions, and backlink data are injected into the agent's context so recommendations are grounded in real numbers.
+
+## What it delivers
+
+| Business outcome | How it's delivered |
+|---|---|
+| Faster page-level optimization | One task rewrites titles, meta descriptions, H1s, alt text, schema — with Webflow publish when configured |
+| Consistent content production | Blog posts and rewrites follow brand voice, SEO workflow, and validator checks |
+| Rank changes you can attribute | Every CMS change is change-logged and reviewed against GSC clicks/impressions/position |
+| Learning that compounds | SEO Feedback Loop extracts learnings from measured outcomes and propagates what works |
+| Team leverage | Comment Autopilot picks up "@agent" revision requests and re-runs automatically |
+| Cost control | Per-task budget ceilings, per-minute rate limits, real cost tracking on data pulls |
+
+## Open source, self-hosted, no lock-in
+
+SEO Agent Orchestrator is released under the [MIT License](LICENSE). It runs entirely on your own infrastructure against your existing Claude Code subscription — your ranking data, CMS, and credentials never leave your control. As an open-source project, the entire pipeline is inspectable and extensible: agent logic, SEO skills, data integrations, and the API are all yours to read, fork, and extend. No black box, no per-seat pricing, no vendor lock-in.
 
 ## How it works
 
-The agent uses Claude Code via OAuth (your Claude Pro or Max subscription — no API key required). Each task is mapped to an **execution profile** that controls which tools the agent can use, how many turns it gets, its cost ceiling, and a structured validator that checks the output before marking a run complete.
+The agent runs on your existing Claude Code subscription (OAuth — no API key). Each task maps to an **execution profile** that controls which tools the agent can use, how many turns it gets, its cost ceiling, and a structured validator that checks the output before a run is marked complete.
 
 A four-layer memory system feeds every prompt:
 - **Semantic** — your site overview, keyword strategy, and extracted ranking learnings from `memory/`
@@ -14,8 +38,8 @@ A four-layer memory system feeds every prompt:
 
 ## Features
 
-- **Multi-agent campaign orchestration** — create a single Kanban task with type `orchestrate_seo_campaign`; the orchestrator agent produces a JSON plan, Python dispatches each phase agent (researcher → writer → publisher → analyst) with DAG-based parallelism, structured inter-agent handoffs, and retry on transient failures
-- **14 SEO Skills** — SEO Audit, Content Strategy, Copywriting, Copy Editing, Brand Voice, Competitor Alternatives, Programmatic SEO, Schema Markup, Analytics Tracking, Page CRO, Marketing Psychology, Webflow CMS, Google Docs, SEO Feedback Loop
+- **Multi-agent campaign orchestration** — one campaign task (researcher → writer → publisher → analyst) with DAG-based parallelism, structured handoffs, retry on transient failures, and an approval gate before publishing
+- **15 SEO Skills** — SEO Audit, Content Strategy, Copywriting, Copy Editing, Brand Voice, Competitor Alternatives, Programmatic SEO, Schema Markup, Analytics Tracking, Page CRO, Marketing Psychology, Webflow CMS, Google Docs, SEO Feedback Loop, Task Breakdown
 - **Kanban UI** — visual task board at `http://localhost:8000/kanban`; create tasks, execute them, leave `@agent` comments for revisions
 - **Comment Autopilot** — background worker that picks up `@agent` comments and re-runs the agent automatically
 - **Run tracking** — every execution is recorded with status, session ID, validator result, and a result summary; child campaign runs link back to the orchestrator run via `parent_run_id`
@@ -95,6 +119,13 @@ async def main():
 asyncio.run(main())
 ```
 
+## Business guardrails by default
+
+- **Human approval before publishing** — `campaign_publisher` phases pause until a person sets `approved_at`; the campaign resumes from where it stopped (no re-planning, no double-billing).
+- **Spend is bounded** — every execution profile has a max budget and turn limit, API rate limits cap cost-triggering endpoints, and DataForSEO pulls track real billed cost per run.
+- **Nothing ships unverified** — outputs must pass a structured validator (grounded research requires cited URLs; CMS changes require a machine-readable change log) before a run is marked complete.
+- **Published changes are attributable** — the SEO Feedback Loop correlates CMS changes with GSC ranking data so you can see what actually worked.
+
 ## Configuration
 
 ### AgentConfig
@@ -120,6 +151,9 @@ Copy `.env.example` to `.env` and fill in the values you need.
 | `COMMENT_AUTOPILOT_ENABLED` | Enable `@agent` comment background worker | `true` |
 | `COMMENT_AUTOPILOT_INTERVAL_SECONDS` | Poll interval for comment autopilot | `900` |
 | `AGENT_EXECUTION_TIMEOUT_SECONDS` | Timeout per agent execution | `900` |
+| `ALLOWED_ORIGINS` | Comma-separated CORS origins for the local API | `http://localhost:8000,http://127.0.0.1:8000` |
+| `API_TOKEN` | Optional bearer token; when set every request needs `Authorization: Bearer <token>` | unset |
+| `API_RATE_LIMIT_EXECUTE` | Per-minute rate limit on endpoints that start paid agent runs | `5/minute` |
 | `WEBFLOW_ACCESS_TOKEN` | Webflow API token | unset |
 | `WEBFLOW_SITE_ID` | Webflow site ID | unset |
 | `WEBFLOW_COLLECTION_ID` | Webflow CMS collection ID | unset |
@@ -127,6 +161,8 @@ Copy `.env.example` to `.env` and fill in the values you need.
 | `GOOGLE_APPLICATION_CREDENTIALS` | Alternative credentials path (same SA JSON) | unset |
 | `GSC_SITE_URL` | GSC property (`sc-domain:example.com` or `https://www.example.com/`) | unset |
 | `GSC_CREDENTIALS_PATH` | SA credentials for GSC (falls back to `GOOGLE_DOCS_CREDENTIALS_PATH`) | unset |
+| `DATAFORSEO_MAX_TASKS_PER_REQUEST` | Max tasks per DataForSEO `task_post` batch | `100` |
+| `DATAFORSEO_TASKS_PER_MINUTE` | Shared per-process rate limit for DataForSEO task creation | `100` |
 
 ## Execution Profiles
 
@@ -175,8 +211,15 @@ seo-agent-orchestrator/
 │   ├── memory_service.py     # Four-layer prompt composition
 │   ├── runtime_profiles.py   # ExecutionProfile registry (incl. campaign profiles)
 │   ├── orchestrator.py       # Multi-agent dispatch loop; DAG resolution; retry
+│   ├── db.py                 # SQLAlchemy engine, models, and API schemas
+│   ├── prompts.py            # Workflow prompts per execution type
+│   ├── feedback_loop.py      # Change-log/learnings persistence
 │   ├── api/
-│   │   └── main.py           # FastAPI Kanban server + all endpoints
+│   │   ├── main.py           # FastAPI app assembly (CORS, token, rate limits, lifespan)
+│   │   ├── helpers.py        # Shared run/comment/autopilot helpers
+│   │   ├── rate_limit.py     # slowapi limiter for cost-triggering endpoints
+│   │   ├── routers/          # tasks, comments, runs, automation routers
+│   │   └── static/           # kanban.html board
 │   ├── webflow/              # Webflow CMS MCP integration
 │   ├── google_docs/          # Google Docs MCP integration
 │   └── gsc/                  # Google Search Console MCP integration (read-only)
@@ -185,7 +228,7 @@ seo-agent-orchestrator/
 │   ├── seo-strategy.md       # Strategy (committed as a template)
 │   ├── seo-context.md        # Auto-updated after each run
 │   └── seo-tasks.md          # Auto-generated from audits
-├── skills/                   # SEO skills (.skill ZIP archives)
+├── skills/                   # SEO skills (unpacked <name>/SKILL.md dirs)
 ├── .claude/
 │   └── seo-learnings.md      # Auto-extracted ranking learnings
 ├── tests/                    # pytest test suite
@@ -252,7 +295,7 @@ Two workers writing at the same time will fight. I used SQLite because there are
 `asyncio.gather` runs them on the same thread, and SQLite only allows one writer at a time anyway. But the actual bottleneck is the Claude API call, which takes seconds to minutes. The DB write takes microseconds. So the parallelism still delivers real time savings. With Postgres and async SQLAlchemy each phase gets its own connection and you get the full benefit.
 
 **4. If an agent skips the summary block, the next agent gets raw truncated output.**
-I ask each agent to write a `## Summary for Next Phase` block at the end of its output so the next agent gets a clean handoff. If it doesn't, I fall back to taking the first 1500 chars. That fallback is silent — the pipeline doesn't know the handoff was degraded. The fix would be a validator that rejects the output and retries with a correction prompt. I skipped it because it costs extra turns. Good enough for now.
+Phases with downstream dependents must end with a `## Summary for Next Phase` block. If it's missing, the orchestrator retries once with a correction prompt asking for the block (only for phases that have dependents, so final phases cost nothing extra). If it's still missing, the campaign continues with the 1500-char truncation fallback, but records `handoff_degraded` in the orchestration state and posts a warning comment on the task — the pipeline now knows the handoff was degraded.
 
 **5. Unknown SDK result types get logged but not alerted.**
 If the SDK ships a new event type we don't handle, we log a warning and wrap it gracefully — nothing crashes. But in production that warning would be invisible. Wire the logger to Sentry or Datadog if you care about SDK contract changes.

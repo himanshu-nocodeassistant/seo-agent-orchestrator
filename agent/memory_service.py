@@ -80,6 +80,7 @@ class SemanticContext:
     strategy: str
     learnings: str
     context_view: str
+    measurements: str = ""
 
 
 @dataclass
@@ -141,6 +142,9 @@ class ComposedPromptContext:
         )
         if self.semantic.context_view:
             sections.append(f"Current Context View: {self.semantic.context_view}")
+        if self.semantic.measurements:
+            sections.extend(["", "## Measured Data (DataForSEO)"])
+            sections.append(self.semantic.measurements)
 
         procedural_lines = [
             "",
@@ -213,7 +217,15 @@ def fetch_episodic_context(db, task_id: Optional[int], execution_type: str, limi
     return EpisodicContext(task_id=task_id, execution_type=execution_type, items=items)
 
 
-def fetch_semantic_context(task, execution_type: str, cwd: str, char_limit: int) -> SemanticContext:
+def fetch_semantic_context(
+    task, execution_type: str, cwd: str, char_limit: int, profile=None
+) -> SemanticContext:
+    """Build the semantic memory layer for a run.
+
+    ``profile`` is optional; when present and tagged ``dataforseo-measurements``,
+    the newest DataForSEO compiled rollups are injected so the agent grounds
+    claims in measured SERP/keyword/backlink data instead of guessing.
+    """
     root = Path(cwd)
     hints = [
         execution_type or "",
@@ -224,11 +236,22 @@ def fetch_semantic_context(task, execution_type: str, cwd: str, char_limit: int)
     strategy = _extract_relevant_lines(_read_text(root / SEMANTIC_FILES["strategy"]), hints, char_limit)
     learnings = _extract_relevant_lines(_read_text(root / SEMANTIC_FILES["learnings_view"]), hints, char_limit)
     context_view = _extract_relevant_lines(_read_text(root / SEMANTIC_FILES["context_view"]), hints, min(1200, char_limit))
+
+    measurements = ""
+    if profile and "dataforseo-measurements" in profile.procedural_tags:
+        try:
+            from agent.dataforseo.memory import load_measurement_snapshot
+
+            measurements = load_measurement_snapshot(cwd, char_limit=min(2000, char_limit))
+        except Exception:  # noqa: BLE001 - measurement layer must never break a run
+            measurements = ""
+
     return SemanticContext(
         project_overview=project_overview,
         strategy=strategy,
         learnings=learnings,
         context_view=context_view,
+        measurements=measurements,
     )
 
 

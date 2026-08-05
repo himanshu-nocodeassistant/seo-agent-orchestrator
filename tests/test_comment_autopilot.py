@@ -40,12 +40,29 @@ class TestCommentAutopilotAPI:
     def _agent_patches(self, result=None, error=None):
         config_patch = patch(
             "agent.config.AgentConfig.from_env",
-            return_value=SimpleNamespace(cwd="", setting_sources=[], system_prompt=""),
+            return_value=SimpleNamespace(
+                cwd="",
+                setting_sources=[],
+                system_prompt="",
+                permission_mode="acceptEdits",
+                allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Skill"],
+                model="sonnet",
+                max_turns=None,
+                max_budget_usd=None,
+                mcp_servers={},
+                hooks=None,
+            ),
         )
         if error is not None:
-            run_patch = patch("agent.seo_agent.SEOAgent.create_and_run", new=AsyncMock(side_effect=error))
+            run_patch = patch(
+                "agent.seo_agent.SEOAgent.create_and_run_result",
+                new=AsyncMock(side_effect=error),
+            )
         else:
-            run_patch = patch("agent.seo_agent.SEOAgent.create_and_run", new=AsyncMock(return_value=result))
+            run_patch = patch(
+                "agent.seo_agent.SEOAgent.create_and_run_result",
+                new=AsyncMock(return_value=SimpleNamespace(result_text=result, session_id=None)),
+            )
         return config_patch, run_patch
 
     def test_process_one_ignores_non_trigger_comments(self, client):
@@ -62,7 +79,7 @@ class TestCommentAutopilotAPI:
             json={
                 "title": "Blog draft",
                 "description": "Write draft",
-                "execution_type": "blog_write",
+                "execution_type": "manual",
                 "status": "completed",
             },
         ).json()
@@ -142,11 +159,27 @@ class TestCommentAutopilotAPI:
 
         config_patch = patch(
             "agent.config.AgentConfig.from_env",
-            return_value=SimpleNamespace(cwd="", setting_sources=[], system_prompt=""),
+            return_value=SimpleNamespace(
+                cwd="",
+                setting_sources=[],
+                system_prompt="",
+                permission_mode="acceptEdits",
+                allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Skill"],
+                model="sonnet",
+                max_turns=None,
+                max_budget_usd=None,
+                mcp_servers={},
+                hooks=None,
+            ),
         )
         run_patch = patch(
-            "agent.seo_agent.SEOAgent.create_and_run",
-            new=AsyncMock(side_effect=["Result 1", "Result 2"]),
+            "agent.seo_agent.SEOAgent.create_and_run_result",
+            new=AsyncMock(
+                side_effect=[
+                    SimpleNamespace(result_text="Result 1", session_id=None),
+                    SimpleNamespace(result_text="Result 2", session_id=None),
+                ]
+            ),
         )
 
         with config_patch, run_patch:
@@ -169,9 +202,23 @@ class TestStaleCommentSkip:
     def _agent_patches(self, result="done"):
         config_patch = patch(
             "agent.config.AgentConfig.from_env",
-            return_value=SimpleNamespace(cwd="", setting_sources=[], system_prompt=""),
+            return_value=SimpleNamespace(
+                cwd="",
+                setting_sources=[],
+                system_prompt="",
+                permission_mode="acceptEdits",
+                allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Skill"],
+                model="sonnet",
+                max_turns=None,
+                max_budget_usd=None,
+                mcp_servers={},
+                hooks=None,
+            ),
         )
-        run_patch = patch("agent.seo_agent.SEOAgent.create_and_run", new=AsyncMock(return_value=result))
+        run_patch = patch(
+            "agent.seo_agent.SEOAgent.create_and_run_result",
+            new=AsyncMock(return_value=SimpleNamespace(result_text=result, session_id=None)),
+        )
         return config_patch, run_patch
 
     def test_autopilot_skips_comment_if_task_executed_after_comment(self, client):

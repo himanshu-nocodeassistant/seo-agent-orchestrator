@@ -78,6 +78,11 @@ def _make_exec_result(text: str, session_id: str = "sess-1"):
     return r
 
 
+def _with_summary(text: str, summary: str) -> str:
+    """Append a structured handoff block (inter-agent protocol)."""
+    return f"{text}\n## Summary for Next Phase\n{summary}\n## End Summary"
+
+
 @pytest.fixture
 def mock_run_agent_prompt():
     """
@@ -86,13 +91,20 @@ def mock_run_agent_prompt():
     """
     results = [
         _make_exec_result(PLAN_OUTPUT, "s0"),
-        _make_exec_result("Research complete: found 10 keywords. Source: https://ahrefs.com/keywords?q=no-code", "s1"),
-        _make_exec_result(WRITER_OUTPUT, "s2"),
-        _make_exec_result(
+        _make_exec_result(_with_summary(
+            "Research complete: found 10 keywords. Source: https://ahrefs.com/keywords?q=no-code",
+            "Top keywords: no-code automation, internal tools.",
+        ), "s1"),
+        _make_exec_result(_with_summary(
+            WRITER_OUTPUT,
+            "Draft is ready to publish.",
+        ), "s2"),
+        _make_exec_result(_with_summary(
             "Published item 123.\n<!-- CHANGE_LOG\n"
             '{"url": "https://example.com/no-code-automation-guide", "field": "publish", "before": null, "after": "published"}\n'
-            "-->", "s3"
-        ),
+            "-->",
+            "Item is live.",
+        ), "s3"),
         _make_exec_result("Analysis complete. No ranking data yet.", "s4"),
     ]
     call_index = {"n": 0}
@@ -102,7 +114,7 @@ def mock_run_agent_prompt():
         call_index["n"] += 1
         return results[idx]
 
-    with patch("agent.api.main._run_agent_prompt", side_effect=_side_effect):
+    with patch("agent.api.helpers._run_agent_prompt", side_effect=_side_effect):
         yield
 
 
@@ -117,10 +129,13 @@ def mock_run_agent_prompt_writer_fails():
         if idx == 0:
             return _make_exec_result(PLAN_OUTPUT, "s0")
         if idx == 1:
-            return _make_exec_result("Research complete. Top keyword: no-code automation. Source: https://ahrefs.com/kw", "s1")
+            return _make_exec_result(_with_summary(
+                "Research complete. Top keyword: no-code automation. Source: https://ahrefs.com/kw",
+                "Top keyword: no-code automation.",
+            ), "s1")
         raise RuntimeError("Writer agent timed out")
 
-    with patch("agent.api.main._run_agent_prompt", side_effect=_side_effect):
+    with patch("agent.api.helpers._run_agent_prompt", side_effect=_side_effect):
         yield
 
 
@@ -343,7 +358,7 @@ class TestAPIRouting:
         })
         task_id = resp.json()["id"]
 
-        with patch("agent.api.main._run_agent_prompt") as mock:
+        with patch("agent.api.helpers._run_agent_prompt") as mock:
             mock.return_value = AsyncMock(return_value=_make_exec_result("Research done."))()
             exec_resp = client.post(f"/tasks/{task_id}/execute")
         assert exec_resp.status_code == 200
@@ -667,8 +682,14 @@ def mock_parallel_agent_prompt():
     )
     results = [
         _make_exec_result(PARALLEL_PLAN_OUTPUT, "s0"),    # orchestrator plan
-        _make_exec_result("Keyword research done. Top keyword: no-code tools. Source: https://ahrefs.com/kw", "s1"),  # keyword_researcher
-        _make_exec_result("Competitor analysis done. Top keyword: workflow automation. Source: https://semrush.com/kw", "s2"),  # competitor_researcher
+        _make_exec_result(_with_summary(
+            "Keyword research done. Top keyword: no-code tools. Source: https://ahrefs.com/kw",
+            "Keywords: no-code tools.",
+        ), "s1"),  # keyword_researcher
+        _make_exec_result(_with_summary(
+            "Competitor analysis done. Top keyword: workflow automation. Source: https://semrush.com/kw",
+            "Competitors: workflow automation tools.",
+        ), "s2"),  # competitor_researcher
         _make_exec_result(WRITER_OUT, "s3"),               # content_writer
     ]
     call_index = {"n": 0}
@@ -681,7 +702,7 @@ def mock_parallel_agent_prompt():
             call_index["n"] += 1
         return results[idx]
 
-    with patch("agent.api.main._run_agent_prompt", side_effect=_side_effect):
+    with patch("agent.api.helpers._run_agent_prompt", side_effect=_side_effect):
         yield
 
 
@@ -739,7 +760,10 @@ class TestParallelOrchestration:
             if idx == 0:
                 return _make_exec_result(PARALLEL_PLAN_OUTPUT, "s0")
             if idx == 1:
-                return _make_exec_result("Keyword research done. Top keyword: no-code. Source: https://ahrefs.com/kw", "s1")
+                return _make_exec_result(_with_summary(
+                    "Keyword research done. Top keyword: no-code. Source: https://ahrefs.com/kw",
+                    "Keywords: no-code.",
+                ), "s1")
             raise RuntimeError("Competitor agent failed")
 
         db = main_module.get_db_session()
@@ -760,7 +784,7 @@ class TestParallelOrchestration:
             orch_run = main_module._create_run(
                 db, parent_task, "manual_execute", "orchestrate_seo_campaign"
             )
-            with patch("agent.api.main._run_agent_prompt", side_effect=_side_effect):
+            with patch("agent.api.helpers._run_agent_prompt", side_effect=_side_effect):
                 await run_campaign_orchestration(db, parent_task, orch_run)
 
             db.refresh(orch_run)
@@ -874,7 +898,7 @@ class TestSDKResultHardening:
         import logging
 
         unknown = {"type": "unexpected_sdk_event", "data": "something"}
-        with patch("agent.api.main.logger") as mock_logger:
+        with patch("agent.api.helpers.logger") as mock_logger:
             result = _normalize_execution_result(unknown)
         mock_logger.warning.assert_called_once()
         warning_msg = mock_logger.warning.call_args[0][0]
@@ -887,3 +911,408 @@ class TestSDKResultHardening:
 
         result = _normalize_execution_result(None)
         assert result.result_text == "" or result.result_text is None
+
+
+# ============================================================================
+# APPROVAL RESUME
+# ============================================================================
+
+
+class TestApprovalResume:
+    @pytest.mark.asyncio
+    async def test_resume_after_approval_completes_campaign(self, mock_run_agent_prompt):
+        """
+        First call pauses at the publisher approval gate. After approved_at is
+        set, resume=True finishes the campaign on the same orchestrator run
+        without re-running the plan agent.
+        """
+        import agent.api.main as main_module
+        from agent.orchestrator import run_campaign_orchestration
+
+        db = main_module.get_db_session()
+        try:
+            now = main_module.datetime.utcnow().isoformat()
+            parent_task = main_module.TaskModel(
+                title="Campaign: Resume After Approval",
+                description="Improve blog SEO for Q3",
+                execution_type="orchestrate_seo_campaign",
+                status="in_progress",
+                approved_at=None,  # not approved yet
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(parent_task)
+            db.commit()
+            db.refresh(parent_task)
+
+            orch_run = main_module._create_run(
+                db, parent_task, "manual_execute", "orchestrate_seo_campaign"
+            )
+
+            # First call pauses before campaign_publisher
+            await run_campaign_orchestration(db, parent_task, orch_run)
+            state = db.query(main_module.OrchestrationStateModel).filter(
+                main_module.OrchestrationStateModel.orchestrator_run_id
+                == orch_run.run_id
+            ).first()
+            assert state.status == "awaiting_approval"
+
+            # Approve + resume
+            parent_task.approved_at = main_module.datetime.utcnow().isoformat()
+            db.commit()
+            await run_campaign_orchestration(
+                db, parent_task, orch_run, resume=True
+            )
+
+            db.refresh(orch_run)
+            db.refresh(parent_task)
+            db.refresh(state)
+            assert orch_run.status == "completed"
+            assert state.status == "completed"
+
+            phase_outputs = json.loads(state.phase_outputs_json)
+            assert set(phase_outputs.keys()) == {
+                "researcher", "content_writer", "publisher", "analyst",
+            }
+            # Same run — no new orchestrator run was created
+            runs = db.query(main_module.AgentRunModel).filter(
+                main_module.AgentRunModel.task_id == parent_task.id,
+                main_module.AgentRunModel.execution_type
+                == "orchestrate_seo_campaign",
+            ).all()
+            assert len(runs) == 1
+        finally:
+            db.close()
+
+    @pytest.mark.asyncio
+    async def test_resume_without_paused_state_raises(self):
+        """Resume on a run with no awaiting_approval state raises cleanly."""
+        import agent.api.main as main_module
+        from agent.orchestrator import run_campaign_orchestration
+
+        db = main_module.get_db_session()
+        try:
+            now = main_module.datetime.utcnow().isoformat()
+            parent_task = main_module.TaskModel(
+                title="Campaign: No Pause",
+                description="x",
+                execution_type="orchestrate_seo_campaign",
+                status="in_progress",
+                approved_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(parent_task)
+            db.commit()
+            db.refresh(parent_task)
+            orch_run = main_module._create_run(
+                db, parent_task, "manual_execute", "orchestrate_seo_campaign"
+            )
+
+            with pytest.raises(RuntimeError, match="no campaign paused"):
+                await run_campaign_orchestration(
+                    db, parent_task, orch_run, resume=True
+                )
+        finally:
+            db.close()
+
+    @pytest.mark.asyncio
+    async def test_resume_requires_approval(self):
+        """Resume while approved_at is still unset raises."""
+        import agent.api.main as main_module
+        from agent.orchestrator import run_campaign_orchestration
+
+        db = main_module.get_db_session()
+        try:
+            now = main_module.datetime.utcnow().isoformat()
+            parent_task = main_module.TaskModel(
+                title="Campaign: Awaiting Approval",
+                description="x",
+                execution_type="orchestrate_seo_campaign",
+                status="in_progress",
+                approved_at=None,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(parent_task)
+            db.commit()
+            db.refresh(parent_task)
+            orch_run = main_module._create_run(
+                db, parent_task, "manual_execute", "orchestrate_seo_campaign"
+            )
+            db.add(main_module.OrchestrationStateModel(
+                orchestrator_run_id=orch_run.run_id,
+                campaign_goal="x",
+                plan_json="{}",
+                status="awaiting_approval",
+                created_at=now,
+                updated_at=now,
+            ))
+            db.commit()
+
+            with pytest.raises(RuntimeError, match="not been approved"):
+                await run_campaign_orchestration(
+                    db, parent_task, orch_run, resume=True
+                )
+        finally:
+            db.close()
+
+
+# ============================================================================
+# HANDOFF VALIDATION + PLAN VALIDATION
+# ============================================================================
+
+
+RESUME_PLAN_JSON = {
+    "campaign_goal": "Handoff test",
+    "phases": [
+        {
+            "phase": "researcher",
+            "task_title": "Research: Handoff",
+            "task_description": "Research keywords.",
+            "execution_type": "campaign_researcher",
+            "depends_on": [],
+        },
+        {
+            "phase": "content_writer",
+            "task_title": "Write: Handoff post",
+            "task_description": "Write the post.",
+            "execution_type": "campaign_draft_writer",
+            "depends_on": ["researcher"],
+        },
+    ],
+}
+
+RESUME_PLAN_OUTPUT = f"Plan:\n```json\n{json.dumps(RESUME_PLAN_JSON, indent=2)}\n```"
+
+
+class TestHandoffRetry:
+    @pytest.mark.asyncio
+    async def test_missing_summary_triggers_one_correction_retry(self):
+        """
+        Researcher (has dependents) omits the summary block; the orchestrator
+        retries once with a correction prompt and the campaign completes.
+        """
+        import agent.api.main as main_module
+        from agent.orchestrator import run_campaign_orchestration
+
+        prompts_seen = []
+        results = [
+            _make_exec_result(RESUME_PLAN_OUTPUT, "s0"),
+            _make_exec_result(
+                "Research done. Top keyword: no-code. Source: https://ahrefs.com/kw",
+                "s1",
+            ),
+            _make_exec_result(_with_summary(
+                "Research done (fixed). Top keyword: no-code. Source: https://ahrefs.com/kw",
+                "Keywords: no-code.",
+            ), "s1b"),
+            _make_exec_result(
+                "Title: Handoff post\nURL slug: handoff-post\nWord count: 1200\n"
+                "Webflow status: manual-only",
+                "s2",
+            ),
+        ]
+        call_index = {"n": 0}
+
+        async def _side_effect(*args, **kwargs):
+            prompts_seen.append(args[0])
+            idx = call_index["n"]
+            call_index["n"] += 1
+            return results[idx]
+
+        db = main_module.get_db_session()
+        try:
+            now = main_module.datetime.utcnow().isoformat()
+            parent_task = main_module.TaskModel(
+                title="Campaign: Handoff Retry",
+                description="x",
+                execution_type="orchestrate_seo_campaign",
+                status="in_progress",
+                approved_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(parent_task)
+            db.commit()
+            db.refresh(parent_task)
+            orch_run = main_module._create_run(
+                db, parent_task, "manual_execute", "orchestrate_seo_campaign"
+            )
+
+            with patch("agent.api.helpers._run_agent_prompt", side_effect=_side_effect):
+                await run_campaign_orchestration(db, parent_task, orch_run)
+
+            db.refresh(orch_run)
+            state = db.query(main_module.OrchestrationStateModel).filter(
+                main_module.OrchestrationStateModel.orchestrator_run_id
+                == orch_run.run_id
+            ).first()
+            assert orch_run.status == "completed"
+            assert state.status == "completed"
+            assert json.loads(state.phase_outputs_json).keys() >= {
+                "researcher", "content_writer",
+            }
+            # Plan + researcher + correction + writer = 4 calls
+            assert call_index["n"] == 4
+            # The correction prompt asked for the handoff block
+            assert "append this block" in prompts_seen[2]
+        finally:
+            db.close()
+
+    @pytest.mark.asyncio
+    async def test_degraded_handoff_recorded_in_state(self):
+        """
+        If the correction retry still omits the summary, the campaign continues
+        with truncation but records handoff_degraded + a warning comment.
+        """
+        import agent.api.main as main_module
+        from agent.orchestrator import run_campaign_orchestration
+
+        results = [
+            _make_exec_result(RESUME_PLAN_OUTPUT, "s0"),
+            _make_exec_result(
+                "Research done. Top keyword: no-code. Source: https://ahrefs.com/kw",
+                "s1",
+            ),
+            _make_exec_result(
+                "Research still missing summary. Top keyword: no-code. Source: https://ahrefs.com/kw",
+                "s1b",
+            ),
+            _make_exec_result(
+                "Title: Handoff post\nURL slug: handoff-post\nWord count: 1200\n"
+                "Webflow status: manual-only",
+                "s2",
+            ),
+        ]
+        call_index = {"n": 0}
+
+        async def _side_effect(*args, **kwargs):
+            idx = call_index["n"]
+            call_index["n"] += 1
+            return results[idx]
+
+        db = main_module.get_db_session()
+        try:
+            now = main_module.datetime.utcnow().isoformat()
+            parent_task = main_module.TaskModel(
+                title="Campaign: Degraded Handoff",
+                description="x",
+                execution_type="orchestrate_seo_campaign",
+                status="in_progress",
+                approved_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(parent_task)
+            db.commit()
+            db.refresh(parent_task)
+            orch_run = main_module._create_run(
+                db, parent_task, "manual_execute", "orchestrate_seo_campaign"
+            )
+
+            with patch("agent.api.helpers._run_agent_prompt", side_effect=_side_effect):
+                await run_campaign_orchestration(db, parent_task, orch_run)
+
+            state = db.query(main_module.OrchestrationStateModel).filter(
+                main_module.OrchestrationStateModel.orchestrator_run_id
+                == orch_run.run_id
+            ).first()
+            assert state.status == "completed"
+            degraded = json.loads(state.handoff_degraded_json or "{}")
+            assert degraded.get("researcher") is True
+
+            comments = db.query(main_module.CommentModel).filter(
+                main_module.CommentModel.task_id == parent_task.id
+            ).all()
+            assert any("truncated handoff" in c.body for c in comments)
+        finally:
+            db.close()
+
+
+class TestPlanValidation:
+    @pytest.mark.asyncio
+    async def test_unknown_phase_execution_type_fails_fast(self):
+        """A plan referencing a nonexistent execution_type fails before any
+        child task is created."""
+        import agent.api.main as main_module
+        from agent.orchestrator import run_campaign_orchestration
+
+        bad_plan = {
+            "campaign_goal": "bad",
+            "phases": [
+                {
+                    "phase": "researcher",
+                    "task_title": "Research",
+                    "task_description": "Research.",
+                    "execution_type": "campaign_researcher",
+                    "depends_on": [],
+                },
+                {
+                    "phase": "mystery",
+                    "task_title": "Mystery phase",
+                    "task_description": "Mystery.",
+                    "execution_type": "not_a_real_profile",
+                    "depends_on": ["researcher"],
+                },
+            ],
+        }
+
+        async def _side_effect(*args, **kwargs):
+            return _make_exec_result(
+                f"Plan:\n```json\n{json.dumps(bad_plan, indent=2)}\n```", "s0"
+            )
+
+        db = main_module.get_db_session()
+        try:
+            now = main_module.datetime.utcnow().isoformat()
+            parent_task = main_module.TaskModel(
+                title="Campaign: Bad Plan",
+                description="x",
+                execution_type="orchestrate_seo_campaign",
+                status="in_progress",
+                approved_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(parent_task)
+            db.commit()
+            db.refresh(parent_task)
+            orch_run = main_module._create_run(
+                db, parent_task, "manual_execute", "orchestrate_seo_campaign"
+            )
+
+            with patch("agent.api.helpers._run_agent_prompt", side_effect=_side_effect):
+                await run_campaign_orchestration(db, parent_task, orch_run)
+
+            db.refresh(orch_run)
+            assert orch_run.status in ("failed", "blocked")
+            assert orch_run.error and "not_a_real_profile" in orch_run.error
+            # No child tasks were created
+            child_count = db.query(main_module.TaskModel).filter(
+                main_module.TaskModel.parent_task_id == parent_task.id
+            ).count()
+            assert child_count == 0
+        finally:
+            db.close()
+
+
+class TestResumeEndpoint:
+    def test_resume_flag_requires_paused_campaign(self, client):
+        """POST /tasks/{id}/execute?resume=true returns 400 when there is no
+        paused campaign."""
+        task = client.post(
+            "/tasks",
+            json={"title": "Campaign", "execution_type": "orchestrate_seo_campaign"},
+        ).json()
+        resp = client.post(f"/tasks/{task['id']}/execute?resume=true")
+        assert resp.status_code == 400
+
+    def test_task_response_exposes_resume_available(self, client):
+        task = client.post(
+            "/tasks",
+            json={"title": "Campaign", "execution_type": "orchestrate_seo_campaign"},
+        ).json()
+        fetched = client.get(f"/tasks/{task['id']}").json()
+        assert "resume_available" in fetched
+        assert fetched["resume_available"] is False

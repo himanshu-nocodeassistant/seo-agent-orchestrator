@@ -53,10 +53,21 @@ class TestUserCommentsInPrompt:
 
         config_patch = patch(
             "agent.config.AgentConfig.from_env",
-            return_value=SimpleNamespace(cwd="", setting_sources=[], system_prompt=""),
+            return_value=SimpleNamespace(
+                cwd="",
+                setting_sources=[],
+                system_prompt="",
+                permission_mode="acceptEdits",
+                allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Skill"],
+                model="sonnet",
+                max_turns=None,
+                max_budget_usd=None,
+                mcp_servers={},
+                hooks=None,
+            ),
         )
-        run_mock = AsyncMock(return_value="done")
-        run_patch = patch("agent.seo_agent.SEOAgent.create_and_run", new=run_mock)
+        run_mock = AsyncMock(return_value=SimpleNamespace(result_text="done", session_id=None))
+        run_patch = patch("agent.seo_agent.SEOAgent.create_and_run_result", new=run_mock)
         with config_patch, run_patch:
             client.post(f"/tasks/{task['id']}/execute")
 
