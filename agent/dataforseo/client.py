@@ -1,6 +1,8 @@
 import json
 import os
+import random
 import sys
+import threading
 import time
 from dotenv import load_dotenv
 import requests
@@ -22,6 +24,50 @@ TASK_NOT_READY_STATUSES = (40601, 40602)
 RETRYABLE_HTTP_STATUSES = (429, 502, 503, 504)
 MAX_RETRIES = 5
 RETRY_BACKOFF_BASE = 2.0
+
+
+def _jittered_backoff(attempt: int) -> float:
+    """Full-jitter exponential backoff, capped at 30s."""
+    cap = min(RETRY_BACKOFF_BASE * (2 ** attempt), 30.0)
+    return random.uniform(0, cap)
+
+
+class _TokenBucket:
+    """Thread-safe token bucket used to rate-limit DataForSEO task creation."""
+
+    def __init__(self, rate_per_minute: float):
+        self.capacity = max(1.0, float(rate_per_minute))
+        self.tokens = self.capacity
+        self.rate = self.capacity / 60.0
+        self.updated_at = time.monotonic()
+        self._lock = threading.Lock()
+
+    def consume(self, tokens: float = 1.0) -> None:
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                self.tokens = min(
+                    self.capacity,
+                    self.tokens + (now - self.updated_at) * self.rate,
+                )
+                self.updated_at = now
+                if self.tokens >= tokens:
+                    self.tokens -= tokens
+                    return
+                wait = (tokens - self.tokens) / self.rate if self.rate > 0 else 60.0
+            time.sleep(min(wait, 1.0))
+
+
+_TASK_BUCKET = None
+
+
+def _get_task_bucket() -> _TokenBucket:
+    """Shared token bucket across all client instances (per-process)."""
+    global _TASK_BUCKET
+    if _TASK_BUCKET is None:
+        rate = float(os.environ.get("DATAFORSEO_TASKS_PER_MINUTE", "100"))
+        _TASK_BUCKET = _TokenBucket(rate)
+    return _TASK_BUCKET
 
 
 class DataForSEOError(Exception):
@@ -72,9 +118,17 @@ class DataForSEOClient:
                     f"{response.status_code} {response.reason}", response=response
                 )
 
+                retry_after = response.headers.get("Retry-After")
+                if retry_after and attempt < MAX_RETRIES - 1:
+                    try:
+                        delay = float(retry_after)
+                    except (ValueError, TypeError):
+                        delay = _jittered_backoff(attempt)
+                    time.sleep(delay)
+                    continue
+
             if attempt < MAX_RETRIES - 1:
-                backoff = RETRY_BACKOFF_BASE * (2 ** attempt)
-                time.sleep(backoff)
+                time.sleep(_jittered_backoff(attempt))
 
         raise last_exc
 
@@ -116,19 +170,35 @@ class DataForSEOClient:
         Writes a manifest file immediately after tasks are created, so that
         IDs survive a crash anywhere downstream (polling errors, process
         kill, etc.) without needing to re-submit and re-bill the tasks.
+
+        Payloads are chunked into batches of at most
+        ``DATAFORSEO_MAX_TASKS_PER_REQUEST`` (default 100 — DataForSEO's
+        per-request cap) and every task consumes a token from the shared
+        per-process rate limiter (``DATAFORSEO_TASKS_PER_MINUTE``, default
+        100). One manifest covering all chunks is written at the end.
         """
-        data = self._post(endpoint, payload)
+        if not payload:
+            return []
+        batch_size = max(
+            1, int(os.environ.get("DATAFORSEO_MAX_TASKS_PER_REQUEST", "100"))
+        )
         task_ids = []
-        for task in data.get("tasks", []):
-            task_status = task.get("status_code")
-            if task_status == TASK_CREATED_STATUS:
-                task_ids.append(task["id"])
-            else:
-                raise DataForSEOError(
-                    task_status,
-                    task.get("status_message", "Task creation failed"),
-                )
-        self._write_manifest(endpoint, payload, task_ids)
+        request_payloads = []
+        for start in range(0, len(payload), batch_size):
+            chunk = payload[start:start + batch_size]
+            _get_task_bucket().consume(len(chunk))
+            data = self._post(endpoint, chunk)
+            for task, req in zip(data.get("tasks", []), chunk):
+                task_status = task.get("status_code")
+                if task_status == TASK_CREATED_STATUS:
+                    task_ids.append(task["id"])
+                    request_payloads.append(req)
+                else:
+                    raise DataForSEOError(
+                        task_status,
+                        task.get("status_message", "Task creation failed"),
+                    )
+        self._write_manifest(endpoint, request_payloads, task_ids)
         return task_ids
 
     @staticmethod
@@ -136,7 +206,8 @@ class DataForSEOClient:
         """Persist {task_id: request_task} to logs/task_manifests/ so a crash
         during polling can resume from disk instead of losing the IDs."""
         os.makedirs(MANIFEST_DIR, exist_ok=True)
-        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        # Microsecond timestamp so concurrent pipeline runs never collide.
+        timestamp = time.strftime("%Y%m%d-%H%M%S-%f")
         safe_endpoint = endpoint.strip("/").replace("/", "_")
         manifest_path = os.path.join(MANIFEST_DIR, f"{timestamp}_{safe_endpoint}.json")
         manifest = {
@@ -147,8 +218,10 @@ class DataForSEOClient:
                 for task_id, req in zip(task_ids, payload)
             ],
         }
-        with open(manifest_path, "w") as f:
+        tmp_path = manifest_path + ".tmp"
+        with open(tmp_path, "w") as f:
             json.dump(manifest, f, indent=2)
+        os.replace(tmp_path, manifest_path)
         return manifest_path
 
     def _task_get(self, endpoint: str, task_id: str) -> dict:
@@ -194,11 +267,19 @@ class DataForSEOClient:
 
         all_results = []
         skipped = []
-        for task_id in task_ids:
-            elapsed = 0.0
-            while elapsed < max_wait:
-                time.sleep(poll_interval)
-                elapsed += poll_interval
+        pending = list(task_ids)
+        # Global deadline across all tasks: one round polls every still-pending
+        # task, so a batch of N tasks takes O(max_wait) worst case instead of
+        # O(N × max_wait).
+        deadline = time.monotonic() + max_wait
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                skipped.extend(pending)
+                break
+            time.sleep(min(poll_interval, remaining))
+            still_pending = []
+            for task_id in pending:
                 try:
                     data = self._task_get(get_endpoint, task_id)
                     tasks = data.get("tasks", [])
@@ -208,11 +289,9 @@ class DataForSEOClient:
                         # Remove earlier not-ready snapshots for this keyword/location;
                         # they have no value once the final result is on disk.
                         purge_stale_poll_logs(tasks[0])
-                    break
                 except TaskNotReadyError:
-                    continue
-            else:
-                skipped.append(task_id)
+                    still_pending.append(task_id)
+            pending = still_pending
 
         if skipped:
             print(

@@ -1,0 +1,18 @@
+{
+  "serp": [
+    {
+      "keyword": "example keyword",
+      "location_code": 2840,
+      "language_code": "en",
+      "tag": "monthly-refresh"
+    }
+  ],
+  "keyword_volume": [
+    {
+      "keywords": ["example keyword", "another keyword"],
+      "location_code": 2840,
+      "language_code": "en",
+      "tag": "monthly-refresh"
+    }
+  ]
+}

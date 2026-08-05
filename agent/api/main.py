@@ -2277,7 +2277,10 @@ Rules:
 def _resolve_prompt_context(db, run, task, comments, workflow_prompt, profile):
     short_term = build_short_term_context(run, task, comments)
     episodic = fetch_episodic_context(db, task.id if task else None, run.execution_type or "manual", profile.episodic_limit)
-    semantic = fetch_semantic_context(task, run.execution_type or "manual", _project_root(), profile.semantic_char_limit)
+    semantic = fetch_semantic_context(
+        task, run.execution_type or "manual", _project_root(),
+        profile.semantic_char_limit, profile=profile,
+    )
     procedural = fetch_procedural_context(run.execution_type or "manual", workflow_prompt, profile)
     return compose_prompt_context(short_term, episodic, semantic, procedural)
 
