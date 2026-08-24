@@ -29,6 +29,7 @@ from agent.api.helpers import (
     _autopilot_interval_seconds,
     comment_autopilot_lock,
     process_one_comment_action,
+    recover_stale_runs,
 )
 from agent.api.rate_limit import _rate_limit_value, limiter
 from agent.api.routers import automation, comments, runs, tasks
@@ -89,6 +90,14 @@ async def _comment_autopilot_loop():
 async def _lifespan(app: FastAPI):
     """Start/stop the comment autopilot and apply one-off DB migrations."""
     _ensure_orchestration_handoff_column()
+    db = db_module.get_db_session()
+    try:
+        try:
+            recover_stale_runs(db)
+        except Exception:
+            logger.exception("Could not recover stale runs during startup")
+    finally:
+        db.close()
     task = None
     if _autopilot_enabled():
         task = asyncio.create_task(_comment_autopilot_loop())

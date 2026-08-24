@@ -260,7 +260,9 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
             prompt_context = _resolve_prompt_context(db, run, task, task_comments, workflow_prompt, profile)
             run.prompt_text = workflow_prompt
             _mark_run_started(db, run, prompt_context, profile.execution_type, resume_session_id)
-            config = _build_runtime_config(profile, resume_session_id)
+            config = _build_runtime_config(
+                profile, resume_session_id, db=db, run_id=run.run_id
+            )
             execution = _normalize_execution_result(
                 await helpers_module._run_agent_prompt(
                     workflow_prompt, config, prompt_context

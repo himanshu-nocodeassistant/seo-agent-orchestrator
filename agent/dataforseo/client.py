@@ -212,6 +212,14 @@ class DataForSEOClient:
                     task_ids.append(task["id"])
                     request_payloads.append(req)
                 else:
+                    if task_ids:
+                        manifest_path = self._write_manifest(
+                            endpoint,
+                            request_payloads,
+                            task_ids,
+                            manifest_path=manifest_path,
+                        )
+                        self._last_manifest_path = manifest_path
                     raise DataForSEOError(
                         task_status,
                         task.get("status_message", "Task creation failed"),
@@ -222,6 +230,7 @@ class DataForSEOClient:
                 task_ids,
                 manifest_path=manifest_path,
             )
+            self._last_manifest_path = manifest_path
         self._last_manifest_path = manifest_path
         return task_ids
 

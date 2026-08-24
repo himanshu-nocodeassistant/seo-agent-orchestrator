@@ -5,7 +5,7 @@ Extracted from the former agent/api/main.py monolith (see git history).
 
 import json
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 
 from agent.api import helpers as helpers_module
 from agent.api.helpers import (
@@ -134,7 +134,11 @@ def get_orchestration_state(orchestrator_run_id: str):
 
 
 @router.post("/runs/{run_id}/seo-audit")
-async def run_seo_audit(run_id: str, payload: SeoAuditRequest = SeoAuditRequest()):
+async def run_seo_audit(
+    request: Request,
+    run_id: str,
+    payload: SeoAuditRequest = SeoAuditRequest(),
+):
     """Run an SEO audit through the standard profile pipeline.
 
     Creates a task + run of type ``seo_audit`` and executes it with the same
@@ -155,7 +159,13 @@ async def run_seo_audit(run_id: str, payload: SeoAuditRequest = SeoAuditRequest(
         )
         db.add(task)
         db.commit()
-        run = _create_run(db, task, "seo_audit", "seo_audit")
+        run = _create_run(
+            db,
+            task,
+            "seo_audit",
+            "seo_audit",
+            request_id=getattr(request.state, "request_id", None),
+        )
         task.status = "in_progress"
         task.updated_at = _utcnow_iso()
         db.commit()

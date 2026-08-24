@@ -392,6 +392,12 @@ def build_post_tool_use_hook(db, run_id: str):
         tool_name = hook_input.get("tool_name", "unknown")
         tool_input = hook_input.get("tool_input", {})
         tool_use_id = hook_input.get("tool_use_id", "")
+        try:
+            run = db.query(AgentRunModel).filter(AgentRunModel.run_id == run_id).first()
+            if run is not None:
+                _heartbeat_run(db, run, session_id, record_event=False)
+        except Exception:
+            logger.exception("Could not refresh run lease for %s", run_id)
         _log_run_event(
             db,
             run_id,
@@ -515,6 +521,7 @@ def _create_run(
         db.add(
             RunEventModel(
                 run_id=run_id,
+                request_id=request_id,
                 event_type="run_created",
                 payload=json.dumps(
                     {
@@ -565,7 +572,13 @@ def _is_write_capable(execution_type: Optional[str]) -> bool:
         return False
 
 
-def _heartbeat_run(db, run, session_id: Optional[str] = None) -> None:
+def _heartbeat_run(
+    db,
+    run,
+    session_id: Optional[str] = None,
+    *,
+    record_event: bool = True,
+) -> None:
     """Refresh a run lease during meaningful work."""
     now = _utcnow_iso()
     run.heartbeat_at = now
@@ -573,14 +586,15 @@ def _heartbeat_run(db, run, session_id: Optional[str] = None) -> None:
     if session_id is not None:
         run.session_id = session_id
     db.commit()
-    _log_run_event(
-        db,
-        run.run_id,
-        "heartbeat",
-        {"lease_expires_at": run.lease_expires_at},
-        session_id=run.session_id,
-        outcome="alive",
-    )
+    if record_event:
+        _log_run_event(
+            db,
+            run.run_id,
+            "heartbeat",
+            {"lease_expires_at": run.lease_expires_at},
+            session_id=run.session_id,
+            outcome="alive",
+        )
 
 
 def _run_is_stale(run, now: Optional[datetime] = None) -> bool:
@@ -932,6 +946,29 @@ async def process_one_comment_action() -> dict:
                     "attempts": action.attempts,
                 }
 
+            active_run = None
+            if task.active_run_id:
+                active_run = (
+                    db.query(AgentRunModel)
+                    .filter(AgentRunModel.run_id == task.active_run_id)
+                    .first()
+                )
+            if active_run is not None and active_run.status in {"queued", "running"}:
+                action.status = "pending"
+                action.attempts = max(0, action.attempts - 1)
+                action.recovery_state = "deferred"
+                action.last_error = "Task already has an active run; comment work deferred."
+                action.updated_at = _utcnow_iso()
+                db.commit()
+                return {
+                    "processed": True,
+                    "task_id": task.id,
+                    "comment_id": comment.id,
+                    "status": action.status,
+                    "attempts": action.attempts,
+                    "max_attempts": action.max_attempts,
+                }
+
             _heartbeat_comment_action(db, action)
             task.status = "in_progress"
             task.updated_at = _utcnow_iso()
@@ -954,7 +991,9 @@ async def process_one_comment_action() -> dict:
                 prompt_context = _resolve_prompt_context(db, run, task, [comment], workflow_prompt, profile)
                 run.prompt_text = workflow_prompt
                 _mark_run_started(db, run, prompt_context, profile.execution_type, resume_session_id)
-                config = _build_runtime_config(profile, resume_session_id)
+                config = _build_runtime_config(
+                    profile, resume_session_id, db=db, run_id=run.run_id
+                )
                 execution = _normalize_execution_result(await _run_agent_prompt(workflow_prompt, config, prompt_context))
                 validation = ValidationResult(
                     status="passed" if execution.result_text and execution.result_text.strip() else "failed",

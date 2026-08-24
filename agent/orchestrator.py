@@ -498,7 +498,9 @@ async def run_campaign_orchestration(
     # ── Fresh run: orchestrator produces plan ────────────────────────────────
     else:
         orch_profile = get_execution_profile("orchestrate_seo_campaign")
-        orch_config = helpers_module._build_runtime_config(orch_profile, None)
+        orch_config = helpers_module._build_runtime_config(
+            orch_profile, None, db=db, run_id=orchestrator_run.run_id
+        )
 
         orch_prompt_context = helpers_module._resolve_prompt_context(
             db, orchestrator_run, parent_task, [], "", orch_profile
@@ -756,8 +758,14 @@ def _create_child_run(db, child_task, parent_run_id: str, execution_type: str):
     from agent.api.main import AgentRunModel, RunEventModel
 
     now = datetime.utcnow().isoformat()
+    parent_run = (
+        db.query(AgentRunModel)
+        .filter(AgentRunModel.run_id == parent_run_id)
+        .first()
+    )
     run = AgentRunModel(
         run_id=str(uuid4()),
+        request_id=parent_run.request_id if parent_run else None,
         task_id=child_task.id,
         parent_run_id=parent_run_id,
         status="queued",
@@ -785,6 +793,7 @@ def _create_child_run(db, child_task, parent_run_id: str, execution_type: str):
 
     db.add(RunEventModel(
         run_id=run.run_id,
+        request_id=run.request_id,
         event_type="run_created",
         payload=json.dumps({"trigger_source": "orchestrator", "parent_run_id": parent_run_id}),
         created_at=now,
