@@ -123,6 +123,10 @@ class CommentActionModel(Base):
     attempts = Column(Integer, nullable=False, default=0)
     max_attempts = Column(Integer, nullable=False, default=2)
     last_error = Column(Text, nullable=True)
+    heartbeat_at = Column(String(20), nullable=True)
+    lease_expires_at = Column(String(20), nullable=True)
+    recovery_state = Column(String(30), nullable=False, default="none")
+    write_capable = Column(Boolean, nullable=False, default=False)
     created_at = Column(String(20), default=lambda: _utcnow_iso())
     updated_at = Column(String(20), default=lambda: _utcnow_iso())
     acted_at = Column(String(20), nullable=True)
@@ -243,6 +247,21 @@ def _ensure_orchestration_handoff_column() -> None:
                 if column not in run_columns:
                     conn.exec_driver_sql(
                         f"ALTER TABLE agent_runs ADD COLUMN {column} {column_type}"
+                    )
+            action_columns = {
+                row[1]
+                for row in conn.exec_driver_sql("PRAGMA table_info(comment_actions)")
+            }
+            action_column_defs = {
+                "heartbeat_at": "VARCHAR(20)",
+                "lease_expires_at": "VARCHAR(20)",
+                "recovery_state": "VARCHAR(30) DEFAULT 'none'",
+                "write_capable": "BOOLEAN DEFAULT 0",
+            }
+            for column, column_type in action_column_defs.items():
+                if column not in action_columns:
+                    conn.exec_driver_sql(
+                        f"ALTER TABLE comment_actions ADD COLUMN {column} {column_type}"
                     )
             event_columns = {
                 row[1]

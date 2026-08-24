@@ -81,7 +81,7 @@ async def _comment_autopilot_loop():
     """Background loop that periodically processes one trigger comment."""
     interval = _autopilot_interval_seconds()
     while True:
-        await process_one_comment_action()
+        await run_comment_autopilot_cycle()
         await asyncio.sleep(interval)
 
 
@@ -222,6 +222,7 @@ from agent.api.helpers import (  # noqa: E402,F401
     extract_agent_comment_instruction,
     is_agent_trigger_comment,
     process_one_comment_action,
+    run_comment_autopilot_cycle,
     _acquire_next_comment_action,
     _agent_execution_timeout_seconds,
     _autopilot_enabled,

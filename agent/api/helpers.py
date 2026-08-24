@@ -600,6 +600,58 @@ def _run_is_stale(run, now: Optional[datetime] = None) -> bool:
         return True
 
 
+def _comment_action_is_stale(action, now: Optional[datetime] = None) -> bool:
+    now = now or datetime.now(timezone.utc).replace(tzinfo=None)
+    expiry = action.lease_expires_at
+    if expiry:
+        try:
+            return datetime.fromisoformat(expiry) <= now
+        except ValueError:
+            pass
+    heartbeat = action.heartbeat_at or action.updated_at
+    if not heartbeat:
+        return True
+    try:
+        return now - datetime.fromisoformat(heartbeat) >= timedelta(seconds=RUN_LEASE_SECONDS)
+    except ValueError:
+        return True
+
+
+def _reclaim_stale_comment_actions(db) -> None:
+    """Move expired comment work back to retry or review state."""
+    stale = db.query(CommentActionModel).filter(CommentActionModel.status == "running").all()
+    changed = False
+    for action in stale:
+        if not _comment_action_is_stale(action):
+            continue
+        task = db.query(TaskModel).filter(TaskModel.id == action.task_id).first()
+        write_capable = bool(action.write_capable) or _is_write_capable(
+            task.execution_type if task else None
+        )
+        action.write_capable = write_capable
+        action.last_error = "Comment action lease expired before completion."
+        if write_capable:
+            action.status = "review_required"
+            action.recovery_state = "review_required"
+        elif action.attempts >= action.max_attempts:
+            action.status = "retry_exhausted"
+            action.recovery_state = "retry_exhausted"
+        else:
+            action.status = "failed"
+            action.recovery_state = "recoverable"
+        action.updated_at = _utcnow_iso()
+        changed = True
+    if changed:
+        db.commit()
+
+
+def _heartbeat_comment_action(db, action) -> None:
+    now = _utcnow_iso()
+    action.heartbeat_at = now
+    action.lease_expires_at = _lease_expires_at(now)
+    db.commit()
+
+
 def recover_stale_runs(db, now: Optional[datetime] = None) -> list[AgentRunModel]:
     """Move expired runs to a safe recovery state after a process restart."""
     stale_runs = []
@@ -643,6 +695,15 @@ def recover_stale_runs(db, now: Optional[datetime] = None) -> list[AgentRunModel
 
 
 reclaim_stale_runs = recover_stale_runs
+
+
+async def run_comment_autopilot_cycle() -> dict:
+    """Run one worker cycle behind an exception boundary."""
+    try:
+        return await process_one_comment_action()
+    except Exception:
+        logger.exception("Comment autopilot cycle failed")
+        return {"processed": False, "reason": "worker_error"}
 
 
 def _finalize_run_success(
@@ -771,8 +832,9 @@ def _normalize_execution_result(execution):
 def _acquire_next_comment_action(db) -> Optional[CommentActionModel]:
     """Find or create the next action candidate and mark it as running."""
     now = _utcnow_iso()
+    _reclaim_stale_comment_actions(db)
 
-    action = (
+    candidate = (
         db.query(CommentActionModel)
         .filter(
             CommentActionModel.status.in_(["pending", "failed"]),
@@ -782,7 +844,7 @@ def _acquire_next_comment_action(db) -> Optional[CommentActionModel]:
         .first()
     )
 
-    if action is None:
+    if candidate is None:
         comments = db.query(CommentModel).order_by(CommentModel.id.asc()).all()
         for comment in comments:
             if not is_agent_trigger_comment(comment.author, comment.body):
@@ -793,7 +855,7 @@ def _acquire_next_comment_action(db) -> Optional[CommentActionModel]:
             if task and task.updated_at and task.updated_at > comment.created_at:
                 continue
 
-            action = CommentActionModel(
+            candidate = CommentActionModel(
                 task_id=comment.task_id,
                 comment_id=comment.id,
                 status="pending",
@@ -802,20 +864,45 @@ def _acquire_next_comment_action(db) -> Optional[CommentActionModel]:
                 created_at=now,
                 updated_at=now,
             )
-            db.add(action)
+            db.add(candidate)
             try:
                 db.commit()
-                db.refresh(action)
+                db.refresh(candidate)
                 break
             except IntegrityError:
                 db.rollback()
-                action = None
+                candidate = None
         else:
             return None
 
-    action.status = "running"
-    action.attempts += 1
-    action.updated_at = now
+    if candidate is None:
+        return None
+    claimed = (
+        db.query(CommentActionModel)
+        .filter(
+            CommentActionModel.id == candidate.id,
+            CommentActionModel.status.in_(["pending", "failed"]),
+            CommentActionModel.attempts < CommentActionModel.max_attempts,
+        )
+        .update(
+            {
+                CommentActionModel.status: "running",
+                CommentActionModel.attempts: CommentActionModel.attempts + 1,
+                CommentActionModel.updated_at: now,
+            },
+            synchronize_session=False,
+        )
+    )
+    if claimed != 1:
+        db.rollback()
+        return None
+    db.commit()
+    action = db.query(CommentActionModel).filter(CommentActionModel.id == candidate.id).one()
+    task = db.query(TaskModel).filter(TaskModel.id == action.task_id).first()
+    action.write_capable = _is_write_capable(task.execution_type if task else None)
+    action.recovery_state = "running"
+    action.heartbeat_at = now
+    action.lease_expires_at = _lease_expires_at(now)
     db.commit()
     db.refresh(action)
     return action
@@ -845,6 +932,7 @@ async def process_one_comment_action() -> dict:
                     "attempts": action.attempts,
                 }
 
+            _heartbeat_comment_action(db, action)
             task.status = "in_progress"
             task.updated_at = _utcnow_iso()
             db.commit()
