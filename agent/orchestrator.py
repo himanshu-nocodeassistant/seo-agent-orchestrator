@@ -615,9 +615,9 @@ async def _run_campaign_orchestration(
         state = db.query(OrchestrationStateModel).filter(
             OrchestrationStateModel.orchestrator_run_id == orchestrator_run.run_id
         ).first()
-        if state is None or state.status not in {"awaiting_approval", "error"}:
+        if state is None or state.status not in {"awaiting_approval", "error", "running"}:
             raise RuntimeError(
-                "Cannot resume: no campaign paused awaiting approval for this run."
+                "Cannot resume: no campaign paused or recoverable saved state for this run."
             )
         if state.status == "awaiting_approval" and not parent_task.approved_at:
             raise RuntimeError("Cannot resume: task has not been approved yet.")

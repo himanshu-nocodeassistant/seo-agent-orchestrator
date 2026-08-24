@@ -1451,6 +1451,93 @@ def test_uncertain_dataforseo_post_is_not_retried_and_is_manifested(tmp_path, mo
     assert manifest["submission_errors"][0]["status"] == "unknown"
 
 
+@pytest.mark.parametrize("failure", [
+    "server_error",
+    "malformed_response",
+])
+def test_uncertain_dataforseo_first_post_failure_is_manifested_without_retry(
+    tmp_path, monkeypatch, failure
+):
+    monkeypatch.setenv("DATAFORSEO_LOGIN", "login")
+    monkeypatch.setenv("DATAFORSEO_PASSWORD", "password")
+    monkeypatch.setattr("agent.dataforseo.client.MANIFEST_DIR", str(tmp_path))
+    client = DataForSEOClient()
+    payload = [{"keyword": failure}]
+
+    if failure == "server_error":
+        response = requests.Response()
+        response.status_code = 503
+        response.reason = "upstream unavailable"
+        request_side_effect = [response]
+    else:
+        response = requests.Response()
+        response.status_code = 200
+        response.json = lambda: (_ for _ in ()).throw(ValueError("invalid JSON"))
+        request_side_effect = [response]
+
+    with patch.object(
+        client.session, "request", side_effect=request_side_effect
+    ) as request:
+        with pytest.raises(DataForSEORecoveryError) as exc_info:
+            client._task_post("serp/google/organic/task_post", payload)
+
+    assert request.call_count == 1
+    assert exc_info.value.task_ids == []
+    manifest_path = next(tmp_path.glob("*.json"))
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["unknown_requests"] == payload
+    assert manifest["submission_errors"][0]["status"] == "unknown"
+
+
+def test_recoverable_read_only_campaign_real_orchestration_resumes_incomplete_phase(
+    client,
+):
+    db = get_db_session()
+    try:
+        task, run = _campaign_task(db)
+        state = db.query(OrchestrationStateModel).filter_by(
+            orchestrator_run_id=run.run_id
+        ).one()
+        state.status = "running"
+        state.plan_json = "```json\n" + json.dumps({"phases": [
+            {
+                "phase": "researcher",
+                "execution_type": "campaign_researcher",
+                "depends_on": [],
+            },
+            {
+                "phase": "analyst",
+                "execution_type": "campaign_analyst",
+                "depends_on": ["researcher"],
+            },
+        ]}) + "\n```"
+        state.phase_outputs_json = json.dumps({"researcher": "saved result"})
+        state.child_run_ids_json = json.dumps(["saved-researcher-child"])
+        run.status = "recoverable"
+        run.recovery_state = "recoverable"
+        task.status = "pending"
+        task.active_run_id = None
+        db.commit()
+        task_id = task.id
+        run_id = run.run_id
+    finally:
+        db.close()
+
+    async def dispatch_only_pending_phase(*args, **kwargs):
+        phase_spec = args[1]
+        return phase_spec["phase"], "analyst result", False
+
+    dispatch = AsyncMock(side_effect=dispatch_only_pending_phase)
+    with patch("agent.orchestrator._dispatch_phase", new=dispatch):
+        response = client.post(f"/tasks/{task_id}/execute")
+
+    assert response.status_code == 200
+    assert response.json()["run_id"] == run_id
+    assert response.json()["status"] == "completed"
+    assert dispatch.call_count == 1
+    assert dispatch.call_args.args[1]["phase"] == "analyst"
+
+
 @pytest.mark.asyncio
 async def test_normal_worker_stops_when_run_ownership_is_lost(client):
     db = get_db_session()

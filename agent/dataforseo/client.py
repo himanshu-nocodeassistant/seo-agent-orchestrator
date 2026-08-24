@@ -241,8 +241,6 @@ class DataForSEOClient:
                     errors=[error],
                 ) from exc
             except Exception as exc:
-                if not task_ids:
-                    raise
                 manifest_path = self._write_manifest(
                     endpoint,
                     request_payloads,
@@ -252,16 +250,17 @@ class DataForSEOClient:
                 self._last_manifest_path = manifest_path
                 error = {
                     "task_id": None,
+                    "status": "unknown",
                     "error": str(exc),
                     "request": chunk,
                 }
                 self._update_manifest_submission_errors(
-                    manifest_path, [error], unsubmitted_requests=chunk
+                    manifest_path, [error], unknown_requests=chunk
                 )
                 raise DataForSEORecoveryError(
                     task_ids,
                     manifest_path,
-                    "Task submission partially failed; recover submitted task IDs from the manifest.",
+                    "Task submission outcome is unknown; do not retry the paid POST automatically.",
                     errors=[error],
                 ) from exc
             tasks = data.get("tasks")
