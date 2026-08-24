@@ -1522,9 +1522,8 @@ async def process_one_comment_action(request_id: Optional[str] = None) -> dict:
                 owns_task = _finalize_run_success(
                     db, run, task, execution.result_text, execution.session_id, validation
                 )
-                _refresh_context_view(db, task_id=task.id)
-
                 if owns_task:
+                    _refresh_context_view(db, task_id=task.id)
                     add_task_comment(
                         db,
                         task.id,
@@ -1566,9 +1565,10 @@ async def process_one_comment_action(request_id: Optional[str] = None) -> dict:
                         "attempts": action.attempts,
                         "max_attempts": action.max_attempts,
                     }
-                _finalize_run_failure(db, run, task, str(e))
-                _refresh_context_view(db, task_id=task.id)
-                add_task_failed_comment(db, task.id, f"Comment #{comment.id}: {str(e)}")
+                owns_task = _finalize_run_failure(db, run, task, str(e))
+                if owns_task:
+                    _refresh_context_view(db, task_id=task.id)
+                    add_task_failed_comment(db, task.id, f"Comment #{comment.id}: {str(e)}")
             return {
                 "processed": True,
                 "task_id": task.id,

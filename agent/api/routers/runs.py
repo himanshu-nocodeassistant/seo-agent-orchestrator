@@ -186,13 +186,19 @@ async def run_seo_audit(
                 )
             )
             validation = profile.validator(execution.result_text)
-            _finalize_run_success(
+            owns_task = _finalize_run_success(
                 db, run, task, execution.result_text, execution.session_id, validation
             )
+            if not owns_task:
+                db.refresh(run)
+                return {"message": "Audit complete", "task_id": task.id, "run_id": run.run_id}
             _refresh_context_view(db, task_id=task.id)
             add_task_completed_comment(db, task.id, execution.result_text)
         except Exception as e:
-            _finalize_run_failure(db, run, task, str(e))
+            owns_task = _finalize_run_failure(db, run, task, str(e))
+            if not owns_task:
+                db.refresh(run)
+                return {"message": "Audit complete", "task_id": task.id, "run_id": run.run_id}
             _refresh_context_view(db, task_id=task.id)
             add_task_failed_comment(db, task.id, str(e))
 

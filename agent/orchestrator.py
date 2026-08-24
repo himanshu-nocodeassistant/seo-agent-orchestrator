@@ -475,17 +475,29 @@ async def _dispatch_phase(
 
         child_validation = child_profile.validator(result_text)
         if child_validation.status == "failed":
+            if write_capable:
+                helpers["_finalize_run_failure"](
+                    phase_db,
+                    child_run,
+                    child_task,
+                    f"Publisher output is uncertain: {child_validation.message}",
+                    status="review_required",
+                )
             raise RuntimeError(
                 f"Phase [{phase_name}] output failed validation: {child_validation.message}"
             )
         if ownership_check is not None and not ownership_check():
             raise LostRunOwnership("Campaign parent run ownership was lost before child finalization")
-        helpers["_finalize_run_success"](
+        owns_child = helpers["_finalize_run_success"](
             phase_db, child_run, child_task,
             result_text,
             session_id,
             child_validation,
         )
+        if not owns_child:
+            raise LostRunOwnership(
+                f"Child phase [{phase_name}] lost ownership during finalization"
+            )
         helpers["_refresh_context_view"](phase_db, task_id=child_task.id)
 
         degraded = phase_has_dependents and _extract_summary_block(result_text) is None
@@ -627,12 +639,13 @@ async def _run_campaign_orchestration(
             phase_outputs = json.loads(state.phase_outputs_json or "{}")
             child_run_ids = json.loads(state.child_run_ids_json or "[]")
         except (ValueError, json.JSONDecodeError) as e:
-            helpers_module._finalize_run_failure(
+            owns_parent = helpers_module._finalize_run_failure(
                 db, orchestrator_run, parent_task, f"Resume failed: {e}"
             )
-            helpers_module.add_task_failed_comment(
-                db, parent_task.id, f"Resume failed: {e}"
-            )
+            if owns_parent:
+                helpers_module.add_task_failed_comment(
+                    db, parent_task.id, f"Resume failed: {e}"
+                )
             return
         plan_text = state.plan_json or ""
         helpers_module.add_task_comment(
@@ -682,11 +695,12 @@ async def _run_campaign_orchestration(
         ]
         if not tiers:
             summary = "Campaign already completed."
-            helpers_module._finalize_run_success(
+            owns_parent = helpers_module._finalize_run_success(
                 db, orchestrator_run, parent_task, summary, None,
                 ValidationResult(status="passed"),
             )
-            helpers_module.add_task_completed_comment(db, parent_task.id, summary)
+            if owns_parent:
+                helpers_module.add_task_completed_comment(db, parent_task.id, summary)
             return
 
     # ── Fresh run: orchestrator produces plan ────────────────────────────────
@@ -729,8 +743,11 @@ async def _run_campaign_orchestration(
                 )
             tiers = _resolve_execution_tiers(phases)
         except ValueError as e:
-            helpers_module._finalize_run_failure(db, orchestrator_run, parent_task, str(e))
-            helpers_module.add_task_failed_comment(db, parent_task.id, str(e))
+            owns_parent = helpers_module._finalize_run_failure(
+                db, orchestrator_run, parent_task, str(e)
+            )
+            if owns_parent:
+                helpers_module.add_task_failed_comment(db, parent_task.id, str(e))
             return
 
         # ── Persist orchestration state ──────────────────────────────────────
@@ -852,7 +869,7 @@ async def _run_campaign_orchestration(
                 failed_child_run = _get_latest_run_for_task(
                     db, AgentRunModel, child_task.id
                 )
-                helpers_module._finalize_run_failure(
+                child_owns_task = helpers_module._finalize_run_failure(
                     db,
                     failed_child_run,
                     child_task,
@@ -861,10 +878,11 @@ async def _run_campaign_orchestration(
                         failed_child_run and failed_child_run.status == "review_required"
                     ),
                 )
-                helpers_module._refresh_context_view(db, task_id=child_task.id)
-                helpers_module.add_task_failed_comment(
-                    db, child_task.id, str(failed_error)
-                )
+                if child_owns_task:
+                    helpers_module._refresh_context_view(db, task_id=child_task.id)
+                    helpers_module.add_task_failed_comment(
+                        db, child_task.id, str(failed_error)
+                    )
             else:
                 phase_name, result_text, degraded = result
                 phase_outputs[phase_name] = result_text
@@ -915,15 +933,16 @@ async def _run_campaign_orchestration(
                     f"Campaign stopped at phase [{failed_phase}] with an uncertain write: "
                     f"{failed_error}"
                 )
-            helpers_module._finalize_run_failure(
+            owns_parent = helpers_module._finalize_run_failure(
                 db, orchestrator_run, parent_task,
                 state.error or f"Campaign stopped at phase [{failed_phase}]: {failed_error}",
                 status="review_required" if parent_review_required else "failed",
             )
-            helpers_module.add_task_failed_comment(
-                db, parent_task.id,
-                f"Campaign stopped at phase [{failed_phase}]: {failed_error}",
-            )
+            if owns_parent:
+                helpers_module.add_task_failed_comment(
+                    db, parent_task.id,
+                    f"Campaign stopped at phase [{failed_phase}]: {failed_error}",
+                )
             return
 
     # ── Finalize campaign ─────────────────────────────────────────────────────
@@ -940,13 +959,14 @@ async def _run_campaign_orchestration(
     summary = "\n".join(summary_lines)
 
     ensure_ownership()
-    helpers_module._finalize_run_success(
+    owns_parent = helpers_module._finalize_run_success(
         db, orchestrator_run, parent_task,
         summary,
         raw_execution.session_id if not resume else None,
         ValidationResult(status="passed"),
     )
-    helpers_module.add_task_completed_comment(db, parent_task.id, summary)
+    if owns_parent:
+        helpers_module.add_task_completed_comment(db, parent_task.id, summary)
 
 
 def _get_latest_run_for_task(db, AgentRunModel, task_id: int):

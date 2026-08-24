@@ -176,6 +176,39 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
 
         # ── Orchestration branch ──────────────────────────────────────────────
         if task.execution_type == "orchestrate_seo_campaign":
+            if not resume:
+                latest_campaign_run = (
+                    db.query(AgentRunModel)
+                    .filter(
+                        AgentRunModel.task_id == task.id,
+                        AgentRunModel.execution_type == "orchestrate_seo_campaign",
+                    )
+                    .order_by(AgentRunModel.id.desc())
+                    .first()
+                )
+                latest_campaign_state = None
+                if latest_campaign_run is not None:
+                    latest_campaign_state = db.query(OrchestrationStateModel).filter(
+                        OrchestrationStateModel.orchestrator_run_id
+                        == latest_campaign_run.run_id
+                    ).first()
+                safe_failed_retry = bool(
+                    latest_campaign_run is not None
+                    and latest_campaign_run.status == "failed"
+                    and latest_campaign_state is not None
+                    and latest_campaign_state.status == "error"
+                )
+                review_gate = bool(
+                    latest_campaign_run is not None
+                    and latest_campaign_run.status in {"review_required", "needs_review"}
+                )
+                if (task.status == "blocked" and not safe_failed_retry) or review_gate:
+                    if latest_campaign_run is None:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Campaign is blocked pending explicit review resolution.",
+                        )
+                    return _run_response(latest_campaign_run)
             if resume:
                 # Resume a campaign paused at the approval gate: reuse the
                 # existing orchestrator run and its saved orchestration state.
@@ -230,7 +263,10 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
                 try:
                     await _execute_campaign_with_timeout(db, task, run, resume=True)
                 except Exception as e:
-                    _finalize_run_failure(db, run, task, str(e))
+                    owns_task = _finalize_run_failure(db, run, task, str(e))
+                    if not owns_task:
+                        db.refresh(run)
+                        return _run_response(run)
                     _refresh_context_view(db, task_id=task.id)
                     add_task_failed_comment(db, task_id, str(e))
                 db.refresh(run)
@@ -285,7 +321,10 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
                         db, task, retry_run, resume=True
                     )
                 except Exception as e:
-                    _finalize_run_failure(db, retry_run, task, str(e))
+                    owns_task = _finalize_run_failure(db, retry_run, task, str(e))
+                    if not owns_task:
+                        db.refresh(retry_run)
+                        return _run_response(retry_run)
                     _refresh_context_view(db, task_id=task.id)
                     add_task_failed_comment(db, task_id, str(e))
                 db.refresh(retry_run)
@@ -313,7 +352,10 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
                         db, task, retry_run, resume=True
                     )
                 except Exception as e:
-                    _finalize_run_failure(db, retry_run, task, str(e))
+                    owns_task = _finalize_run_failure(db, retry_run, task, str(e))
+                    if not owns_task:
+                        db.refresh(retry_run)
+                        return _run_response(retry_run)
                     _refresh_context_view(db, task_id=task.id)
                     add_task_failed_comment(db, task_id, str(e))
                 db.refresh(retry_run)
@@ -333,7 +375,10 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
             try:
                 await _execute_campaign_with_timeout(db, task, run)
             except Exception as e:
-                _finalize_run_failure(db, run, task, str(e))
+                owns_task = _finalize_run_failure(db, run, task, str(e))
+                if not owns_task:
+                    db.refresh(run)
+                    return _run_response(run)
                 _refresh_context_view(db, task_id=task.id)
                 add_task_failed_comment(db, task_id, str(e))
             db.refresh(run)
@@ -374,7 +419,12 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
                 )
             )
             validation = profile.validator(execution.result_text)
-            _finalize_run_success(db, run, task, execution.result_text, execution.session_id, validation)
+            owns_task = _finalize_run_success(
+                db, run, task, execution.result_text, execution.session_id, validation
+            )
+            if not owns_task:
+                db.refresh(run)
+                return _run_response(run)
             _refresh_context_view(db, task_id=task.id)
 
             # Deterministic application-layer change logging (guaranteed, not prompt-dependent)
@@ -398,7 +448,10 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
             # for a run that may now belong to another worker.
             db.refresh(run)
         except Exception as e:
-            _finalize_run_failure(db, run, task, str(e))
+            owns_task = _finalize_run_failure(db, run, task, str(e))
+            if not owns_task:
+                db.refresh(run)
+                return _run_response(run)
             _refresh_context_view(db, task_id=task.id)
             add_task_failed_comment(db, task_id, str(e))
 
