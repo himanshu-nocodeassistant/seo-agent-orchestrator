@@ -7,7 +7,7 @@ import asyncio
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 from uuid import uuid4
@@ -51,6 +51,14 @@ _SENSITIVE_KEY_PARTS = (
     "private_key",
     "access_key",
 )
+RUN_LEASE_SECONDS = 15 * 60
+_WRITE_CAPABLE_TOOLS = {
+    "Write",
+    "Edit",
+    "mcp__webflow__create_cms_item",
+    "mcp__webflow__update_cms_item",
+    "mcp__webflow__publish_cms_item",
+}
 
 def add_task_comment(db, task_id: int, body: str, author: str = "agent") -> CommentModel:
     """
@@ -280,6 +288,11 @@ def _run_response(run) -> dict:
     return {
         "run_id": run.run_id,
         "request_id": run.request_id,
+        "heartbeat_at": run.heartbeat_at,
+        "lease_expires_at": run.lease_expires_at,
+        "recovery_state": run.recovery_state,
+        "recovery_attempts": run.recovery_attempts,
+        "write_capable": bool(run.write_capable),
         "task_id": run.task_id,
         "status": run.status,
         "execution_type": run.execution_type,
@@ -449,6 +462,11 @@ def _create_run(
     run = AgentRunModel(
         run_id=run_id,
         request_id=request_id,
+        heartbeat_at=now,
+        lease_expires_at=(datetime.fromisoformat(now) + timedelta(seconds=RUN_LEASE_SECONDS)).isoformat(),
+        recovery_state="none",
+        recovery_attempts=0,
+        write_capable=_is_write_capable(execution_type),
         task_id=task.id if task else None,
         status="queued",
         execution_type=execution_type or "manual",
@@ -521,6 +539,9 @@ def _mark_run_started(db, run, prompt_context, profile_name: str, session_id: Op
     run.profile_name = profile_name
     run.prompt_context_json = _serialize_prompt_context(prompt_context)
     run.session_id = session_id
+    run.heartbeat_at = _utcnow_iso()
+    run.lease_expires_at = _lease_expires_at(run.heartbeat_at)
+    run.write_capable = _is_write_capable(profile_name)
     db.commit()
     _log_run_event(
         db,
@@ -530,6 +551,98 @@ def _mark_run_started(db, run, prompt_context, profile_name: str, session_id: Op
         session_id=session_id,
         outcome="started",
     )
+
+
+def _lease_expires_at(heartbeat_at: str) -> str:
+    return (datetime.fromisoformat(heartbeat_at) + timedelta(seconds=RUN_LEASE_SECONDS)).isoformat()
+
+
+def _is_write_capable(execution_type: Optional[str]) -> bool:
+    try:
+        profile = get_execution_profile(execution_type)
+        return bool(profile.requires_approval or _WRITE_CAPABLE_TOOLS.intersection(profile.allowed_tools))
+    except Exception:
+        return False
+
+
+def _heartbeat_run(db, run, session_id: Optional[str] = None) -> None:
+    """Refresh a run lease during meaningful work."""
+    now = _utcnow_iso()
+    run.heartbeat_at = now
+    run.lease_expires_at = _lease_expires_at(now)
+    if session_id is not None:
+        run.session_id = session_id
+    db.commit()
+    _log_run_event(
+        db,
+        run.run_id,
+        "heartbeat",
+        {"lease_expires_at": run.lease_expires_at},
+        session_id=run.session_id,
+        outcome="alive",
+    )
+
+
+def _run_is_stale(run, now: Optional[datetime] = None) -> bool:
+    now = now or datetime.now(timezone.utc).replace(tzinfo=None)
+    expiry = run.lease_expires_at
+    if expiry:
+        try:
+            return datetime.fromisoformat(expiry) <= now
+        except ValueError:
+            pass
+    heartbeat = run.heartbeat_at or run.started_at
+    if not heartbeat:
+        return True
+    try:
+        return now - datetime.fromisoformat(heartbeat) >= timedelta(seconds=RUN_LEASE_SECONDS)
+    except ValueError:
+        return True
+
+
+def recover_stale_runs(db, now: Optional[datetime] = None) -> list[AgentRunModel]:
+    """Move expired runs to a safe recovery state after a process restart."""
+    stale_runs = []
+    candidates = db.query(AgentRunModel).filter(
+        AgentRunModel.status.in_(["queued", "running"])
+    ).all()
+    for run in candidates:
+        if not _run_is_stale(run, now):
+            continue
+        task = db.query(TaskModel).filter(TaskModel.id == run.task_id).first()
+        run.recovery_attempts = (run.recovery_attempts or 0) + 1
+        if run.write_capable or _is_write_capable(run.execution_type):
+            run.status = "review_required"
+            run.recovery_state = "review_required"
+            if task is not None:
+                task.status = "blocked"
+        else:
+            run.status = "recoverable"
+            run.recovery_state = "recoverable"
+            if task is not None:
+                task.status = "pending"
+        if task is not None and task.active_run_id == run.run_id:
+            task.active_run_id = None
+            task.updated_at = _utcnow_iso()
+        run.finished_at = _utcnow_iso()
+        stale_runs.append(run)
+    if stale_runs:
+        db.commit()
+        for run in stale_runs:
+            _log_run_event(
+                db,
+                run.run_id,
+                "run_recovery",
+                {
+                    "recovery_state": run.recovery_state,
+                    "recovery_attempts": run.recovery_attempts,
+                },
+                outcome=run.recovery_state,
+            )
+    return stale_runs
+
+
+reclaim_stale_runs = recover_stale_runs
 
 
 def _finalize_run_success(

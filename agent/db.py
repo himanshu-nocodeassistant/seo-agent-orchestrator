@@ -135,6 +135,11 @@ class AgentRunModel(Base):
     id = Column(Integer, primary_key=True, index=True)
     run_id = Column(String(64), nullable=False, unique=True, index=True)
     request_id = Column(String(128), nullable=True, index=True)
+    heartbeat_at = Column(String(20), nullable=True)
+    lease_expires_at = Column(String(20), nullable=True)
+    recovery_state = Column(String(30), nullable=False, default="none")
+    recovery_attempts = Column(Integer, nullable=False, default=0)
+    write_capable = Column(Boolean, nullable=False, default=False)
     task_id = Column(Integer, nullable=True, index=True)
     parent_run_id = Column(String(64), nullable=True, index=True)
     status = Column(String(30), nullable=False, default="queued")
@@ -227,6 +232,18 @@ def _ensure_orchestration_handoff_column() -> None:
                 conn.exec_driver_sql(
                     "ALTER TABLE agent_runs ADD COLUMN request_id VARCHAR(128)"
                 )
+            run_column_defs = {
+                "heartbeat_at": "VARCHAR(20)",
+                "lease_expires_at": "VARCHAR(20)",
+                "recovery_state": "VARCHAR(30) DEFAULT 'none'",
+                "recovery_attempts": "INTEGER DEFAULT 0",
+                "write_capable": "BOOLEAN DEFAULT 0",
+            }
+            for column, column_type in run_column_defs.items():
+                if column not in run_columns:
+                    conn.exec_driver_sql(
+                        f"ALTER TABLE agent_runs ADD COLUMN {column} {column_type}"
+                    )
             event_columns = {
                 row[1]
                 for row in conn.exec_driver_sql("PRAGMA table_info(run_events)")
@@ -329,6 +346,11 @@ class CommentResponse(BaseModel):
 class RunResponse(BaseModel):
     run_id: str
     request_id: Optional[str]
+    heartbeat_at: Optional[str]
+    lease_expires_at: Optional[str]
+    recovery_state: Optional[str]
+    recovery_attempts: Optional[int]
+    write_capable: bool = False
     task_id: Optional[int]
     status: str
     execution_type: Optional[str]
