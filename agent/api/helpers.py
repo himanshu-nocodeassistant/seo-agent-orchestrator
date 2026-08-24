@@ -4,6 +4,7 @@ Extracted from the former agent/api/main.py monolith (see git history).
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -52,6 +53,7 @@ _SENSITIVE_KEY_PARTS = (
     "access_key",
 )
 RUN_LEASE_SECONDS = 15 * 60
+RUN_HEARTBEAT_INTERVAL_SECONDS = max(1, RUN_LEASE_SECONDS / 3)
 _WRITE_CAPABLE_TOOLS = {
     "Write",
     "Edit",
@@ -541,6 +543,29 @@ def _create_run(
     return run
 
 
+def _claim_campaign_resume(db, run_id: str) -> bool:
+    """Atomically claim one approval-gated campaign resume."""
+    claimed = (
+        db.query(AgentRunModel)
+        .filter(
+            AgentRunModel.run_id == run_id,
+            AgentRunModel.status.in_(["queued", "running"]),
+        )
+        .update(
+            {AgentRunModel.status: "resuming"},
+            synchronize_session=False,
+        )
+    )
+    if claimed != 1:
+        db.rollback()
+        return False
+    db.commit()
+    run = db.query(AgentRunModel).filter(AgentRunModel.run_id == run_id).first()
+    if run is not None:
+        run._resume_claimed = True
+    return True
+
+
 def _mark_run_started(db, run, prompt_context, profile_name: str, session_id: Optional[str]) -> None:
     run.status = "running"
     run.profile_name = profile_name
@@ -670,14 +695,24 @@ def recover_stale_runs(db, now: Optional[datetime] = None) -> list[AgentRunModel
     """Move expired runs to a safe recovery state after a process restart."""
     stale_runs = []
     candidates = db.query(AgentRunModel).filter(
-        AgentRunModel.status.in_(["queued", "running"])
+        AgentRunModel.status.in_(["queued", "running", "resuming"])
     ).all()
     for run in candidates:
         if not _run_is_stale(run, now):
             continue
         task = db.query(TaskModel).filter(TaskModel.id == run.task_id).first()
         run.recovery_attempts = (run.recovery_attempts or 0) + 1
-        if run.write_capable or _is_write_capable(run.execution_type):
+        has_incomplete_writable_child = False
+        if task is not None and task.execution_type == "orchestrate_seo_campaign":
+            has_incomplete_writable_child = db.query(AgentRunModel).filter(
+                AgentRunModel.parent_run_id == run.run_id,
+                AgentRunModel.status != "completed",
+                (
+                    AgentRunModel.write_capable.is_(True)
+                    | AgentRunModel.execution_type.in_(["campaign_publisher"])
+                ),
+            ).first() is not None
+        if run.write_capable or _is_write_capable(run.execution_type) or has_incomplete_writable_child:
             run.status = "review_required"
             run.recovery_state = "review_required"
             if task is not None:
@@ -777,6 +812,35 @@ async def _run_agent_prompt(prompt: str, config: AgentConfig, prompt_context) ->
     """Execute a prompt via SEOAgent using layered memory context."""
     os.environ.pop("CLAUDECODE", None)
     timeout = _agent_execution_timeout_seconds()
+    stop_heartbeat = asyncio.Event()
+    heartbeat_task = None
+
+    async def heartbeat_loop():
+        while True:
+            try:
+                await asyncio.wait_for(
+                    stop_heartbeat.wait(), timeout=RUN_HEARTBEAT_INTERVAL_SECONDS
+                )
+                return
+            except asyncio.TimeoutError:
+                pass
+            try:
+                heartbeat_db = getattr(config, "_heartbeat_db", None)
+                run_id = getattr(config, "_heartbeat_run_id", None)
+                if heartbeat_db is not None and run_id:
+                    run = heartbeat_db.query(AgentRunModel).filter(
+                        AgentRunModel.run_id == run_id
+                    ).first()
+                    if run is not None:
+                        _heartbeat_run(heartbeat_db, run, record_event=False)
+                action = getattr(config, "_comment_action", None)
+                if heartbeat_db is not None and action is not None:
+                    _heartbeat_comment_action(heartbeat_db, action)
+            except Exception:
+                logger.exception("Could not refresh execution lease")
+
+    if getattr(config, "_heartbeat_db", None) is not None:
+        heartbeat_task = asyncio.create_task(heartbeat_loop())
     try:
         return await asyncio.wait_for(
             SEOAgent.create_and_run_result(prompt, config, prompt_context=prompt_context),
@@ -784,6 +848,12 @@ async def _run_agent_prompt(prompt: str, config: AgentConfig, prompt_context) ->
         )
     except asyncio.TimeoutError as e:
         raise RuntimeError(f"Agent execution timed out after {timeout}s") from e
+    finally:
+        if heartbeat_task is not None:
+            stop_heartbeat.set()
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat_task
 
 
 def _build_runtime_config(
@@ -791,6 +861,7 @@ def _build_runtime_config(
     resume_session_id: Optional[str],
     db=None,
     run_id: Optional[str] = None,
+    comment_action=None,
 ) -> AgentConfig:
     from claude_agent_sdk.types import HookMatcher
 
@@ -812,6 +883,10 @@ def _build_runtime_config(
         config.hooks = {
             "PostToolUse": [HookMatcher(hooks=[build_post_tool_use_hook(db, run_id)])]
         }
+        config._heartbeat_db = db
+        config._heartbeat_run_id = run_id
+    if comment_action is not None:
+        config._comment_action = comment_action
 
     return config
 
@@ -992,7 +1067,8 @@ async def process_one_comment_action() -> dict:
                 run.prompt_text = workflow_prompt
                 _mark_run_started(db, run, prompt_context, profile.execution_type, resume_session_id)
                 config = _build_runtime_config(
-                    profile, resume_session_id, db=db, run_id=run.run_id
+                    profile, resume_session_id, db=db, run_id=run.run_id,
+                    comment_action=action,
                 )
                 execution = _normalize_execution_result(await _run_agent_prompt(workflow_prompt, config, prompt_context))
                 validation = ValidationResult(

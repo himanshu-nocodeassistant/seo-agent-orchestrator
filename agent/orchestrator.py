@@ -434,6 +434,9 @@ async def run_campaign_orchestration(
 
     # ── Resume path: reuse the saved plan/state from the paused run ───────────
     if resume:
+        if not getattr(orchestrator_run, "_resume_claimed", False):
+            if not helpers_module._claim_campaign_resume(db, orchestrator_run.run_id):
+                return
         state = db.query(OrchestrationStateModel).filter(
             OrchestrationStateModel.orchestrator_run_id == orchestrator_run.run_id
         ).first()
@@ -475,9 +478,7 @@ async def run_campaign_orchestration(
             title = phase_spec.get("task_title", f"Campaign: {phase_spec['phase']}")
             child_task = by_title.get(title)
             if child_task is None:
-                raise RuntimeError(
-                    f"Cannot resume: child task for phase [{phase_spec['phase']}] is missing."
-                )
+                child_task = _create_child_task(db, parent_task, phase_spec)
             child_tasks[phase_spec["phase"]] = child_task
 
         completed = set(phase_outputs)
@@ -736,9 +737,16 @@ def _create_child_task(db, parent_task, phase_spec: dict):
     """Create a child TaskModel row for a campaign phase."""
     from agent.api.main import TaskModel
 
+    title = phase_spec.get("task_title", f"Campaign: {phase_spec['phase']}")
+    existing = db.query(TaskModel).filter(
+        TaskModel.parent_task_id == parent_task.id,
+        TaskModel.title == title,
+    ).first()
+    if existing is not None:
+        return existing
     now = datetime.utcnow().isoformat()
     child = TaskModel(
-        title=phase_spec.get("task_title", f"Campaign: {phase_spec['phase']}"),
+        title=title,
         description=phase_spec.get("task_description"),
         status="pending",
         priority=parent_task.priority,
@@ -748,7 +756,12 @@ def _create_child_task(db, parent_task, phase_spec: dict):
         updated_at=now,
     )
     db.add(child)
-    db.commit()
+    db.flush()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     db.refresh(child)
     return child
 
@@ -756,6 +769,13 @@ def _create_child_task(db, parent_task, phase_spec: dict):
 def _create_child_run(db, child_task, parent_run_id: str, execution_type: str):
     """Create an AgentRunModel for a child phase, linked to the orchestrator run."""
     from agent.api.main import AgentRunModel, RunEventModel
+
+    if child_task.active_run_id:
+        existing = db.query(AgentRunModel).filter(
+            AgentRunModel.run_id == child_task.active_run_id
+        ).first()
+        if existing is not None:
+            return existing
 
     now = datetime.utcnow().isoformat()
     parent_run = (
@@ -783,14 +803,10 @@ def _create_child_run(db, child_task, parent_run_id: str, execution_type: str):
         finished_at=None,
     )
     db.add(run)
-    db.commit()
-    db.refresh(run)
-
+    db.flush()
     child_task.active_run_id = run.run_id
     child_task.last_run_id = run.run_id
     child_task.updated_at = now
-    db.commit()
-
     db.add(RunEventModel(
         run_id=run.run_id,
         request_id=run.request_id,
@@ -798,5 +814,10 @@ def _create_child_run(db, child_task, parent_run_id: str, execution_type: str):
         payload=json.dumps({"trigger_source": "orchestrator", "parent_run_id": parent_run_id}),
         created_at=now,
     ))
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    db.refresh(run)
     return run

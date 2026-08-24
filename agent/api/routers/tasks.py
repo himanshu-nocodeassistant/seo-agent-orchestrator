@@ -12,6 +12,7 @@ from agent.api.helpers import (
     add_task_failed_comment,
     add_task_started_comment,
     _build_runtime_config,
+    _claim_campaign_resume,
     _create_run,
     _execute_campaign_with_timeout,
     _finalize_run_failure,
@@ -205,6 +206,9 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
                         status_code=400,
                         detail="Task not approved yet — set approved_at first.",
                     )
+                if not _claim_campaign_resume(db, run.run_id):
+                    db.refresh(run)
+                    return _run_response(run)
                 task.status = "in_progress"
                 task.updated_at = _utcnow_iso()
                 db.commit()

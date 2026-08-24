@@ -90,9 +90,16 @@ class TaskNotReadyError(DataForSEOError):
 class DataForSEORecoveryError(DataForSEOError):
     """A submitted task needs recovery from its preserved manifest."""
 
-    def __init__(self, task_ids: list[str], manifest_path: str | None, message: str):
+    def __init__(
+        self,
+        task_ids: list[str],
+        manifest_path: str | None,
+        message: str,
+        results: list[dict] | None = None,
+    ):
         self.task_ids = list(task_ids)
         self.manifest_path = manifest_path
+        self.results = list(results or [])
         super().__init__(0, message)
 
 
@@ -277,6 +284,25 @@ class DataForSEOClient:
             read_timeout("DATAFORSEO_READ_TIMEOUT_SECONDS", DEFAULT_READ_TIMEOUT),
         )
 
+    @staticmethod
+    def _update_manifest_results(manifest_path: str | None, results: list[dict]) -> None:
+        """Persist ready results beside submitted IDs for recovery tooling."""
+        if not manifest_path or not os.path.exists(manifest_path):
+            return
+        try:
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+            manifest["completed_results"] = results
+            tmp_path = manifest_path + ".tmp"
+            with open(tmp_path, "w") as f:
+                json.dump(manifest, f, indent=2)
+            os.replace(tmp_path, manifest_path)
+        except Exception as exc:
+            print(
+                f"WARNING: failed to update recovery manifest {manifest_path}: {exc}",
+                file=sys.stderr,
+            )
+
     def _task_get(self, endpoint: str, task_id: str) -> dict:
         """Retrieve results for a single completed task."""
         data = self._get(f"{endpoint}/{task_id}")
@@ -341,6 +367,7 @@ class DataForSEOClient:
                     if tasks:
                         result = tasks[0].get("result") or []
                         all_results.extend(result)
+                        self._update_manifest_results(manifest_path, all_results)
                         # Remove earlier not-ready snapshots for this keyword/location;
                         # they have no value once the final result is on disk.
                         purge_stale_poll_logs(tasks[0])
@@ -358,6 +385,7 @@ class DataForSEOClient:
                 manifest_path,
                 f"Polling stopped after {effective_max_wait}s; recover task IDs "
                 f"from {manifest_path or 'the DataForSEO manifest'}.",
+                results=all_results,
             )
 
         return all_results
