@@ -16,6 +16,7 @@ current_phase so a worker can resume after restart.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -380,6 +381,44 @@ async def _dispatch_phase(
 
 
 async def run_campaign_orchestration(
+    db, parent_task, orchestrator_run, resume: bool = False
+) -> None:
+    """Run a campaign while keeping its parent run lease alive."""
+    from agent.api import helpers as helpers_module
+
+    stop_heartbeat = asyncio.Event()
+
+    async def heartbeat_loop():
+        while True:
+            try:
+                await asyncio.wait_for(
+                    stop_heartbeat.wait(),
+                    timeout=helpers_module.RUN_HEARTBEAT_INTERVAL_SECONDS,
+                )
+                return
+            except asyncio.TimeoutError:
+                pass
+            try:
+                if orchestrator_run.status in {"queued", "running", "resuming"}:
+                    helpers_module._heartbeat_run(
+                        db, orchestrator_run, record_event=False
+                    )
+            except Exception:
+                logger.exception("Could not refresh campaign parent lease")
+
+    heartbeat_task = asyncio.create_task(heartbeat_loop())
+    try:
+        await _run_campaign_orchestration(
+            db, parent_task, orchestrator_run, resume=resume
+        )
+    finally:
+        stop_heartbeat.set()
+        heartbeat_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat_task
+
+
+async def _run_campaign_orchestration(
     db, parent_task, orchestrator_run, resume: bool = False
 ) -> None:
     """

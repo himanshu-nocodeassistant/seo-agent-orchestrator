@@ -96,10 +96,12 @@ class DataForSEORecoveryError(DataForSEOError):
         manifest_path: str | None,
         message: str,
         results: list[dict] | None = None,
+        errors: list[dict] | None = None,
     ):
         self.task_ids = list(task_ids)
         self.manifest_path = manifest_path
         self.results = list(results or [])
+        self.errors = list(errors or [])
         super().__init__(0, message)
 
 
@@ -303,6 +305,27 @@ class DataForSEOClient:
                 file=sys.stderr,
             )
 
+    @staticmethod
+    def _update_manifest_recovery(
+        manifest_path: str | None, errors: list[dict]
+    ) -> None:
+        """Persist permanent polling errors beside completed results."""
+        if not manifest_path or not os.path.exists(manifest_path):
+            return
+        try:
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+            manifest["recovery_errors"] = errors
+            tmp_path = manifest_path + ".tmp"
+            with open(tmp_path, "w") as f:
+                json.dump(manifest, f, indent=2)
+            os.replace(tmp_path, manifest_path)
+        except Exception as exc:
+            print(
+                f"WARNING: failed to update recovery manifest {manifest_path}: {exc}",
+                file=sys.stderr,
+            )
+
     def _task_get(self, endpoint: str, task_id: str) -> dict:
         """Retrieve results for a single completed task."""
         data = self._get(f"{endpoint}/{task_id}")
@@ -337,16 +360,17 @@ class DataForSEOClient:
         Returns:
             Combined list of result dicts from all tasks.
 
-        A task that isn't ready by max_wait is skipped (not raised) so one
-        straggler can't discard results already collected for the rest of
-        the batch. Skipped task IDs are still in the manifest written by
-        _task_post, so they can be recovered later without re-billing.
+        A task that isn't ready by max_wait is skipped (not raised), and a
+        permanent task error is recorded, so neither can discard results
+        already collected for the rest of the batch. Skipped task IDs and
+        polling errors are preserved in the manifest for recovery.
         """
         task_ids = self._task_post(post_endpoint, payload)
         manifest_path = getattr(self, "_last_manifest_path", None)
 
         all_results = []
         skipped = []
+        recovery_errors = []
         pending = list(task_ids)
         # Global deadline across all tasks: one round polls every still-pending
         # task, so a batch of N tasks takes O(max_wait) worst case instead of
@@ -373,19 +397,34 @@ class DataForSEOClient:
                         purge_stale_poll_logs(tasks[0])
                 except TaskNotReadyError:
                     still_pending.append(task_id)
+                except DataForSEOError as exc:
+                    error = {
+                        "task_id": task_id,
+                        "status_code": exc.status_code,
+                        "error": str(exc),
+                    }
+                    recovery_errors.append(error)
+                    self._update_manifest_recovery(manifest_path, recovery_errors)
             pending = still_pending
 
-        if skipped:
-            print(
-                f"Warning: {len(skipped)} task(s) not ready after {effective_max_wait}s, "
-                f"recoverable from manifest {manifest_path}: {skipped}"
-            )
+        if skipped or recovery_errors:
+            if skipped:
+                print(
+                    f"Warning: {len(skipped)} task(s) not ready after {effective_max_wait}s, "
+                    f"recoverable from manifest {manifest_path}: {skipped}"
+                )
+            if recovery_errors:
+                print(
+                    f"Warning: {len(recovery_errors)} task(s) failed during polling; "
+                    f"details saved in manifest {manifest_path}"
+                )
             raise DataForSEORecoveryError(
                 skipped,
                 manifest_path,
-                f"Polling stopped after {effective_max_wait}s; recover task IDs "
-                f"from {manifest_path or 'the DataForSEO manifest'}.",
+                f"Polling produced partial results; recover task IDs from "
+                f"{manifest_path or 'the DataForSEO manifest'}.",
                 results=all_results,
+                errors=recovery_errors,
             )
 
         return all_results

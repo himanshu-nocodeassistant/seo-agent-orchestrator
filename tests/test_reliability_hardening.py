@@ -11,8 +11,10 @@ import pytest
 
 from agent.api.helpers import (
     RUN_LEASE_SECONDS,
+    _claim_campaign_resume,
     _comment_action_is_stale,
     _create_run,
+    _heartbeat_run,
     _reclaim_stale_comment_actions,
     _run_agent_prompt,
     _utcnow_iso,
@@ -20,6 +22,7 @@ from agent.api.helpers import (
 )
 from agent.api.main import (
     AgentRunModel,
+    CommentModel,
     CommentActionModel,
     OrchestrationStateModel,
     TaskModel,
@@ -28,6 +31,7 @@ from agent.api.main import (
 from agent.config import AgentConfig
 from agent.dataforseo.client import (
     DataForSEOClient,
+    DataForSEOError,
     DataForSEORecoveryError,
     TaskNotReadyError,
 )
@@ -271,7 +275,9 @@ def test_child_run_creation_rolls_back_task_pointer_on_commit_failure(client):
 class _RecoveryClient(DataForSEOClient):
     def keyword_method(self, tasks):
         raise DataForSEORecoveryError(
-            ["slow"], "/tmp/recovery.json", "polling stopped", results=[{"keyword": "ready"}]
+            ["slow"], "/tmp/recovery.json", "polling stopped",
+            results=[{"keyword": "ready"}],
+            errors=[{"task_id": "failed", "error": "bad task"}],
         )
 
 
@@ -287,4 +293,153 @@ def test_pipeline_cli_writes_partial_results_on_recovery(tmp_path, monkeypatch, 
     run_pipeline(_RecoveryClient, "recovery-pipeline")
 
     assert json.loads(output.read_text()) == [{"keyword": "ready"}]
-    assert "Recovery required" in capsys.readouterr().out
+    captured = capsys.readouterr().out
+    assert "Recovery required" in captured
+    assert "failed" in captured
+
+
+@pytest.mark.asyncio
+async def test_comment_autopilot_defers_while_campaign_is_resuming(client):
+    from agent.api.helpers import process_one_comment_action
+
+    task_data = client.post(
+        "/tasks", json={
+            "title": "Resuming campaign",
+            "execution_type": "orchestrate_seo_campaign",
+        }
+    ).json()
+    db = get_db_session()
+    try:
+        task = db.query(TaskModel).filter_by(id=task_data["id"]).one()
+        run = _create_run(db, task, "manual_execute", task.execution_type)
+        run.status = "resuming"
+        comment = CommentModel(
+            task_id=task.id, author="user", body="@agent revise this"
+        )
+        db.add(comment)
+        db.commit()
+        db.refresh(comment)
+        comment_id = comment.id
+        action = CommentActionModel(
+            task_id=task.id, comment_id=comment.id, status="pending",
+            attempts=0, max_attempts=2,
+        )
+        db.add(action)
+        db.commit()
+    finally:
+        db.close()
+
+    with patch("agent.api.helpers._run_agent_prompt", new=AsyncMock()) as run_agent:
+        result = await process_one_comment_action()
+
+    assert result["status"] == "pending"
+    run_agent.assert_not_awaited()
+    cleanup_db = get_db_session()
+    try:
+        cleanup_action = cleanup_db.query(CommentActionModel).filter_by(
+            comment_id=comment_id
+        ).one()
+        cleanup_action.status = "retry_exhausted"
+        cleanup_db.commit()
+    finally:
+        cleanup_db.close()
+
+
+@pytest.mark.asyncio
+async def test_resumed_campaign_refreshes_parent_lease_during_child_wait(
+    client, monkeypatch
+):
+    from agent.orchestrator import run_campaign_orchestration
+
+    monkeypatch.setattr("agent.api.helpers.RUN_HEARTBEAT_INTERVAL_SECONDS", 0.005)
+    db = get_db_session()
+    try:
+        task, run = _campaign_task(db)
+        state = db.query(OrchestrationStateModel).filter_by(
+            orchestrator_run_id=run.run_id
+        ).one()
+        state.plan_json = "```json\n" + json.dumps({
+            "phases": [{
+                "phase": "researcher",
+                "task_title": "Campaign: researcher",
+                "execution_type": "campaign_researcher",
+                "depends_on": [],
+            }]
+        }) + "\n```"
+        db.commit()
+        assert _claim_campaign_resume(db, run.run_id)
+        db.refresh(run)
+        claimed_heartbeat = run.heartbeat_at
+
+        async def slow_phase(*args, **kwargs):
+            await asyncio.sleep(0.03)
+            return "researcher", "done", False
+
+        with patch("agent.orchestrator._dispatch_phase", new=slow_phase), \
+            patch("agent.api.helpers._heartbeat_run", wraps=_heartbeat_run) as parent_heartbeat:
+            await run_campaign_orchestration(db, task, run, resume=True)
+
+        db.refresh(run)
+        assert parent_heartbeat.call_count >= 1
+        assert run.heartbeat_at > claimed_heartbeat
+    finally:
+        db.close()
+
+
+def test_stale_approval_run_can_resume_without_new_run(client):
+    db = get_db_session()
+    try:
+        task, run = _campaign_task(db)
+        run.heartbeat_at = _old_timestamp()
+        run.lease_expires_at = _old_timestamp()
+        db.commit()
+
+        recovered = recover_stale_runs(db)
+        assert run.run_id in {item.run_id for item in recovered}
+        db.refresh(run)
+        assert run.status == "recoverable"
+        assert task.active_run_id is None
+
+        assert _claim_campaign_resume(db, run.run_id)
+        db.refresh(run)
+        assert run.status == "resuming"
+        assert run.recovery_state == "none"
+        assert db.query(AgentRunModel).filter_by(task_id=task.id).count() == 1
+    finally:
+        db.close()
+
+
+def test_dataforseo_preserves_partial_results_after_task_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATAFORSEO_LOGIN", "login")
+    monkeypatch.setenv("DATAFORSEO_PASSWORD", "password")
+    monkeypatch.setattr("agent.dataforseo.client.MANIFEST_DIR", str(tmp_path))
+    client = DataForSEOClient()
+    manifest = client._write_manifest(
+        "post", [{"keyword": "one"}, {"keyword": "two"}, {"keyword": "three"}],
+        ["ready", "failed", "slow"],
+    )
+    client._last_manifest_path = manifest
+    responses = iter(["ready", "failed", "slow", "slow"])
+
+    def fake_task_get(endpoint, task_id):
+        result = next(responses)
+        if result == "ready":
+            return {"tasks": [{"result": [{"keyword": "one"}]}]}
+        if result == "failed":
+            raise DataForSEOError(40000, "bad task")
+        raise TaskNotReadyError(40601, "queued")
+
+    clock = iter([0.0, 1.0, 1.0, 11.0])
+    with patch.object(client, "_task_post", return_value=["ready", "failed", "slow"]), \
+        patch.object(client, "_task_get", side_effect=fake_task_get), \
+        patch("agent.dataforseo.client.time.sleep"), \
+        patch("agent.dataforseo.client.time.monotonic", side_effect=lambda: next(clock)):
+        with pytest.raises(DataForSEORecoveryError) as exc_info:
+            client._task_post_and_poll("post", "get", [{"keyword": "x"}], max_wait=10)
+
+    assert exc_info.value.task_ids == ["slow"]
+    assert exc_info.value.results == [{"keyword": "one"}]
+    assert exc_info.value.errors[0]["task_id"] == "failed"
+    saved = json.loads(tmp_path.joinpath(manifest.split("/")[-1]).read_text())
+    assert saved["completed_results"] == [{"keyword": "one"}]
+    assert saved["recovery_errors"][0]["task_id"] == "failed"

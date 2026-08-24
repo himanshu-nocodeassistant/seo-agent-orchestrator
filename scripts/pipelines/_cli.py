@@ -157,6 +157,11 @@ def run_pipeline(client_cls: type, pipeline_name: str) -> None:
             f"Recovery required: {len(exc.task_ids)} task(s) remain pending. "
             f"Manifest: {exc.manifest_path or 'unavailable'}"
         )
+        for error in exc.errors:
+            print(
+                f"Task {error.get('task_id', 'unknown')} failed: "
+                f"{error.get('error', 'unknown error')}"
+            )
 
     output_path = (
         Path(args.output) if args.output

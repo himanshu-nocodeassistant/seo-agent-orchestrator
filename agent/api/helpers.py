@@ -545,24 +545,42 @@ def _create_run(
 
 def _claim_campaign_resume(db, run_id: str) -> bool:
     """Atomically claim one approval-gated campaign resume."""
+    now = _utcnow_iso()
     claimed = (
         db.query(AgentRunModel)
         .filter(
             AgentRunModel.run_id == run_id,
-            AgentRunModel.status.in_(["queued", "running"]),
+            AgentRunModel.status.in_(["queued", "running", "recoverable"]),
         )
         .update(
-            {AgentRunModel.status: "resuming"},
+            {
+                AgentRunModel.status: "resuming",
+                AgentRunModel.recovery_state: "none",
+                AgentRunModel.heartbeat_at: now,
+                AgentRunModel.lease_expires_at: _lease_expires_at(now),
+                AgentRunModel.finished_at: None,
+            },
             synchronize_session=False,
         )
     )
     if claimed != 1:
         db.rollback()
         return False
-    db.commit()
     run = db.query(AgentRunModel).filter(AgentRunModel.run_id == run_id).first()
-    if run is not None:
-        run._resume_claimed = True
+    if run is None:
+        db.rollback()
+        return False
+    task = db.query(TaskModel).filter(TaskModel.id == run.task_id).first()
+    if task is not None:
+        if task.active_run_id not in (None, run.run_id):
+            db.rollback()
+            return False
+        task.active_run_id = run.run_id
+        task.last_run_id = run.run_id
+        task.status = "in_progress"
+        task.updated_at = now
+    db.commit()
+    run._resume_claimed = True
     return True
 
 
@@ -1028,7 +1046,7 @@ async def process_one_comment_action() -> dict:
                     .filter(AgentRunModel.run_id == task.active_run_id)
                     .first()
                 )
-            if active_run is not None and active_run.status in {"queued", "running"}:
+            if active_run is not None and active_run.status in {"queued", "running", "resuming"}:
                 action.status = "pending"
                 action.attempts = max(0, action.attempts - 1)
                 action.recovery_state = "deferred"
@@ -1056,6 +1074,23 @@ async def process_one_comment_action() -> dict:
                 task.execution_type or "manual",
                 source_comment_id=comment.id,
             )
+            # Re-check after creation for a race with campaign resume. Never
+            # reuse the campaign's resuming run for comment work.
+            if run.status == "resuming":
+                action.status = "pending"
+                action.attempts = max(0, action.attempts - 1)
+                action.recovery_state = "deferred"
+                action.last_error = "Campaign resume is active; comment work deferred."
+                action.updated_at = _utcnow_iso()
+                db.commit()
+                return {
+                    "processed": True,
+                    "task_id": task.id,
+                    "comment_id": comment.id,
+                    "status": action.status,
+                    "attempts": action.attempts,
+                    "max_attempts": action.max_attempts,
+                }
             action.run_id = run.run_id
             db.commit()
 
