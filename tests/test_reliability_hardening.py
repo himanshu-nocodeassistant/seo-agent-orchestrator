@@ -15,6 +15,7 @@ from agent.api.helpers import (
     _comment_action_is_stale,
     _create_run,
     _finalize_run_failure,
+    _heartbeat_comment_action,
     _heartbeat_run,
     _reclaim_stale_comment_actions,
     _run_agent_prompt,
@@ -37,6 +38,7 @@ from agent.dataforseo.client import (
     DataForSEORecoveryError,
     TaskNotReadyError,
 )
+import agent.orchestrator as orchestrator_module
 from agent.orchestrator import _run_with_retry
 from scripts.pipelines._cli import run_pipeline
 
@@ -440,7 +442,7 @@ def test_dataforseo_preserves_partial_results_after_task_error(tmp_path, monkeyp
         with pytest.raises(DataForSEORecoveryError) as exc_info:
             client._task_post_and_poll("post", "get", [{"keyword": "x"}], max_wait=10)
 
-    assert exc_info.value.task_ids == ["slow"]
+    assert exc_info.value.task_ids == ["failed", "slow"]
     assert exc_info.value.results == [{"keyword": "one"}]
     assert exc_info.value.errors[0]["task_id"] == "failed"
     saved = json.loads(tmp_path.joinpath(manifest.split("/")[-1]).read_text())
@@ -674,6 +676,254 @@ def test_dataforseo_partial_submission_is_reported_as_recovery(tmp_path, monkeyp
     saved = json.loads(next(tmp_path.glob("*.json")).read_text())
     assert saved["tasks"][0]["task_id"] == "first"
     assert saved["submission_errors"]
+
+
+def test_campaign_retry_reuses_saved_state_and_skips_completed_publisher(client):
+    db = get_db_session()
+    try:
+        task, run = _campaign_task(db)
+        state = db.query(OrchestrationStateModel).filter_by(
+            orchestrator_run_id=run.run_id
+        ).one()
+        state.plan_json = "```json\n" + json.dumps({
+            "phases": [
+                {"phase": "publisher", "execution_type": "campaign_publisher", "depends_on": []},
+                {"phase": "analyst", "execution_type": "campaign_analyst", "depends_on": ["publisher"]},
+            ]
+        }) + "\n```"
+        state.phase_outputs_json = json.dumps({"publisher": "published"})
+        state.child_run_ids_json = json.dumps([])
+        state.status = "error"
+        run.status = "failed"
+        run.finished_at = _utcnow_iso()
+        task.status = "blocked"
+        task.active_run_id = None
+        db.commit()
+        task_id = task.id
+        original_run_id = run.run_id
+    finally:
+        db.close()
+
+    with patch(
+        "agent.api.routers.tasks._execute_campaign_with_timeout",
+        new=AsyncMock(return_value=None),
+    ) as execute:
+        response = client.post(f"/tasks/{task_id}/execute")
+
+    assert response.status_code == 200
+    assert response.json()["run_id"] == original_run_id
+    execute.assert_awaited_once()
+    assert execute.call_args.kwargs["resume"] is True
+
+
+@pytest.mark.asyncio
+async def test_stale_campaign_worker_stops_before_child_dispatch():
+    with pytest.raises(orchestrator_module.LostRunOwnership):
+        await orchestrator_module._dispatch_phase(
+            None,
+            {"phase": "researcher", "execution_type": "campaign_researcher"},
+            1,
+            "stale-parent",
+            {},
+            "goal",
+            {},
+            False,
+            ownership_check=lambda: False,
+        )
+
+
+def test_finalizer_uses_atomic_ownership_condition(client):
+    db = get_db_session()
+    try:
+        task_data = client.post(
+            "/tasks", json={"title": "Atomic finalizer", "execution_type": "research"}
+        ).json()
+        task = db.query(TaskModel).filter_by(id=task_data["id"]).one()
+        old_run = _create_run(db, task, "manual_execute", "research")
+        task.active_run_id = None
+        old_run.status = "review_required"
+        db.commit()
+        new_run = _create_run(db, task, "manual_execute", "research")
+
+        with patch("agent.api.helpers._run_owns_task", return_value=True):
+            _finalize_run_failure(db, old_run, task, "late worker")
+
+        db.refresh(task)
+        db.refresh(new_run)
+        assert task.active_run_id == new_run.run_id
+        assert task.last_run_id == new_run.run_id
+        assert task.status == "in_progress"
+        assert new_run.status == "queued"
+    finally:
+        db.close()
+
+
+def test_partial_submission_network_error_is_recovery(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATAFORSEO_LOGIN", "login")
+    monkeypatch.setenv("DATAFORSEO_PASSWORD", "password")
+    monkeypatch.setenv("DATAFORSEO_MAX_TASKS_PER_REQUEST", "1")
+    monkeypatch.setattr("agent.dataforseo.client.MANIFEST_DIR", str(tmp_path))
+    client = DataForSEOClient()
+    with patch.object(client, "_post", side_effect=[
+        {"status_code": 20000, "tasks": [{"id": "paid-1", "status_code": 20100}]},
+        DataForSEOError(503, "service unavailable"),
+    ]):
+        with pytest.raises(DataForSEORecoveryError) as exc_info:
+            client._task_post("post", [{"keyword": "one"}, {"keyword": "two"}])
+
+    assert exc_info.value.task_ids == ["paid-1"]
+    assert "service unavailable" in exc_info.value.errors[0]["error"]
+    manifest = json.loads(exc_info.value.manifest_path and open(exc_info.value.manifest_path).read())
+    assert manifest["tasks"][0]["task_id"] == "paid-1"
+    assert manifest["submission_errors"]
+
+
+def test_direct_campaign_publisher_execution_requires_approval(client):
+    task = client.post(
+        "/tasks", json={"title": "Direct publisher", "execution_type": "campaign_publisher"}
+    ).json()
+    with patch("agent.api.helpers._run_agent_prompt", new=AsyncMock()) as run_agent:
+        response = client.post(f"/tasks/{task['id']}/execute")
+
+    assert response.status_code == 400
+    run_agent.assert_not_awaited()
+    db = get_db_session()
+    try:
+        assert db.query(AgentRunModel).filter_by(task_id=task["id"]).count() == 0
+    finally:
+        db.close()
+
+
+def test_reclaimed_comment_action_ignores_old_worker(client):
+    db = get_db_session()
+    try:
+        task_data = client.post(
+            "/tasks", json={"title": "Comment lease owner", "execution_type": "research"}
+        ).json()
+        action = CommentActionModel(
+            task_id=task_data["id"], comment_id=999991, status="running",
+            attempts=1, max_attempts=2, run_id="new-worker", heartbeat_at=_utcnow_iso(),
+            lease_expires_at=_utcnow_iso(), recovery_state="running",
+        )
+        db.add(action)
+        db.commit()
+        old_heartbeat = action.heartbeat_at
+        assert _heartbeat_comment_action(db, action, expected_run_id="old-worker") is False
+        db.refresh(action)
+        assert action.heartbeat_at == old_heartbeat
+    finally:
+        db.close()
+
+
+def test_pipeline_cli_reports_submitted_ids_and_partial_results(tmp_path, monkeypatch, capsys):
+    class PartialClient(DataForSEOClient):
+        def keyword_method(self, tasks):
+            raise DataForSEORecoveryError(
+                ["paid-1", "failed-2"], "/tmp/partial-manifest.json", "recover",
+                results=[{"keyword": "ready"}],
+                errors=[{"task_id": "failed-2", "error": "bad task"}],
+            )
+
+    monkeypatch.setenv("DATAFORSEO_LOGIN", "login")
+    monkeypatch.setenv("DATAFORSEO_PASSWORD", "password")
+    output = tmp_path / "partial.json"
+    monkeypatch.setattr(
+        "sys.argv", ["pipeline.py", "keyword_method", "--task", "{}", "--output", str(output)]
+    )
+    run_pipeline(PartialClient, "partial-pipeline")
+    captured = capsys.readouterr().out
+    assert "Submitted task IDs: paid-1, failed-2" in captured
+    assert "Partial results: 1" in captured
+    assert "2 submitted task(s)" in captured
+
+
+@pytest.mark.asyncio
+async def test_comment_autopilot_generates_request_id_when_missing(client):
+    from agent.api.helpers import process_one_comment_action
+
+    task = client.post(
+        "/tasks", json={"title": "Background trace", "execution_type": "research"}
+    ).json()
+    cleanup_db = get_db_session()
+    try:
+        cleanup_db.query(CommentActionModel).delete()
+        cleanup_db.query(CommentModel).delete()
+        cleanup_db.commit()
+    finally:
+        cleanup_db.close()
+    comment = client.post(
+        f"/tasks/{task['id']}/comments", json={"body": "@agent revise"}
+    ).json()
+    db = get_db_session()
+    try:
+        db.add(CommentActionModel(task_id=task["id"], comment_id=comment["id"], status="pending"))
+        db.commit()
+    finally:
+        db.close()
+    with patch(
+        "agent.api.helpers._run_agent_prompt",
+        new=AsyncMock(return_value=SimpleNamespace(result_text="done", session_id=None)),
+    ):
+        result = await process_one_comment_action()
+    assert result["status"] == "succeeded"
+    db = get_db_session()
+    try:
+        run = db.query(AgentRunModel).filter_by(source_comment_id=comment["id"]).one()
+        event = db.query(RunEventModel).filter_by(run_id=run.run_id, event_type="run_created").one()
+        assert run.request_id
+        assert event.request_id == run.request_id
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_retry_trace_records_final_exhausted_attempt(client):
+    db = get_db_session()
+    try:
+        task_data = client.post(
+            "/tasks", json={"title": "Retry exhausted trace", "execution_type": "research"}
+        ).json()
+        task = db.query(TaskModel).filter_by(id=task_data["id"]).one()
+        run = _create_run(db, task, "manual_execute", "research")
+
+        async def always_fails():
+            raise RuntimeError("timed out")
+
+        with patch("agent.orchestrator.asyncio.sleep", new=AsyncMock()):
+            with pytest.raises(RuntimeError, match="timed out"):
+                await _run_with_retry(
+                    always_fails, max_retries=2, base_delay=0,
+                    trace_db=db, trace_run_id=run.run_id,
+                )
+        events = db.query(RunEventModel).filter_by(
+            run_id=run.run_id, event_type="retry"
+        ).order_by(RunEventModel.id).all()
+        assert [json.loads(event.payload)["attempt"] for event in events] == [1, 2]
+        assert [event.outcome for event in events] == ["retrying", "exhausted"]
+    finally:
+        db.close()
+
+
+def test_child_task_and_run_are_atomic(client):
+    db = get_db_session()
+    try:
+        task_data = client.post(
+            "/tasks", json={"title": "Atomic child parent", "execution_type": "orchestrate_seo_campaign"}
+        ).json()
+        parent = db.query(TaskModel).filter_by(id=task_data["id"]).one()
+        parent_run = _create_run(db, parent, "manual_execute", parent.execution_type)
+        with patch.object(db, "commit", side_effect=RuntimeError("simulated crash")):
+            with pytest.raises(RuntimeError, match="simulated crash"):
+                orchestrator_module._ensure_child_task_and_run(
+                    db, parent,
+                    {"phase": "researcher", "execution_type": "campaign_researcher"},
+                    parent_run.run_id,
+                )
+        db.expire_all()
+        assert db.query(TaskModel).filter(TaskModel.parent_task_id == parent.id).count() == 0
+        assert db.query(AgentRunModel).filter(AgentRunModel.parent_run_id == parent_run.run_id).count() == 0
+    finally:
+        db.close()
 
 
 @pytest.mark.asyncio

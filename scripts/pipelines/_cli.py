@@ -158,6 +158,11 @@ def run_pipeline(client_cls: type, pipeline_name: str) -> None:
             f"pending or uncertain. "
             f"Manifest: {exc.manifest_path or 'unavailable'}"
         )
+        print(
+            "Submitted task IDs: "
+            + (", ".join(exc.task_ids) if exc.task_ids else "none")
+        )
+        print(f"Partial results: {len(exc.results)}")
         for error in exc.errors:
             print(
                 f"Task {error.get('task_id', 'unknown')} failed: "

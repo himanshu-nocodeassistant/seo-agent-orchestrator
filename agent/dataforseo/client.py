@@ -214,7 +214,32 @@ class DataForSEOClient:
         for start in range(0, len(payload), batch_size):
             chunk = payload[start:start + batch_size]
             _get_task_bucket().consume(len(chunk))
-            data = self._post(endpoint, chunk)
+            try:
+                data = self._post(endpoint, chunk)
+            except Exception as exc:
+                if not task_ids:
+                    raise
+                manifest_path = self._write_manifest(
+                    endpoint,
+                    request_payloads,
+                    task_ids,
+                    manifest_path=manifest_path,
+                )
+                self._last_manifest_path = manifest_path
+                error = {
+                    "task_id": None,
+                    "error": str(exc),
+                    "request": chunk,
+                }
+                self._update_manifest_submission_errors(
+                    manifest_path, [error], unsubmitted_requests=chunk
+                )
+                raise DataForSEORecoveryError(
+                    task_ids,
+                    manifest_path,
+                    "Task submission partially failed; recover submitted task IDs from the manifest.",
+                    errors=[error],
+                ) from exc
             tasks = data.get("tasks")
             if not isinstance(tasks, list) or not tasks:
                 manifest_path = self._write_manifest(
@@ -520,8 +545,15 @@ class DataForSEOClient:
                     f"Warning: {len(recovery_errors)} task(s) failed during polling; "
                     f"details saved in manifest {manifest_path}"
                 )
+            recoverable_set = set(skipped)
+            recoverable_set.update(
+                error["task_id"] for error in recovery_errors if error.get("task_id")
+            )
+            recoverable_task_ids = [
+                task_id for task_id in task_ids if task_id in recoverable_set
+            ]
             raise DataForSEORecoveryError(
-                skipped,
+                recoverable_task_ids,
                 manifest_path,
                 f"Polling produced partial results; recover task IDs from "
                 f"{manifest_path or 'the DataForSEO manifest'}.",

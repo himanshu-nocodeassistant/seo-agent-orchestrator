@@ -560,7 +560,7 @@ def _claim_campaign_resume(db, run_id: str) -> bool:
         db.query(AgentRunModel)
         .filter(
             AgentRunModel.run_id == run_id,
-            AgentRunModel.status.in_(["queued", "running", "recoverable"]),
+            AgentRunModel.status.in_(["queued", "running", "failed", "recoverable"]),
         )
         .update(
             {
@@ -729,11 +729,49 @@ def _reclaim_stale_comment_actions(db) -> None:
         db.commit()
 
 
-def _heartbeat_comment_action(db, action) -> None:
+def _heartbeat_comment_action(db, action, expected_run_id: Optional[str] = None) -> bool:
     now = _utcnow_iso()
+    query = db.query(CommentActionModel).filter(
+        CommentActionModel.id == action.id,
+        CommentActionModel.status == "running",
+    )
+    if expected_run_id is not None:
+        query = query.filter(CommentActionModel.run_id == expected_run_id)
+    updated = query.update(
+        {
+            CommentActionModel.heartbeat_at: now,
+            CommentActionModel.lease_expires_at: _lease_expires_at(now),
+            CommentActionModel.updated_at: now,
+        },
+        synchronize_session=False,
+    )
+    if updated != 1:
+        db.rollback()
+        return False
+    db.commit()
     action.heartbeat_at = now
     action.lease_expires_at = _lease_expires_at(now)
+    return True
+
+
+def _update_comment_action_if_owned(
+    db, action_id: int, owner_run_id: str, values: dict
+) -> bool:
+    """Update a comment action only while this worker still owns its lease."""
+    updated = (
+        db.query(CommentActionModel)
+        .filter(
+            CommentActionModel.id == action_id,
+            CommentActionModel.status == "running",
+            CommentActionModel.run_id == owner_run_id,
+        )
+        .update(values, synchronize_session=False)
+    )
+    if updated != 1:
+        db.rollback()
+        return False
     db.commit()
+    return True
 
 
 def _task_has_review_gate(db, task) -> bool:
@@ -862,21 +900,51 @@ def _finalize_run_success(
     validation: ValidationResult,
 ) -> None:
     now = _utcnow_iso()
-    owns_task = _run_owns_task(db, run, task)
-    run.session_id = session_id
-    run.result_summary = result_text
-    run.validator_status = validation.status
-    run.finished_at = now
-    run.status = "completed" if validation.status == "passed" else "needs_review"
-    run.error = validation.message if validation.status != "passed" else None
+    final_status = "completed" if validation.status == "passed" else "needs_review"
+    run_updated = (
+        db.query(AgentRunModel)
+        .filter(
+            AgentRunModel.run_id == run.run_id,
+            AgentRunModel.status.in_(["queued", "running", "resuming"]),
+        )
+        .update(
+            {
+                AgentRunModel.session_id: session_id,
+                AgentRunModel.result_summary: result_text,
+                AgentRunModel.validator_status: validation.status,
+                AgentRunModel.finished_at: now,
+                AgentRunModel.status: final_status,
+                AgentRunModel.error: validation.message if validation.status != "passed" else None,
+            },
+            synchronize_session=False,
+        )
+    )
+    if run_updated != 1:
+        db.rollback()
+        return False
 
-    if owns_task:
-        task.notes = result_text
-        task.status = "completed" if validation.status == "passed" else "blocked"
-        task.active_run_id = None
-        task.last_run_id = run.run_id
-        task.updated_at = now
+    owns_task = False
+    if task is not None and run.task_id is not None:
+        owns_task = (
+            db.query(TaskModel)
+            .filter(
+                TaskModel.id == task.id,
+                TaskModel.active_run_id == run.run_id,
+            )
+            .update(
+                {
+                    TaskModel.notes: result_text,
+                    TaskModel.status: "completed" if validation.status == "passed" else "blocked",
+                    TaskModel.active_run_id: None,
+                    TaskModel.last_run_id: run.run_id,
+                    TaskModel.updated_at: now,
+                },
+                synchronize_session=False,
+            )
+            == 1
+        )
     db.commit()
+    db.refresh(run)
 
     if owns_task and session_id and run.task_id is not None:
         _upsert_task_session(db, run.task_id, session_id, run.run_id)
@@ -886,27 +954,58 @@ def _finalize_run_success(
         "run_completed",
         {"validator_status": validation.status, "message": validation.message},
     )
+    return owns_task
 
 
 def _finalize_run_failure(db, run, task, error_message: str, status: str = "failed") -> None:
     now = _utcnow_iso()
-    owns_task = _run_owns_task(db, run, task)
     if status == "failed" and (
         bool(run.write_capable) or _is_write_capable(run.execution_type)
     ):
         status = "review_required"
-    run.status = status
-    run.error = error_message
-    run.finished_at = now
-    run.validator_status = "failed"
-    if owns_task:
-        task.status = "blocked"
-        task.notes = f"Error: {error_message}"
-        task.active_run_id = None
-        task.last_run_id = run.run_id
-        task.updated_at = now
+    run_updated = (
+        db.query(AgentRunModel)
+        .filter(
+            AgentRunModel.run_id == run.run_id,
+            AgentRunModel.status.in_(["queued", "running", "resuming"]),
+        )
+        .update(
+            {
+                AgentRunModel.status: status,
+                AgentRunModel.error: error_message,
+                AgentRunModel.finished_at: now,
+                AgentRunModel.validator_status: "failed",
+            },
+            synchronize_session=False,
+        )
+    )
+    if run_updated != 1:
+        db.rollback()
+        return False
+    owns_task = False
+    if task is not None and run.task_id is not None:
+        owns_task = (
+            db.query(TaskModel)
+            .filter(
+                TaskModel.id == task.id,
+                TaskModel.active_run_id == run.run_id,
+            )
+            .update(
+                {
+                    TaskModel.status: "blocked",
+                    TaskModel.notes: f"Error: {error_message}",
+                    TaskModel.active_run_id: None,
+                    TaskModel.last_run_id: run.run_id,
+                    TaskModel.updated_at: now,
+                },
+                synchronize_session=False,
+            )
+            == 1
+        )
     db.commit()
+    db.refresh(run)
     _log_run_event(db, run.run_id, "run_failed", {"error": error_message, "status": status})
+    return owns_task
 
 
 def _refresh_context_view(db, task_id: Optional[int] = None) -> None:
@@ -941,7 +1040,11 @@ async def _run_agent_prompt(prompt: str, config: AgentConfig, prompt_context) ->
                         _heartbeat_run(heartbeat_db, run, record_event=False)
                 action = getattr(config, "_comment_action", None)
                 if heartbeat_db is not None and action is not None:
-                    _heartbeat_comment_action(heartbeat_db, action)
+                    _heartbeat_comment_action(
+                        heartbeat_db,
+                        action,
+                        expected_run_id=getattr(config, "_comment_action_run_id", None),
+                    )
             except Exception:
                 logger.exception("Could not refresh execution lease")
 
@@ -993,6 +1096,7 @@ def _build_runtime_config(
         config._heartbeat_run_id = run_id
     if comment_action is not None:
         config._comment_action = comment_action
+        config._comment_action_run_id = getattr(comment_action, "run_id", None)
 
     return config
 
@@ -1105,6 +1209,7 @@ def _acquire_next_comment_action(db) -> Optional[CommentActionModel]:
 
 async def process_one_comment_action(request_id: Optional[str] = None) -> dict:
     """Process exactly one pending trigger comment action."""
+    request_id = request_id or str(uuid4())
     async with comment_autopilot_lock:
         db = db_module.get_db_session()
         try:
@@ -1196,13 +1301,24 @@ async def process_one_comment_action(request_id: Optional[str] = None) -> dict:
                     "attempts": action.attempts,
                     "max_attempts": action.max_attempts,
                 }
-            _heartbeat_comment_action(db, action)
             task.status = "in_progress"
             task.updated_at = _utcnow_iso()
             db.commit()
             add_task_comment(db, task.id, f"🤖 Started revision from comment #{comment.id}", "agent")
             action.run_id = run.run_id
             db.commit()
+            action_owner_run_id = run.run_id
+            if not _heartbeat_comment_action(
+                db, action, expected_run_id=action_owner_run_id
+            ):
+                return {
+                    "processed": True,
+                    "task_id": task.id,
+                    "comment_id": comment.id,
+                    "status": "deferred",
+                    "attempts": action.attempts,
+                    "max_attempts": action.max_attempts,
+                }
 
             workflow_prompt = build_comment_revision_prompt(task, comment.body)
             try:
@@ -1248,8 +1364,18 @@ async def process_one_comment_action(request_id: Optional[str] = None) -> dict:
                 else:
                     action.status = "failed"
 
-            action.updated_at = _utcnow_iso()
-            db.commit()
+            _update_comment_action_if_owned(
+                db,
+                action.id,
+                action_owner_run_id,
+                {
+                    CommentActionModel.status: action.status,
+                    CommentActionModel.recovery_state: action.recovery_state,
+                    CommentActionModel.acted_at: action.acted_at,
+                    CommentActionModel.last_error: action.last_error,
+                    CommentActionModel.updated_at: _utcnow_iso(),
+                },
+            )
             return {
                 "processed": True,
                 "task_id": task.id,

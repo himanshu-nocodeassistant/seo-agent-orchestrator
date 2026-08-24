@@ -224,6 +224,43 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
                 db.refresh(run)
                 return _run_response(run)
 
+            retry_run = (
+                db.query(AgentRunModel)
+                .filter(
+                    AgentRunModel.task_id == task.id,
+                    AgentRunModel.execution_type == "orchestrate_seo_campaign",
+                )
+                .order_by(AgentRunModel.id.desc())
+                .first()
+            )
+            retry_state = None
+            if retry_run is not None:
+                retry_state = db.query(OrchestrationStateModel).filter(
+                    OrchestrationStateModel.orchestrator_run_id == retry_run.run_id
+                ).first()
+            if (
+                retry_run is not None
+                and retry_run.status == "failed"
+                and retry_state is not None
+                and retry_state.status == "error"
+            ):
+                if not _claim_campaign_resume(db, retry_run.run_id):
+                    db.refresh(retry_run)
+                    return _run_response(retry_run)
+                add_task_comment(
+                    db, task_id, "🤖 Campaign retry resuming saved phases", "agent"
+                )
+                try:
+                    await _execute_campaign_with_timeout(
+                        db, task, retry_run, resume=True
+                    )
+                except Exception as e:
+                    _finalize_run_failure(db, retry_run, task, str(e))
+                    _refresh_context_view(db, task_id=task.id)
+                    add_task_failed_comment(db, task_id, str(e))
+                db.refresh(retry_run)
+                return _run_response(retry_run)
+
             run = _create_run(
                 db,
                 task,
@@ -245,6 +282,13 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
             return _run_response(run)
         # ── End orchestration branch ──────────────────────────────────────────
 
+        profile = get_execution_profile(task.execution_type)
+        if profile.requires_approval and not task.approved_at:
+            raise HTTPException(
+                status_code=400,
+                detail="Task requires approval before execution.",
+            )
+
         run = _create_run(
             db,
             task,
@@ -259,7 +303,6 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
         try:
             task_comments = db.query(CommentModel).filter(CommentModel.task_id == task_id).order_by(CommentModel.created_at).all()
             workflow_prompt = build_execution_prompt(task, comments=task_comments)
-            profile = get_execution_profile(task.execution_type)
             resume_session_id = _get_task_session_id(db, task.id)
             prompt_context = _resolve_prompt_context(db, run, task, task_comments, workflow_prompt, profile)
             run.prompt_text = workflow_prompt

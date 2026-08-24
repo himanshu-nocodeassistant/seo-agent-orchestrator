@@ -27,6 +27,10 @@ from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
+
+class LostRunOwnership(RuntimeError):
+    """Raised when a campaign worker no longer owns its parent run."""
+
 # Errors whose message matches these patterns are transient and safe to retry.
 _RETRYABLE_PATTERNS = [
     r"timed out",
@@ -104,30 +108,33 @@ async def _run_with_retry(
             if not _is_retryable(exc):
                 raise
             last_exc = exc
+            retrying = attempt < max_retries - 1
+            if trace_db is not None and trace_run_id:
+                try:
+                    from agent.api.helpers import _log_run_event
+
+                    _log_run_event(
+                        trace_db,
+                        trace_run_id,
+                        "retry",
+                        {
+                            "attempt": attempt + 1,
+                            "max_retries": max_retries,
+                            "error": str(exc),
+                            "next_delay_seconds": delay if retrying else None,
+                        },
+                        outcome="retrying" if retrying else "exhausted",
+                    )
+                except Exception:
+                    logger.exception("Could not persist retry trace event")
+            if not retrying:
+                break
             if attempt < max_retries - 1:
                 if deadline is not None and time.monotonic() > deadline:
                     raise RuntimeError(
                         f"_run_with_retry exceeded max_total_seconds={max_total_seconds} "
                         f"after {attempt + 1} attempt(s)"
                     )
-                if trace_db is not None and trace_run_id:
-                    try:
-                        from agent.api.helpers import _log_run_event
-
-                        _log_run_event(
-                            trace_db,
-                            trace_run_id,
-                            "retry",
-                            {
-                                "attempt": attempt + 1,
-                                "max_retries": max_retries,
-                                "error": str(exc),
-                                "next_delay_seconds": delay,
-                            },
-                            outcome="retrying",
-                        )
-                    except Exception:
-                        logger.exception("Could not persist retry trace event")
                 logger.warning(
                     "Transient failure (attempt %d/%d): %s — retrying in %.1fs",
                     attempt + 1, max_retries, exc, delay,
@@ -292,6 +299,7 @@ async def _dispatch_phase(
     campaign_goal: str,
     helpers: dict,
     phase_has_dependents: bool,
+    ownership_check=None,
 ) -> tuple[str, str, bool]:
     """
     Run a single child agent phase and return (phase_name, result_text, degraded).
@@ -306,6 +314,9 @@ async def _dispatch_phase(
     phases never share/interleave a SQLAlchemy session (the PostToolUse hook
     and run/task writes all go through the phase-local session).
     """
+    if ownership_check is not None and not ownership_check():
+        raise LostRunOwnership("Campaign parent run ownership was lost before child dispatch")
+
     from agent.db import SessionLocal, TaskModel
     from agent.runtime_profiles import get_execution_profile
 
@@ -318,6 +329,8 @@ async def _dispatch_phase(
         child_task = phase_db.query(TaskModel).filter(TaskModel.id == child_task_id).first()
         if child_task is None:
             raise RuntimeError(f"Child task {child_task_id} not found for phase [{phase_name}]")
+        if ownership_check is not None and not ownership_check():
+            raise LostRunOwnership("Campaign parent run ownership was lost before child start")
 
         base_child_prompt = helpers["build_execution_prompt"](child_task, comments=[])
         child_prompt = _build_child_prompt_with_prior_outputs(
@@ -327,6 +340,8 @@ async def _dispatch_phase(
         child_run = _create_child_run(
             phase_db, child_task, orchestrator_run_id, child_exec_type
         )
+        if ownership_check is not None and not ownership_check():
+            raise LostRunOwnership("Campaign parent run ownership was lost before agent execution")
 
         child_prompt_context = helpers["_resolve_prompt_context"](
             phase_db, child_run, child_task, [], child_prompt, child_profile
@@ -390,6 +405,8 @@ async def _dispatch_phase(
             raise RuntimeError(
                 f"Phase [{phase_name}] output failed validation: {child_validation.message}"
             )
+        if ownership_check is not None and not ownership_check():
+            raise LostRunOwnership("Campaign parent run ownership was lost before child finalization")
         helpers["_finalize_run_success"](
             phase_db, child_run, child_task,
             result_text,
@@ -411,6 +428,7 @@ async def run_campaign_orchestration(
     from agent.api import helpers as helpers_module
 
     stop_heartbeat = asyncio.Event()
+    ownership_lost = asyncio.Event()
 
     async def heartbeat_loop():
         while True:
@@ -424,17 +442,22 @@ async def run_campaign_orchestration(
                 pass
             try:
                 if orchestrator_run.status in {"queued", "running", "resuming"}:
-                    helpers_module._heartbeat_run(
+                    alive = helpers_module._heartbeat_run(
                         db, orchestrator_run, record_event=False
                     )
+                    if alive is False:
+                        ownership_lost.set()
             except Exception:
                 logger.exception("Could not refresh campaign parent lease")
 
     heartbeat_task = asyncio.create_task(heartbeat_loop())
     try:
         await _run_campaign_orchestration(
-            db, parent_task, orchestrator_run, resume=resume
+            db, parent_task, orchestrator_run, resume=resume,
+            ownership_lost=ownership_lost,
         )
+    except LostRunOwnership:
+        logger.warning("Campaign worker stopped after losing parent run ownership")
     finally:
         stop_heartbeat.set()
         heartbeat_task.cancel()
@@ -443,7 +466,8 @@ async def run_campaign_orchestration(
 
 
 async def _run_campaign_orchestration(
-    db, parent_task, orchestrator_run, resume: bool = False
+    db, parent_task, orchestrator_run, resume: bool = False,
+    ownership_lost: Optional[asyncio.Event] = None,
 ) -> None:
     """
     Drive a full multi-agent SEO campaign from a single orchestrator run.
@@ -481,6 +505,15 @@ async def _run_campaign_orchestration(
     from agent.prompts import build_execution_prompt
     from agent.runtime_profiles import ValidationResult, get_execution_profile
 
+    def ensure_ownership() -> None:
+        active_run_id = db.query(TaskModel.active_run_id).filter(
+            TaskModel.id == parent_task.id
+        ).scalar()
+        if (ownership_lost is not None and ownership_lost.is_set()) or active_run_id != orchestrator_run.run_id:
+            if ownership_lost is not None:
+                ownership_lost.set()
+            raise LostRunOwnership("Campaign parent run ownership was lost")
+
     helpers = {
         "build_execution_prompt": build_execution_prompt,
         "_build_runtime_config": helpers_module._build_runtime_config,
@@ -503,11 +536,11 @@ async def _run_campaign_orchestration(
         state = db.query(OrchestrationStateModel).filter(
             OrchestrationStateModel.orchestrator_run_id == orchestrator_run.run_id
         ).first()
-        if state is None or state.status != "awaiting_approval":
+        if state is None or state.status not in {"awaiting_approval", "error"}:
             raise RuntimeError(
                 "Cannot resume: no campaign paused awaiting approval for this run."
             )
-        if not parent_task.approved_at:
+        if state.status == "awaiting_approval" and not parent_task.approved_at:
             raise RuntimeError("Cannot resume: task has not been approved yet.")
         try:
             phases = _parse_orchestration_plan(state.plan_json or "")
@@ -526,6 +559,7 @@ async def _run_campaign_orchestration(
         helpers_module.add_task_comment(
             db, parent_task.id, "Campaign resuming after approval.", "agent"
         )
+        ensure_ownership()
         state.status = "running"
         state.updated_at = datetime.utcnow().isoformat()
         db.commit()
@@ -541,7 +575,9 @@ async def _run_campaign_orchestration(
             title = phase_spec.get("task_title", f"Campaign: {phase_spec['phase']}")
             child_task = by_title.get(title)
             if child_task is None:
-                child_task = _create_child_task(db, parent_task, phase_spec)
+                child_task = _ensure_child_task_and_run(
+                    db, parent_task, phase_spec, orchestrator_run.run_id
+                )
             child_tasks[phase_spec["phase"]] = child_task
 
         completed = set(phase_outputs)
@@ -623,7 +659,9 @@ async def _run_campaign_orchestration(
         # ── Create child tasks ───────────────────────────────────────────────
         child_tasks = {}
         for phase_spec in phases:
-            child_task = _create_child_task(db, parent_task, phase_spec)
+            child_task = _ensure_child_task_and_run(
+                db, parent_task, phase_spec, orchestrator_run.run_id
+            )
             child_tasks[phase_spec["phase"]] = child_task
 
         tier_summary = " → ".join(
@@ -643,6 +681,7 @@ async def _run_campaign_orchestration(
 
     # ── Tier-by-tier dispatch (parallel within tier) ─────────────────────────
     for tier in tiers:
+        ensure_ownership()
         pending_in_tier = [p for p in tier if p["phase"] not in phase_outputs]
         if not pending_in_tier:
             continue
@@ -693,17 +732,23 @@ async def _run_campaign_orchestration(
                 db, phase_spec, child_tasks[phase_spec["phase"]].id,
                 orchestrator_run.run_id, phase_outputs, campaign_goal, helpers,
                 phase_spec["phase"] in dependents,
+                ownership_check=lambda: _campaign_run_owns_task(
+                    db, parent_task.id, orchestrator_run.run_id
+                ),
             )
             for phase_spec in pending_in_tier
         ]
 
         tier_results = await asyncio.gather(*tasks_coros, return_exceptions=True)
+        ensure_ownership()
 
         # Check for failures (fail-fast)
         failed_phase = None
         failed_error = None
         for phase_spec, result in zip(pending_in_tier, tier_results):
             if isinstance(result, BaseException):
+                if isinstance(result, LostRunOwnership):
+                    raise result
                 failed_phase = phase_spec["phase"]
                 failed_error = result
                 # Mark failed child task
@@ -741,12 +786,14 @@ async def _run_campaign_orchestration(
                         "agent",
                     )
 
+        ensure_ownership()
         state.phase_outputs_json = json.dumps(phase_outputs)
         state.child_run_ids_json = json.dumps(child_run_ids)
         state.updated_at = datetime.utcnow().isoformat()
         db.commit()
 
         if failed_phase is not None:
+            ensure_ownership()
             state.status = "error"
             state.error = f"Phase [{failed_phase}] failed: {failed_error}"
             state.updated_at = datetime.utcnow().isoformat()
@@ -763,6 +810,7 @@ async def _run_campaign_orchestration(
             return
 
     # ── Finalize campaign ─────────────────────────────────────────────────────
+    ensure_ownership()
     state.status = "completed"
     state.current_phase = None
     state.updated_at = datetime.utcnow().isoformat()
@@ -774,6 +822,7 @@ async def _run_campaign_orchestration(
         summary_lines.append(f"- **{phase_name}**: {snippet}...")
     summary = "\n".join(summary_lines)
 
+    ensure_ownership()
     helpers_module._finalize_run_success(
         db, orchestrator_run, parent_task,
         summary,
@@ -796,6 +845,12 @@ def _get_latest_run_for_task(db, AgentRunModel, task_id: int):
 def _get_latest_run_id_for_task(db, AgentRunModel, task_id: int) -> str:
     run = _get_latest_run_for_task(db, AgentRunModel, task_id)
     return run.run_id if run else ""
+
+
+def _campaign_run_owns_task(db, task_id: int, run_id: str) -> bool:
+    from agent.db import TaskModel
+
+    return db.query(TaskModel.active_run_id).filter(TaskModel.id == task_id).scalar() == run_id
 
 
 def _create_child_task(db, parent_task, phase_spec: dict):
@@ -831,7 +886,46 @@ def _create_child_task(db, parent_task, phase_spec: dict):
     return child
 
 
-def _create_child_run(db, child_task, parent_run_id: str, execution_type: str):
+def _ensure_child_task_and_run(db, parent_task, phase_spec: dict, parent_run_id: str):
+    """Create a campaign child task and run in one transaction."""
+    from agent.api.main import TaskModel
+
+    title = phase_spec.get("task_title", f"Campaign: {phase_spec['phase']}")
+    child = db.query(TaskModel).filter(
+        TaskModel.parent_task_id == parent_task.id,
+        TaskModel.title == title,
+    ).first()
+    try:
+        if child is None:
+            now = datetime.utcnow().isoformat()
+            child = TaskModel(
+                title=title,
+                description=phase_spec.get("task_description"),
+                status="pending",
+                priority=parent_task.priority,
+                execution_type=phase_spec.get("execution_type", phase_spec["phase"]),
+                parent_task_id=parent_task.id,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(child)
+            db.flush()
+        _create_child_run(
+            db, child, parent_run_id,
+            phase_spec.get("execution_type", phase_spec["phase"]),
+            commit=False,
+        )
+        db.commit()
+        db.refresh(child)
+        return child
+    except Exception:
+        db.rollback()
+        raise
+
+
+def _create_child_run(
+    db, child_task, parent_run_id: str, execution_type: str, *, commit: bool = True
+):
     """Create an AgentRunModel for a child phase, linked to the orchestrator run."""
     from agent.api.main import AgentRunModel, RunEventModel
 
@@ -879,10 +973,11 @@ def _create_child_run(db, child_task, parent_run_id: str, execution_type: str):
         payload=json.dumps({"trigger_source": "orchestrator", "parent_run_id": parent_run_id}),
         created_at=now,
     ))
-    try:
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise
+    if commit:
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
     db.refresh(run)
     return run

@@ -64,8 +64,11 @@ def test_manifest_survives_failure_after_first_batch(client, tmp_path, monkeypat
     created = {"status_code": 20000, "tasks": [{"id": "submitted-1", "status_code": 20100}]}
 
     with patch.object(client, "_post", side_effect=[created, RuntimeError("second batch")]):
-        with pytest.raises(RuntimeError, match="second batch"):
+        with pytest.raises(DataForSEORecoveryError) as exc_info:
             client._task_post("serp/google/organic/task_post", [{"keyword": "one"}, {"keyword": "two"}])
+
+    assert exc_info.value.task_ids == ["submitted-1"]
+    assert "second batch" in exc_info.value.errors[0]["error"]
 
     manifests = list(tmp_path.glob("*.json"))
     assert len(manifests) == 1
