@@ -4,6 +4,8 @@ import random
 import sys
 import threading
 import time
+from datetime import datetime, timezone
+from uuid import uuid4
 from dotenv import load_dotenv
 import requests
 
@@ -24,6 +26,10 @@ TASK_NOT_READY_STATUSES = (40601, 40602)
 RETRYABLE_HTTP_STATUSES = (429, 502, 503, 504)
 MAX_RETRIES = 5
 RETRY_BACKOFF_BASE = 2.0
+MAX_RETRY_DELAY = 30.0
+MAX_POLL_SECONDS = 30 * 60
+DEFAULT_CONNECT_TIMEOUT = 10.0
+DEFAULT_READ_TIMEOUT = 60.0
 
 
 def _jittered_backoff(attempt: int) -> float:
@@ -81,6 +87,15 @@ class TaskNotReadyError(DataForSEOError):
     pass
 
 
+class DataForSEORecoveryError(DataForSEOError):
+    """A submitted task needs recovery from its preserved manifest."""
+
+    def __init__(self, task_ids: list[str], manifest_path: str | None, message: str):
+        self.task_ids = list(task_ids)
+        self.manifest_path = manifest_path
+        super().__init__(0, message)
+
+
 class DataForSEOClient:
     def __init__(self, login: str = None, password: str = None):
         self.login = login or os.environ["DATAFORSEO_LOGIN"]
@@ -92,6 +107,7 @@ class DataForSEOClient:
         # response's own `cost` field (not an estimate). Per-instance, not
         # global, so concurrent pipelines don't cross-contaminate totals.
         self.total_cost: float = 0.0
+        self._last_manifest_path: str | None = None
 
     def _accumulate_cost(self, data: dict) -> None:
         cost = data.get("cost")
@@ -105,6 +121,7 @@ class DataForSEOClient:
         Anything else (auth errors, 4xx other than 429, etc.) raises immediately.
         """
         last_exc = None
+        kwargs.setdefault("timeout", self._request_timeout())
         for attempt in range(MAX_RETRIES):
             try:
                 response = self.session.request(method, url, **kwargs)
@@ -121,7 +138,7 @@ class DataForSEOClient:
                 retry_after = response.headers.get("Retry-After")
                 if retry_after and attempt < MAX_RETRIES - 1:
                     try:
-                        delay = float(retry_after)
+                        delay = min(max(float(retry_after), 0.0), MAX_RETRY_DELAY)
                     except (ValueError, TypeError):
                         delay = _jittered_backoff(attempt)
                     time.sleep(delay)
@@ -184,6 +201,7 @@ class DataForSEOClient:
         )
         task_ids = []
         request_payloads = []
+        manifest_path = None
         for start in range(0, len(payload), batch_size):
             chunk = payload[start:start + batch_size]
             _get_task_bucket().consume(len(chunk))
@@ -198,18 +216,31 @@ class DataForSEOClient:
                         task_status,
                         task.get("status_message", "Task creation failed"),
                     )
-        self._write_manifest(endpoint, request_payloads, task_ids)
+            manifest_path = self._write_manifest(
+                endpoint,
+                request_payloads,
+                task_ids,
+                manifest_path=manifest_path,
+            )
+        self._last_manifest_path = manifest_path
         return task_ids
 
     @staticmethod
-    def _write_manifest(endpoint: str, payload: list, task_ids: list[str]) -> str:
+    def _write_manifest(
+        endpoint: str,
+        payload: list,
+        task_ids: list[str],
+        manifest_path: str | None = None,
+    ) -> str:
         """Persist {task_id: request_task} to logs/task_manifests/ so a crash
         during polling can resume from disk instead of losing the IDs."""
         os.makedirs(MANIFEST_DIR, exist_ok=True)
-        # Microsecond timestamp so concurrent pipeline runs never collide.
-        timestamp = time.strftime("%Y%m%d-%H%M%S-%f")
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
         safe_endpoint = endpoint.strip("/").replace("/", "_")
-        manifest_path = os.path.join(MANIFEST_DIR, f"{timestamp}_{safe_endpoint}.json")
+        manifest_path = manifest_path or os.path.join(
+            MANIFEST_DIR,
+            f"{timestamp}_{uuid4().hex[:12]}_{safe_endpoint}.json",
+        )
         manifest = {
             "endpoint": endpoint,
             "created_at": timestamp,
@@ -223,6 +254,19 @@ class DataForSEOClient:
             json.dump(manifest, f, indent=2)
         os.replace(tmp_path, manifest_path)
         return manifest_path
+
+    @staticmethod
+    def _request_timeout() -> tuple[float, float]:
+        def read_timeout(name: str, default: float) -> float:
+            try:
+                return max(float(os.environ.get(name, default)), 0.1)
+            except (TypeError, ValueError):
+                return default
+
+        return (
+            read_timeout("DATAFORSEO_CONNECT_TIMEOUT_SECONDS", DEFAULT_CONNECT_TIMEOUT),
+            read_timeout("DATAFORSEO_READ_TIMEOUT_SECONDS", DEFAULT_READ_TIMEOUT),
+        )
 
     def _task_get(self, endpoint: str, task_id: str) -> dict:
         """Retrieve results for a single completed task."""
@@ -264,6 +308,7 @@ class DataForSEOClient:
         _task_post, so they can be recovered later without re-billing.
         """
         task_ids = self._task_post(post_endpoint, payload)
+        manifest_path = getattr(self, "_last_manifest_path", None)
 
         all_results = []
         skipped = []
@@ -271,7 +316,8 @@ class DataForSEOClient:
         # Global deadline across all tasks: one round polls every still-pending
         # task, so a batch of N tasks takes O(max_wait) worst case instead of
         # O(N × max_wait).
-        deadline = time.monotonic() + max_wait
+        effective_max_wait = min(max_wait, MAX_POLL_SECONDS)
+        deadline = time.monotonic() + effective_max_wait
         while pending:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -295,8 +341,14 @@ class DataForSEOClient:
 
         if skipped:
             print(
-                f"Warning: {len(skipped)} task(s) not ready after {max_wait}s, "
-                f"skipped (recoverable from manifest, not re-billed): {skipped}"
+                f"Warning: {len(skipped)} task(s) not ready after {effective_max_wait}s, "
+                f"recoverable from manifest {manifest_path}: {skipped}"
+            )
+            raise DataForSEORecoveryError(
+                skipped,
+                manifest_path,
+                f"Polling stopped after {effective_max_wait}s; recover task IDs "
+                f"from {manifest_path or 'the DataForSEO manifest'}.",
             )
 
         return all_results
