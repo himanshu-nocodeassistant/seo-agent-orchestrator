@@ -21,7 +21,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
+from sqlalchemy import text
 
+from agent import db as db_module
 from agent.api.helpers import (
     _autopilot_enabled,
     _autopilot_interval_seconds,
@@ -144,8 +146,40 @@ async def _api_token_check(request: Request, call_next):
 
 @app.get("/health")
 def health_check():
-    """Health check endpoint."""
-    return {"status": "ok", "service": "seo-bot-kanban"}
+    """Fast dependency health check with safe, stable output."""
+    database_status = "ok"
+    db = None
+    try:
+        db = db_module.get_db_session()
+        db.execute(text("SELECT 1"))
+    except Exception:
+        database_status = "unavailable"
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+    if not _autopilot_enabled():
+        worker_status = "disabled"
+    else:
+        worker = getattr(app.state, "comment_autopilot_task", None)
+        if worker is None:
+            worker_status = "not_running"
+        elif worker.cancelled() or worker.done():
+            worker_status = "failed"
+        else:
+            worker_status = "running"
+
+    healthy_worker = worker_status in {"running", "disabled"}
+    overall_status = "ok" if database_status == "ok" and healthy_worker else "degraded"
+    return {
+        "status": overall_status,
+        "service": "seo-bot-kanban",
+        "database": {"status": database_status},
+        "worker": {"status": worker_status},
+    }
 
 
 KANBAN_HTML_PATH = Path(__file__).parent / "static" / "kanban.html"
