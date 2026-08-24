@@ -196,12 +196,12 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
                 state = db.query(OrchestrationStateModel).filter(
                     OrchestrationStateModel.orchestrator_run_id == run.run_id
                 ).first()
-                if state is None or state.status != "awaiting_approval":
+                if state is None or state.status not in {"awaiting_approval", "error", "running"}:
                     raise HTTPException(
                         status_code=400,
-                        detail="Campaign is not paused awaiting approval.",
+                        detail="Campaign has no safely recoverable saved state.",
                     )
-                if not task.approved_at:
+                if state.status == "awaiting_approval" and not task.approved_at:
                     raise HTTPException(
                         status_code=400,
                         detail="Task not approved yet — set approved_at first.",
@@ -215,7 +215,12 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
                 task.updated_at = _utcnow_iso()
                 db.commit()
                 add_task_comment(
-                    db, task_id, "🤖 Campaign resuming after approval", "agent"
+                    db,
+                    task_id,
+                    "🤖 Campaign resuming saved state"
+                    if state.status != "awaiting_approval"
+                    else "🤖 Campaign resuming after approval",
+                    "agent",
                 )
                 try:
                     await _execute_campaign_with_timeout(db, task, run, resume=True)
@@ -267,6 +272,34 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
                     return _run_response(retry_run)
                 add_task_comment(
                     db, task_id, "🤖 Campaign retry resuming saved phases", "agent"
+                )
+                try:
+                    await _execute_campaign_with_timeout(
+                        db, task, retry_run, resume=True
+                    )
+                except Exception as e:
+                    _finalize_run_failure(db, retry_run, task, str(e))
+                    _refresh_context_view(db, task_id=task.id)
+                    add_task_failed_comment(db, task_id, str(e))
+                db.refresh(retry_run)
+                return _run_response(retry_run)
+
+            if (
+                retry_run is not None
+                and retry_run.status == "recoverable"
+                and retry_state is not None
+                and retry_state.status in {"running", "error"}
+                and not retry_run.write_capable
+            ):
+                if not _claim_campaign_resume(
+                    db,
+                    retry_run.run_id,
+                    request_id=getattr(request.state, "request_id", None),
+                ):
+                    db.refresh(retry_run)
+                    return _run_response(retry_run)
+                add_task_comment(
+                    db, task_id, "🤖 Campaign recovering saved read-only phases", "agent"
                 )
                 try:
                     await _execute_campaign_with_timeout(
@@ -353,6 +386,10 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
                     f"⚠️ Run completed but failed validation: {validation.message}",
                     "agent",
                 )
+        except helpers_module.RunOwnershipLost:
+            # The heartbeat fenced this worker. Do not finalize or clear state
+            # for a run that may now belong to another worker.
+            db.refresh(run)
         except Exception as e:
             _finalize_run_failure(db, run, task, str(e))
             _refresh_context_view(db, task_id=task.id)

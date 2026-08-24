@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+import requests
 
 from agent.api.helpers import (
     RUN_LEASE_SECONDS,
@@ -21,6 +22,7 @@ from agent.api.helpers import (
     _run_agent_prompt,
     _utcnow_iso,
     recover_stale_runs,
+    _finalize_run_success,
 )
 from agent.api.main import (
     AgentRunModel,
@@ -38,6 +40,7 @@ from agent.dataforseo.client import (
     DataForSEORecoveryError,
     TaskNotReadyError,
 )
+from agent.runtime_profiles import ValidationResult
 import agent.orchestrator as orchestrator_module
 from agent.orchestrator import _run_with_retry
 from scripts.pipelines._cli import run_pipeline
@@ -1390,3 +1393,169 @@ def test_resume_request_id_is_stored_on_run_and_event(client):
         assert event.request_id == "req-resume-trace"
     finally:
         db.close()
+
+
+def test_validation_failed_write_run_is_a_review_gate(client):
+    task_data = client.post(
+        "/tasks", json={"title": "Validation write gate", "execution_type": "webflow_publish"}
+    ).json()
+    db = get_db_session()
+    try:
+        task = db.query(TaskModel).filter_by(id=task_data["id"]).one()
+        task.approved_at = _utcnow_iso()
+        db.commit()
+        run = _create_run(db, task, "manual_execute", "webflow_publish")
+        _finalize_run_success(
+            db,
+            run,
+            task,
+            "The publisher wrote, but the output was invalid.",
+            None,
+            ValidationResult(status="failed", message="missing publish confirmation"),
+        )
+        db.refresh(run)
+        assert run.status == "review_required"
+        assert task.status == "blocked"
+        task_id = task.id
+        run_id = run.run_id
+    finally:
+        db.close()
+
+    with patch("agent.api.helpers._run_agent_prompt", new=AsyncMock()) as run_agent:
+        response = client.post(f"/tasks/{task_id}/execute")
+
+    assert response.status_code == 200
+    assert response.json()["run_id"] == run_id
+    assert response.json()["status"] == "review_required"
+    run_agent.assert_not_awaited()
+
+
+def test_uncertain_dataforseo_post_is_not_retried_and_is_manifested(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATAFORSEO_LOGIN", "login")
+    monkeypatch.setenv("DATAFORSEO_PASSWORD", "password")
+    monkeypatch.setattr("agent.dataforseo.client.MANIFEST_DIR", str(tmp_path))
+    client = DataForSEOClient()
+    payload = [{"keyword": "uncertain"}]
+    with patch.object(
+        client.session,
+        "request",
+        side_effect=requests.exceptions.ReadTimeout("response lost after acceptance"),
+    ) as request:
+        with pytest.raises(DataForSEORecoveryError) as exc_info:
+            client._task_post("serp/google/organic/task_post", payload)
+
+    assert request.call_count == 1
+    assert exc_info.value.task_ids == []
+    manifest = json.loads((tmp_path / next(p.name for p in tmp_path.glob("*.json"))).read_text())
+    assert manifest["unknown_requests"] == payload
+    assert manifest["submission_errors"][0]["status"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_normal_worker_stops_when_run_ownership_is_lost(client):
+    db = get_db_session()
+    try:
+        task_data = client.post(
+            "/tasks", json={"title": "Ownership cancellation", "execution_type": "research"}
+        ).json()
+        task = db.query(TaskModel).filter_by(id=task_data["id"]).one()
+        run = _create_run(db, task, "manual_execute", "research")
+        config = SimpleNamespace(_heartbeat_db=db, _heartbeat_run_id=run.run_id)
+    finally:
+        db.close()
+
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def long_agent(*args, **kwargs):
+        started.set()
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    with patch("agent.api.helpers.RUN_HEARTBEAT_INTERVAL_SECONDS", 0.01), \
+        patch("agent.api.helpers._heartbeat_run", return_value=False), \
+        patch("agent.api.helpers.SEOAgent.create_and_run_result", new=long_agent):
+        with pytest.raises(RuntimeError, match="ownership"):
+            await _run_agent_prompt("work", config, {})
+
+    assert started.is_set()
+    assert cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_comment_worker_stops_when_action_ownership_is_lost(client):
+    db = get_db_session()
+    try:
+        task_data = client.post(
+            "/tasks", json={"title": "Comment ownership cancellation", "execution_type": "research"}
+        ).json()
+        task = db.query(TaskModel).filter_by(id=task_data["id"]).one()
+        run = _create_run(db, task, "comment_autopilot", "research")
+        config = SimpleNamespace(
+            _heartbeat_db=db,
+            _heartbeat_run_id=run.run_id,
+            _comment_action=object(),
+            _comment_action_run_id=run.run_id,
+        )
+    finally:
+        db.close()
+
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def long_agent(*args, **kwargs):
+        started.set()
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    with patch("agent.api.helpers.RUN_HEARTBEAT_INTERVAL_SECONDS", 0.01), \
+        patch("agent.api.helpers._heartbeat_run", return_value=True), \
+        patch("agent.api.helpers._heartbeat_comment_action", return_value=False), \
+        patch("agent.api.helpers.SEOAgent.create_and_run_result", new=long_agent):
+        with pytest.raises(RuntimeError, match="ownership"):
+            await _run_agent_prompt("comment work", config, {})
+
+    assert started.is_set()
+    assert cancelled.is_set()
+
+
+def test_recoverable_read_only_campaign_execute_resumes_saved_state(client):
+    db = get_db_session()
+    try:
+        task, run = _campaign_task(db)
+        state = db.query(OrchestrationStateModel).filter_by(
+            orchestrator_run_id=run.run_id
+        ).one()
+        state.status = "running"
+        state.plan_json = "```json\n" + json.dumps({"phases": [
+            {"phase": "researcher", "execution_type": "campaign_researcher", "depends_on": []},
+            {"phase": "analyst", "execution_type": "campaign_analyst", "depends_on": ["researcher"]},
+        ]}) + "\n```"
+        state.phase_outputs_json = json.dumps({"researcher": "saved result"})
+        state.child_run_ids_json = json.dumps(["saved-child-run"])
+        run.status = "recoverable"
+        run.recovery_state = "recoverable"
+        task.status = "pending"
+        task.active_run_id = None
+        db.commit()
+        task_id = task.id
+        run_id = run.run_id
+    finally:
+        db.close()
+
+    with patch(
+        "agent.api.routers.tasks._execute_campaign_with_timeout",
+        new=AsyncMock(return_value=None),
+    ) as execute:
+        response = client.post(f"/tasks/{task_id}/execute")
+
+    assert response.status_code == 200
+    assert response.json()["run_id"] == run_id
+    execute.assert_awaited_once()
+    assert execute.call_args.kwargs["resume"] is True

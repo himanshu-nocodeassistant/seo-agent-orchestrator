@@ -62,6 +62,10 @@ _WRITE_CAPABLE_TOOLS = {
     "mcp__webflow__publish_cms_item",
 }
 
+
+class RunOwnershipLost(RuntimeError):
+    """Raised when a worker loses its run or action lease."""
+
 def add_task_comment(db, task_id: int, body: str, author: str = "agent") -> CommentModel:
     """
     Add a comment to a task and increment comment_count.
@@ -831,7 +835,16 @@ def _task_has_review_gate(db, task) -> bool:
         .order_by(AgentRunModel.id.desc())
         .first()
     )
-    return latest is not None and latest.status == "review_required"
+    if latest is None:
+        return False
+    return latest.status == "review_required" or (
+        latest.status == "needs_review"
+        and (
+            bool(latest.write_capable)
+            or _is_write_capable(latest.execution_type)
+            or latest.validator_status == "failed"
+        )
+    )
 
 
 def _campaign_has_blocking_publisher_child(db, task) -> bool:
@@ -962,7 +975,16 @@ def _finalize_run_success(
     validation: ValidationResult,
 ) -> None:
     now = _utcnow_iso()
-    final_status = "completed" if validation.status == "passed" else "needs_review"
+    write_validation_at_risk = (
+        validation.status != "passed"
+        and (bool(run.write_capable) or _is_write_capable(run.execution_type))
+    )
+    final_status = (
+        "completed"
+        if validation.status == "passed"
+        else "review_required" if write_validation_at_risk else "needs_review"
+    )
+    recovery_state = "review_required" if write_validation_at_risk else "none"
     run_updated = (
         db.query(AgentRunModel)
         .filter(
@@ -976,6 +998,7 @@ def _finalize_run_success(
                 AgentRunModel.validator_status: validation.status,
                 AgentRunModel.finished_at: now,
                 AgentRunModel.status: final_status,
+                AgentRunModel.recovery_state: recovery_state,
                 AgentRunModel.error: validation.message if validation.status != "passed" else None,
             },
             synchronize_session=False,
@@ -1089,6 +1112,7 @@ async def _run_agent_prompt(prompt: str, config: AgentConfig, prompt_context) ->
     os.environ.pop("CLAUDECODE", None)
     timeout = _agent_execution_timeout_seconds()
     stop_heartbeat = asyncio.Event()
+    ownership_lost = asyncio.Event()
     heartbeat_task = None
 
     async def heartbeat_loop():
@@ -1108,27 +1132,54 @@ async def _run_agent_prompt(prompt: str, config: AgentConfig, prompt_context) ->
                         AgentRunModel.run_id == run_id
                     ).first()
                     if run is not None:
-                        _heartbeat_run(heartbeat_db, run, record_event=False)
+                        if _heartbeat_run(heartbeat_db, run, record_event=False) is False:
+                            ownership_lost.set()
                 action = getattr(config, "_comment_action", None)
                 if heartbeat_db is not None and action is not None:
-                    _heartbeat_comment_action(
+                    if _heartbeat_comment_action(
                         heartbeat_db,
                         action,
                         expected_run_id=getattr(config, "_comment_action_run_id", None),
-                    )
+                    ) is False:
+                        ownership_lost.set()
             except Exception:
                 logger.exception("Could not refresh execution lease")
 
     if getattr(config, "_heartbeat_db", None) is not None:
         heartbeat_task = asyncio.create_task(heartbeat_loop())
+    agent_task = asyncio.create_task(
+        SEOAgent.create_and_run_result(prompt, config, prompt_context=prompt_context)
+    )
+    ownership_task = None
     try:
-        return await asyncio.wait_for(
-            SEOAgent.create_and_run_result(prompt, config, prompt_context=prompt_context),
+        if heartbeat_task is None:
+            try:
+                return await asyncio.wait_for(agent_task, timeout=timeout)
+            except asyncio.TimeoutError as e:
+                raise RuntimeError(f"Agent execution timed out after {timeout}s") from e
+
+        ownership_task = asyncio.create_task(ownership_lost.wait())
+        done, _ = await asyncio.wait(
+            {agent_task, ownership_task},
             timeout=timeout,
+            return_when=asyncio.FIRST_COMPLETED,
         )
-    except asyncio.TimeoutError as e:
-        raise RuntimeError(f"Agent execution timed out after {timeout}s") from e
+        if ownership_lost.is_set():
+            agent_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await agent_task
+            raise RunOwnershipLost("Agent execution stopped after run ownership was lost")
+        if agent_task in done:
+            return await agent_task
+        agent_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await agent_task
+        raise RuntimeError(f"Agent execution timed out after {timeout}s")
     finally:
+        if ownership_task is not None:
+            ownership_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await ownership_task
         if heartbeat_task is not None:
             stop_heartbeat.set()
             heartbeat_task.cancel()
@@ -1463,6 +1514,10 @@ async def process_one_comment_action(request_id: Optional[str] = None) -> dict:
                         f"🤖 Revision completed for comment #{comment.id}\n\n{execution.result_text}",
                         "agent",
                     )
+            except RunOwnershipLost:
+                # The lease owner changed while the agent was running. The
+                # action and run finalizers must not touch the new owner.
+                db.refresh(action)
             except Exception as e:
                 action.last_error = str(e)
                 if run.status == "review_required":

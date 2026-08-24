@@ -131,7 +131,8 @@ class DataForSEOClient:
         """
         last_exc = None
         kwargs.setdefault("timeout", self._request_timeout())
-        for attempt in range(MAX_RETRIES):
+        max_attempts = 1 if method.upper() == "POST" else MAX_RETRIES
+        for attempt in range(max_attempts):
             try:
                 response = self.session.request(method, url, **kwargs)
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
@@ -145,7 +146,7 @@ class DataForSEOClient:
                 )
 
                 retry_after = response.headers.get("Retry-After")
-                if retry_after and attempt < MAX_RETRIES - 1:
+                if retry_after and attempt < max_attempts - 1:
                     try:
                         delay = min(max(float(retry_after), 0.0), MAX_RETRY_DELAY)
                     except (ValueError, TypeError):
@@ -153,7 +154,7 @@ class DataForSEOClient:
                     time.sleep(delay)
                     continue
 
-            if attempt < MAX_RETRIES - 1:
+            if attempt < max_attempts - 1:
                 time.sleep(_jittered_backoff(attempt))
 
         raise last_exc
@@ -216,6 +217,29 @@ class DataForSEOClient:
             _get_task_bucket().consume(len(chunk))
             try:
                 data = self._post(endpoint, chunk)
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+                manifest_path = self._write_manifest(
+                    endpoint,
+                    request_payloads,
+                    task_ids,
+                    manifest_path=manifest_path,
+                )
+                self._last_manifest_path = manifest_path
+                error = {
+                    "task_id": None,
+                    "status": "unknown",
+                    "error": str(exc),
+                    "request": chunk,
+                }
+                self._update_manifest_submission_errors(
+                    manifest_path, [error], unknown_requests=chunk
+                )
+                raise DataForSEORecoveryError(
+                    task_ids,
+                    manifest_path,
+                    "Task submission outcome is unknown; do not retry the paid POST automatically.",
+                    errors=[error],
+                ) from exc
             except Exception as exc:
                 if not task_ids:
                     raise
@@ -430,6 +454,7 @@ class DataForSEOClient:
         manifest_path: str | None,
         errors: list[dict],
         unsubmitted_requests: list[dict] | None = None,
+        unknown_requests: list[dict] | None = None,
     ) -> None:
         """Persist submission uncertainty without making a retry look safe."""
         if not manifest_path or not os.path.exists(manifest_path):
@@ -440,6 +465,8 @@ class DataForSEOClient:
             manifest["submission_errors"] = errors
             if unsubmitted_requests:
                 manifest["unsubmitted_requests"] = unsubmitted_requests
+            if unknown_requests:
+                manifest["unknown_requests"] = unknown_requests
             tmp_path = manifest_path + ".tmp"
             with open(tmp_path, "w") as f:
                 json.dump(manifest, f, indent=2)
