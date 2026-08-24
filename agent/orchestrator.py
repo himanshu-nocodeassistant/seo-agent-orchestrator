@@ -661,6 +661,8 @@ async def _run_campaign_orchestration(
 
         if _campaign_has_blocking_publisher_child(
             db, parent_task.id, orchestrator_run.run_id
+        ) or helpers_module._campaign_has_unrecorded_publisher_write(
+            db, parent_task, orchestrator_run.run_id
         ):
             state.status = "review_required"
             state.error = "A publisher child is in review and cannot be retried automatically."
@@ -994,10 +996,15 @@ def _campaign_has_blocking_publisher_child(db, parent_task_id: int, parent_run_i
     ).all()]
     if not child_ids:
         return False
-    return db.query(AgentRunModel).filter(
+    if db.query(AgentRunModel).filter(
         AgentRunModel.parent_run_id == parent_run_id,
         AgentRunModel.task_id.in_(child_ids),
         AgentRunModel.status.in_(["failed", "review_required"]),
+    ).first() is not None:
+        return True
+    return db.query(AgentRunModel).filter(
+        AgentRunModel.task_id.in_(child_ids),
+        AgentRunModel.status.in_(["running", "resuming"]),
     ).first() is not None
 
 
@@ -1096,6 +1103,12 @@ def _create_child_run(
             existing.parent_run_id == parent_run_id
             and existing.status in {"queued", "running", "resuming"}
         ):
+            if execution_type == "campaign_publisher" and existing.status in {
+                "running", "resuming"
+            }:
+                raise LostRunOwnership(
+                    "Publisher child is already running; review is required before retry"
+                )
             return existing
 
     now = datetime.utcnow().isoformat()

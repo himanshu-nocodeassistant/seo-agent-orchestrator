@@ -206,6 +206,11 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
                         status_code=400,
                         detail="Task not approved yet — set approved_at first.",
                     )
+                if (
+                    task.active_run_id == run.run_id
+                    and run.status in {"running", "resuming"}
+                ):
+                    return _run_response(run)
                 if not _claim_campaign_resume(
                     db, run.run_id, request_id=getattr(request.state, "request_id", None)
                 ):
@@ -251,7 +256,9 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
                 and retry_state is not None
                 and retry_state.status == "error"
             ):
-                if helpers_module._campaign_has_blocking_publisher_child(db, task):
+                if helpers_module._campaign_has_blocking_publisher_child(
+                    db, task, retry_run.run_id
+                ):
                     retry_run.status = "review_required"
                     retry_run.recovery_state = "review_required"
                     task.status = "blocked"

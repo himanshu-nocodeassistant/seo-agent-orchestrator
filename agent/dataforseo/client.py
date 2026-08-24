@@ -550,10 +550,15 @@ class DataForSEOClient:
                         purge_stale_poll_logs(tasks[0])
                 except TaskNotReadyError:
                     still_pending.append(task_id)
-                except DataForSEOError as exc:
+                except (
+                    DataForSEOError,
+                    ValueError,
+                    TypeError,
+                    requests.exceptions.RequestException,
+                ) as exc:
                     error = {
                         "task_id": task_id,
-                        "status_code": exc.status_code,
+                        "status_code": getattr(exc, "status_code", None),
                         "error": str(exc),
                     }
                     recovery_errors.append(error)

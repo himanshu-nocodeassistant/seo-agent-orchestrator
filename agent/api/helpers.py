@@ -827,7 +827,7 @@ def _update_comment_action_if_owned(
 
 def _task_has_review_gate(db, task) -> bool:
     """Return True when a blocked task has an unresolved safety review."""
-    if task is None or task.status != "blocked":
+    if task is None:
         return False
     latest = (
         db.query(AgentRunModel)
@@ -837,17 +837,20 @@ def _task_has_review_gate(db, task) -> bool:
     )
     if latest is None:
         return False
-    return latest.status == "review_required" or (
+    is_write_run = bool(latest.write_capable) or _is_write_capable(
+        latest.execution_type
+    )
+    return (
+        latest.status == "review_required" and is_write_run
+    ) or (
         latest.status == "needs_review"
-        and (
-            bool(latest.write_capable)
-            or _is_write_capable(latest.execution_type)
-            or latest.validator_status == "failed"
-        )
+        and (is_write_run or latest.validator_status == "failed")
     )
 
 
-def _campaign_has_blocking_publisher_child(db, task) -> bool:
+def _campaign_has_blocking_publisher_child(
+    db, task, parent_run_id: Optional[str] = None
+) -> bool:
     """Return True when a publisher child makes campaign retry unsafe."""
     children = db.query(TaskModel).filter(
         TaskModel.parent_task_id == task.id,
@@ -856,10 +859,21 @@ def _campaign_has_blocking_publisher_child(db, task) -> bool:
     child_ids = [child.id for child in children]
     if not child_ids:
         return False
-    return db.query(AgentRunModel).filter(
+    query = db.query(AgentRunModel).filter(
         AgentRunModel.task_id.in_(child_ids),
         AgentRunModel.status.in_(["failed", "review_required"]),
-    ).first() is not None
+    )
+    if query.first() is not None:
+        return True
+    if parent_run_id is not None and db.query(AgentRunModel).filter(
+        AgentRunModel.task_id.in_(child_ids),
+        AgentRunModel.status.in_(["running", "resuming"]),
+    ).first() is not None:
+        return True
+    return bool(
+        parent_run_id
+        and _campaign_has_unrecorded_publisher_write(db, task, parent_run_id)
+    )
 
 
 def _campaign_has_unrecorded_publisher_write(db, task, parent_run_id: str) -> bool:
@@ -1143,6 +1157,8 @@ async def _run_agent_prompt(prompt: str, config: AgentConfig, prompt_context) ->
                     ) is False:
                         ownership_lost.set()
             except Exception:
+                if getattr(config, "_write_capable", False):
+                    ownership_lost.set()
                 logger.exception("Could not refresh execution lease")
 
     if getattr(config, "_heartbeat_db", None) is not None:
@@ -1209,6 +1225,7 @@ def _build_runtime_config(
     config.max_budget_usd = profile.max_budget_usd
     config.max_thinking_tokens = profile.max_thinking_tokens
     config.resume = resume_session_id if profile.should_resume_session else None
+    config._write_capable = _is_write_capable(profile.execution_type)
 
     if db is not None and run_id is not None:
         config.hooks = {
