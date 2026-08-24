@@ -3,7 +3,7 @@
 Extracted from the former agent/api/main.py monolith (see git history).
 """
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 
 from agent.api import helpers as helpers_module
 from agent.api.helpers import (
@@ -50,7 +50,7 @@ router = APIRouter()
 # ============================================================================
 
 @router.get("/tasks", response_model=TaskListResponse)
-def list_tasks(limit: int = 200):
+def list_tasks(limit: int = Query(200, ge=1, le=200)):
     """List all tasks with counts."""
     db = get_db_session()
     try:

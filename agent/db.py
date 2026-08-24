@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Mapping, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import (
     Boolean,
     Column,
@@ -21,6 +21,8 @@ from sqlalchemy import (
     event,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
+
+from agent.runtime_profiles import PROFILE_REGISTRY
 
 logger = logging.getLogger(__name__)
 
@@ -289,29 +291,43 @@ def _ensure_orchestration_handoff_column() -> None:
 
 class TaskCreate(BaseModel):
     """Task creation schema."""
-    title: str
-    description: Optional[str] = None
-    priority: int = 0
-    status: str = "pending"
+    title: str = Field(max_length=500)
+    description: Optional[str] = Field(default=None, max_length=20_000)
+    priority: int = Field(default=0, ge=0, le=5)
+    status: TaskStatus = TaskStatus.pending
     assignee: Optional[str] = None
     due_date: Optional[str] = None
     execution_type: Optional[str] = None
     requires_approval: bool = False
 
+    @field_validator("execution_type")
+    @classmethod
+    def validate_execution_type(cls, value):
+        if value is not None and value not in PROFILE_REGISTRY:
+            raise ValueError(f"Unknown execution_type '{value}'")
+        return value
+
 
 class TaskUpdate(BaseModel):
     """Task update schema."""
-    title: Optional[str] = None
-    description: Optional[str] = None
-    status: Optional[str] = None
-    priority: Optional[int] = None
+    title: Optional[str] = Field(default=None, max_length=500)
+    description: Optional[str] = Field(default=None, max_length=20_000)
+    status: Optional[TaskStatus] = None
+    priority: Optional[int] = Field(default=None, ge=0, le=5)
     assignee: Optional[str] = None
     due_date: Optional[str] = None
     execution_type: Optional[str] = None
     requires_approval: Optional[bool] = None
     approved_at: Optional[str] = None
-    notes: Optional[str] = None
+    notes: Optional[str] = Field(default=None, max_length=20_000)
     model: Optional[str] = None
+
+    @field_validator("execution_type")
+    @classmethod
+    def validate_execution_type(cls, value):
+        if value is not None and value not in PROFILE_REGISTRY:
+            raise ValueError(f"Unknown execution_type '{value}'")
+        return value
 
 
 class TaskResponse(BaseModel):
@@ -349,8 +365,7 @@ class TaskListResponse(BaseModel):
 
 class CommentCreate(BaseModel):
     """Comment creation schema."""
-    author: str = "user"
-    body: str
+    body: str = Field(max_length=10_000)
 
 
 class CommentResponse(BaseModel):
@@ -392,7 +407,7 @@ class TaskMemoryResponse(BaseModel):
 class SeoAuditRequest(BaseModel):
     """Body for POST /runs/{run_id}/seo-audit."""
 
-    days: int = 28
+    days: int = Field(default=28, ge=1, le=365)
 
 
 # ============================================================================
