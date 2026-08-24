@@ -158,8 +158,12 @@ class RunEventModel(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     run_id = Column(String(64), nullable=False, index=True)
+    request_id = Column(String(128), nullable=True, index=True)
+    session_id = Column(String(255), nullable=True)
     event_type = Column(String(50), nullable=False)
     payload = Column(Text, nullable=True)
+    duration_ms = Column(Integer, nullable=True)
+    outcome = Column(String(30), nullable=True)
     created_at = Column(String(20), default=lambda: _utcnow_iso())
 
 
@@ -223,6 +227,21 @@ def _ensure_orchestration_handoff_column() -> None:
                 conn.exec_driver_sql(
                     "ALTER TABLE agent_runs ADD COLUMN request_id VARCHAR(128)"
                 )
+            event_columns = {
+                row[1]
+                for row in conn.exec_driver_sql("PRAGMA table_info(run_events)")
+            }
+            event_column_defs = {
+                "request_id": "VARCHAR(128)",
+                "session_id": "VARCHAR(255)",
+                "duration_ms": "INTEGER",
+                "outcome": "VARCHAR(30)",
+            }
+            for column, column_type in event_column_defs.items():
+                if column not in event_columns:
+                    conn.exec_driver_sql(
+                        f"ALTER TABLE run_events ADD COLUMN {column} {column_type}"
+                    )
             conn.commit()
     except Exception as e:  # pragma: no cover - best-effort migration
         logger.warning("Could not ensure handoff_degraded_json column: %s", e)

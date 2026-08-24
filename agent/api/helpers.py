@@ -39,6 +39,18 @@ from agent.seo_agent import SEOAgent
 
 logger = logging.getLogger(__name__)
 comment_autopilot_lock = asyncio.Lock()
+MAX_EVENT_PAYLOAD_BYTES = 100_000
+_REDACTED = "[REDACTED]"
+_SENSITIVE_KEY_PARTS = (
+    "password",
+    "secret",
+    "token",
+    "api_key",
+    "apikey",
+    "authorization",
+    "private_key",
+    "access_key",
+)
 
 def add_task_comment(db, task_id: int, body: str, author: str = "agent") -> CommentModel:
     """
@@ -280,16 +292,75 @@ def _run_response(run) -> dict:
         "finished_at": run.finished_at,
     }
 
-def _log_run_event(db, run_id: str, event_type: str, payload: Optional[dict] = None) -> None:
-    db.add(
-        RunEventModel(
-            run_id=run_id,
-            event_type=event_type,
-            payload=json.dumps(payload or {}, ensure_ascii=False),
-            created_at=_utcnow_iso(),
-        )
+def _is_sensitive_key(key: object) -> bool:
+    normalized = str(key).lower().replace("-", "_")
+    return any(part in normalized for part in _SENSITIVE_KEY_PARTS)
+
+
+def _redact_sensitive(value, key: object = None):
+    if key is not None and _is_sensitive_key(key):
+        return _REDACTED
+    if isinstance(value, dict):
+        return {item_key: _redact_sensitive(item_value, item_key) for item_key, item_value in value.items()}
+    if isinstance(value, list):
+        return [_redact_sensitive(item) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_sensitive(item) for item in value]
+    return value
+
+
+def _bounded_event_payload(payload: Optional[dict]) -> str:
+    raw = json.dumps(_redact_sensitive(payload or {}), ensure_ascii=False, default=str)
+    if len(raw.encode("utf-8")) <= MAX_EVENT_PAYLOAD_BYTES:
+        return raw
+    preview = raw
+    while len(json.dumps({"_truncated": True, "payload_preview": preview}, ensure_ascii=False).encode("utf-8")) > MAX_EVENT_PAYLOAD_BYTES - 32:
+        preview = preview[: max(1, len(preview) // 2)]
+    return json.dumps(
+        {"_truncated": True, "payload_preview": preview}, ensure_ascii=False
     )
-    db.commit()
+
+
+def _log_run_event(
+    db,
+    run_id: str,
+    event_type: str,
+    payload: Optional[dict] = None,
+    *,
+    request_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    duration_ms: Optional[int] = None,
+    outcome: Optional[str] = None,
+) -> None:
+    """Persist a trace event without making tracing a run dependency."""
+    try:
+        if request_id is None or session_id is None:
+            try:
+                run = db.query(AgentRunModel).filter(AgentRunModel.run_id == run_id).first()
+                if run is not None:
+                    request_id = request_id or run.request_id
+                    session_id = session_id or run.session_id
+            except Exception:
+                pass
+        db.add(
+            RunEventModel(
+                run_id=run_id,
+                request_id=request_id,
+                session_id=session_id,
+                event_type=event_type,
+                payload=_bounded_event_payload(payload),
+                duration_ms=duration_ms,
+                outcome=outcome,
+                created_at=_utcnow_iso(),
+            )
+        )
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        logger.exception("Could not persist run event %s for %s", event_type, run_id)
 
 
 def build_post_tool_use_hook(db, run_id: str):
@@ -313,6 +384,8 @@ def build_post_tool_use_hook(db, run_id: str):
             run_id,
             "tool_use",
             {"tool_name": tool_name, "tool_input": tool_input, "tool_use_id": tool_use_id},
+            session_id=session_id,
+            outcome="recorded",
         )
 
     return _hook
@@ -449,7 +522,14 @@ def _mark_run_started(db, run, prompt_context, profile_name: str, session_id: Op
     run.prompt_context_json = _serialize_prompt_context(prompt_context)
     run.session_id = session_id
     db.commit()
-    _log_run_event(db, run.run_id, "run_started", {"profile_name": profile_name, "session_id": session_id})
+    _log_run_event(
+        db,
+        run.run_id,
+        "run_started",
+        {"profile_name": profile_name, "session_id": session_id},
+        session_id=session_id,
+        outcome="started",
+    )
 
 
 def _finalize_run_success(

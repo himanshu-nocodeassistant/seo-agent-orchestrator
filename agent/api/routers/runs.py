@@ -5,7 +5,7 @@ Extracted from the former agent/api/main.py monolith (see git history).
 
 import json
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 
 from agent.api import helpers as helpers_module
 from agent.api.helpers import (
@@ -26,6 +26,7 @@ from agent.api.helpers import (
 from agent.db import (
     AgentRunModel,
     OrchestrationStateModel,
+    RunEventModel,
     RunResponse,
     SeoAuditRequest,
     TaskModel,
@@ -44,6 +45,46 @@ def get_run(run_id: str):
         if not run:
             raise HTTPException(status_code=404, detail="Run not found")
         return _run_response(run)
+    finally:
+        db.close()
+
+
+@router.get("/runs/{run_id}/events")
+def get_run_events(
+    run_id: str,
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1),
+):
+    """Return bounded, paginated trace events for a run."""
+    limit = min(limit, 200)
+    db = get_db_session()
+    try:
+        run = db.query(AgentRunModel).filter(AgentRunModel.run_id == run_id).first()
+        if not run:
+            raise HTTPException(status_code=404, detail="Run not found")
+        query = db.query(RunEventModel).filter(RunEventModel.run_id == run_id)
+        total = query.count()
+        events = query.order_by(RunEventModel.id.asc()).offset((page - 1) * limit).limit(limit).all()
+        serialized = []
+        for event in events:
+            try:
+                event_payload = json.loads(event.payload or "{}")
+            except (TypeError, json.JSONDecodeError):
+                event_payload = {"raw": event.payload}
+            serialized.append(
+                {
+                    "id": event.id,
+                    "run_id": event.run_id,
+                    "request_id": event.request_id,
+                    "session_id": event.session_id,
+                    "event_type": event.event_type,
+                    "payload": event_payload,
+                    "duration_ms": event.duration_ms,
+                    "outcome": event.outcome,
+                    "created_at": event.created_at,
+                }
+            )
+        return {"run_id": run_id, "page": page, "limit": limit, "total": total, "events": serialized}
     finally:
         db.close()
 
