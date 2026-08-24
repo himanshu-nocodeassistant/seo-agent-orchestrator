@@ -215,13 +215,34 @@ class DataForSEOClient:
             chunk = payload[start:start + batch_size]
             _get_task_bucket().consume(len(chunk))
             data = self._post(endpoint, chunk)
-            for task, req in zip(data.get("tasks", []), chunk):
+            tasks = data.get("tasks")
+            if not isinstance(tasks, list) or not tasks:
+                manifest_path = self._write_manifest(
+                    endpoint,
+                    request_payloads,
+                    task_ids,
+                    manifest_path=manifest_path,
+                )
+                self._last_manifest_path = manifest_path
+                errors = [{
+                    "task_id": None,
+                    "error": "Task submission response contained no task data.",
+                    "request": chunk,
+                }]
+                self._update_manifest_submission_errors(
+                    manifest_path, errors, unsubmitted_requests=chunk
+                )
+                raise DataForSEORecoveryError(
+                    task_ids,
+                    manifest_path,
+                    "Task submission returned no task data; do not retry automatically.",
+                    errors=errors,
+                )
+            for task, req in zip(tasks, chunk):
                 task_status = task.get("status_code")
                 if task_status == TASK_CREATED_STATUS:
-                    task_ids.append(task["id"])
-                    request_payloads.append(req)
-                else:
-                    if task_ids:
+                    task_id = task.get("id")
+                    if not task_id:
                         manifest_path = self._write_manifest(
                             endpoint,
                             request_payloads,
@@ -229,10 +250,63 @@ class DataForSEOClient:
                             manifest_path=manifest_path,
                         )
                         self._last_manifest_path = manifest_path
-                    raise DataForSEOError(
-                        task_status,
-                        task.get("status_message", "Task creation failed"),
+                        error = {
+                            "task_id": None,
+                            "error": "Created task response did not include a task ID.",
+                            "request": req,
+                        }
+                        self._update_manifest_submission_errors(manifest_path, [error])
+                        raise DataForSEORecoveryError(
+                            task_ids,
+                            manifest_path,
+                            "Task submission returned an incomplete task record; do not retry automatically.",
+                            errors=[error],
+                        )
+                    task_ids.append(task_id)
+                    request_payloads.append(req)
+                else:
+                    manifest_path = self._write_manifest(
+                        endpoint,
+                        request_payloads,
+                        task_ids,
+                        manifest_path=manifest_path,
                     )
+                    self._last_manifest_path = manifest_path
+                    error = {
+                        "task_id": task.get("id"),
+                        "status_code": task_status,
+                        "error": task.get("status_message", "Task creation failed"),
+                        "request": req,
+                    }
+                    self._update_manifest_submission_errors(manifest_path, [error])
+                    raise DataForSEORecoveryError(
+                        task_ids,
+                        manifest_path,
+                        "Task submission partially failed; do not retry automatically.",
+                        errors=[error],
+                    )
+            if len(tasks) != len(chunk):
+                manifest_path = self._write_manifest(
+                    endpoint,
+                    request_payloads,
+                    task_ids,
+                    manifest_path=manifest_path,
+                )
+                self._last_manifest_path = manifest_path
+                error = {
+                    "task_id": None,
+                    "error": "Task submission response omitted one or more task records.",
+                    "request": chunk[len(tasks):],
+                }
+                self._update_manifest_submission_errors(
+                    manifest_path, [error], unsubmitted_requests=chunk[len(tasks):]
+                )
+                raise DataForSEORecoveryError(
+                    task_ids,
+                    manifest_path,
+                    "Task submission returned incomplete task data; do not retry automatically.",
+                    errors=[error],
+                )
             manifest_path = self._write_manifest(
                 endpoint,
                 request_payloads,
@@ -326,10 +400,38 @@ class DataForSEOClient:
                 file=sys.stderr,
             )
 
+    @staticmethod
+    def _update_manifest_submission_errors(
+        manifest_path: str | None,
+        errors: list[dict],
+        unsubmitted_requests: list[dict] | None = None,
+    ) -> None:
+        """Persist submission uncertainty without making a retry look safe."""
+        if not manifest_path or not os.path.exists(manifest_path):
+            return
+        try:
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+            manifest["submission_errors"] = errors
+            if unsubmitted_requests:
+                manifest["unsubmitted_requests"] = unsubmitted_requests
+            tmp_path = manifest_path + ".tmp"
+            with open(tmp_path, "w") as f:
+                json.dump(manifest, f, indent=2)
+            os.replace(tmp_path, manifest_path)
+        except Exception as exc:
+            print(
+                f"WARNING: failed to update submission recovery manifest {manifest_path}: {exc}",
+                file=sys.stderr,
+            )
+
     def _task_get(self, endpoint: str, task_id: str) -> dict:
         """Retrieve results for a single completed task."""
         data = self._get(f"{endpoint}/{task_id}")
-        for task in data.get("tasks", []):
+        tasks = data.get("tasks")
+        if not isinstance(tasks, list) or not tasks:
+            raise DataForSEOError(0, "Task response contained no task data")
+        for task in tasks:
             task_status = task.get("status_code")
             if task_status in TASK_NOT_READY_STATUSES:
                 raise TaskNotReadyError(task_status, "Task still in queue")

@@ -14,7 +14,9 @@ router = APIRouter()
 @limiter.limit(lambda: _rate_limit_value())
 async def process_one_comment_action_endpoint(request: Request):
     """Process one pending @agent trigger comment action."""
-    return await process_one_comment_action()
+    return await process_one_comment_action(
+        request_id=getattr(request.state, "request_id", None)
+    )
 
 
 # ============================================================================

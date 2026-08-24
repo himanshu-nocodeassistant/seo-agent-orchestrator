@@ -67,6 +67,8 @@ async def _run_with_retry(
     max_retries: int = 2,
     base_delay: float = 1.0,
     max_total_seconds: Optional[float] = None,
+    trace_db=None,
+    trace_run_id: Optional[str] = None,
     **kwargs,
 ):
     """
@@ -108,6 +110,24 @@ async def _run_with_retry(
                         f"_run_with_retry exceeded max_total_seconds={max_total_seconds} "
                         f"after {attempt + 1} attempt(s)"
                     )
+                if trace_db is not None and trace_run_id:
+                    try:
+                        from agent.api.helpers import _log_run_event
+
+                        _log_run_event(
+                            trace_db,
+                            trace_run_id,
+                            "retry",
+                            {
+                                "attempt": attempt + 1,
+                                "max_retries": max_retries,
+                                "error": str(exc),
+                                "next_delay_seconds": delay,
+                            },
+                            outcome="retrying",
+                        )
+                    except Exception:
+                        logger.exception("Could not persist retry trace event")
                 logger.warning(
                     "Transient failure (attempt %d/%d): %s — retrying in %.1fs",
                     attempt + 1, max_retries, exc, delay,
@@ -328,6 +348,8 @@ async def _dispatch_phase(
                 max_retries=2,
                 base_delay=1.0,
                 max_total_seconds=child_profile.timeout_seconds,
+                trace_db=phase_db,
+                trace_run_id=child_run.run_id,
             )
         )
         result_text = child_execution.result_text or ""
@@ -355,6 +377,8 @@ async def _dispatch_phase(
                     max_retries=1,
                     base_delay=1.0,
                     max_total_seconds=child_profile.timeout_seconds,
+                    trace_db=phase_db,
+                    trace_run_id=child_run.run_id,
                 )
             )
             if retry_execution.result_text:
@@ -559,6 +583,8 @@ async def _run_campaign_orchestration(
                 max_retries=2,
                 base_delay=1.0,
                 max_total_seconds=orch_profile.timeout_seconds,
+                trace_db=db,
+                trace_run_id=orchestrator_run.run_id,
             )
         )
         plan_text = raw_execution.result_text or ""

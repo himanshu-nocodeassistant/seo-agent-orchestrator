@@ -154,7 +154,8 @@ def run_pipeline(client_cls: type, pipeline_name: str) -> None:
         recovery = exc
         result = exc.results
         print(
-            f"Recovery required: {len(exc.task_ids)} task(s) remain pending. "
+            f"Recovery required: {len(exc.task_ids)} submitted task(s) remain "
+            f"pending or uncertain. "
             f"Manifest: {exc.manifest_path or 'unavailable'}"
         )
         for error in exc.errors:

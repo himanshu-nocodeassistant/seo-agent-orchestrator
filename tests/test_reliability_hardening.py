@@ -14,6 +14,7 @@ from agent.api.helpers import (
     _claim_campaign_resume,
     _comment_action_is_stale,
     _create_run,
+    _finalize_run_failure,
     _heartbeat_run,
     _reclaim_stale_comment_actions,
     _run_agent_prompt,
@@ -25,6 +26,7 @@ from agent.api.main import (
     CommentModel,
     CommentActionModel,
     OrchestrationStateModel,
+    RunEventModel,
     TaskModel,
     get_db_session,
 )
@@ -35,6 +37,7 @@ from agent.dataforseo.client import (
     DataForSEORecoveryError,
     TaskNotReadyError,
 )
+from agent.orchestrator import _run_with_retry
 from scripts.pipelines._cli import run_pipeline
 
 
@@ -443,3 +446,315 @@ def test_dataforseo_preserves_partial_results_after_task_error(tmp_path, monkeyp
     saved = json.loads(tmp_path.joinpath(manifest.split("/")[-1]).read_text())
     assert saved["completed_results"] == [{"keyword": "one"}]
     assert saved["recovery_errors"][0]["task_id"] == "failed"
+
+
+def test_completed_publisher_without_durable_phase_state_requires_review(client):
+    db = get_db_session()
+    try:
+        task, parent_run = _campaign_task(db)
+        state = db.query(OrchestrationStateModel).filter_by(
+            orchestrator_run_id=parent_run.run_id
+        ).one()
+        state.plan_json = "```json\n" + json.dumps({
+            "phases": [{
+                "phase": "publisher",
+                "task_title": "Campaign: publisher",
+                "execution_type": "campaign_publisher",
+                "depends_on": [],
+            }]
+        }) + "\n```"
+        state.phase_outputs_json = json.dumps({})
+        state.child_run_ids_json = json.dumps([])
+        child = TaskModel(
+            title="Campaign: publisher",
+            execution_type="campaign_publisher",
+            parent_task_id=task.id,
+            status="completed",
+            created_at=_utcnow_iso(),
+            updated_at=_utcnow_iso(),
+        )
+        db.add(child)
+        db.commit()
+        db.refresh(child)
+        child_run = AgentRunModel(
+            run_id="completed-publisher",
+            task_id=child.id,
+            parent_run_id=parent_run.run_id,
+            status="completed",
+            execution_type="campaign_publisher",
+            write_capable=True,
+            started_at=_old_timestamp(),
+            finished_at=_utcnow_iso(),
+        )
+        db.add(child_run)
+        parent_run.heartbeat_at = _old_timestamp()
+        parent_run.lease_expires_at = _old_timestamp()
+        db.commit()
+
+        recover_stale_runs(db)
+
+        db.refresh(parent_run)
+        assert parent_run.status == "review_required"
+        assert parent_run.recovery_state == "review_required"
+        assert task.status == "blocked"
+    finally:
+        db.close()
+
+
+def test_stale_worker_cannot_heartbeat_or_finalize_newer_run(client):
+    db = get_db_session()
+    try:
+        task_data = client.post(
+            "/tasks", json={"title": "Run ownership", "execution_type": "research"}
+        ).json()
+        task = db.query(TaskModel).filter_by(id=task_data["id"]).one()
+        old_run = _create_run(db, task, "manual_execute", "research")
+        task.active_run_id = None
+        old_run.status = "review_required"
+        db.commit()
+        new_run = _create_run(db, task, "manual_execute", "research")
+        old_heartbeat = old_run.heartbeat_at
+
+        assert _heartbeat_run(db, old_run, record_event=False) is False
+        db.refresh(old_run)
+        assert old_run.heartbeat_at == old_heartbeat
+
+        _finalize_run_failure(db, old_run, task, "late failure")
+
+        db.refresh(task)
+        db.refresh(new_run)
+        assert task.active_run_id == new_run.run_id
+        assert task.last_run_id == new_run.run_id
+        assert task.status == "in_progress"
+        assert new_run.status == "queued"
+    finally:
+        db.close()
+
+
+def test_write_capable_failure_requires_review_and_blocks_retry(client):
+    task_data = client.post(
+        "/tasks", json={"title": "Unsafe write retry", "execution_type": "webflow_publish"}
+    ).json()
+    with patch(
+        "agent.api.helpers._run_agent_prompt",
+        new=AsyncMock(side_effect=TimeoutError("timed out")),
+    ):
+        response = client.post(f"/tasks/{task_data['id']}/execute")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "review_required"
+    db = get_db_session()
+    try:
+        task = db.query(TaskModel).filter_by(id=task_data["id"]).one()
+        assert task.status == "blocked"
+        assert task.active_run_id is None
+        latest = db.query(AgentRunModel).filter_by(task_id=task.id).one()
+        assert latest.status == "review_required"
+        retry = _create_run(db, task, "manual_execute", "webflow_publish")
+        assert retry.run_id == latest.run_id
+        assert retry._claim_created is False
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_comment_race_defers_when_manual_run_wins(client):
+    from agent.api.helpers import process_one_comment_action
+
+    task_data = client.post(
+        "/tasks", json={"title": "Comment race", "execution_type": "research"}
+    ).json()
+    comment = client.post(
+        f"/tasks/{task_data['id']}/comments", json={"body": "@agent revise this"}
+    ).json()
+    db = get_db_session()
+    try:
+        action = CommentActionModel(
+            task_id=task_data["id"], comment_id=comment["id"], status="pending",
+            attempts=0, max_attempts=2,
+        )
+        db.add(action)
+        db.commit()
+    finally:
+        db.close()
+
+    from agent.api import helpers as helpers_module
+    original_create_run = helpers_module._create_run
+
+    def manual_wins(db, task, *args, **kwargs):
+        manual_run = original_create_run(db, task, "manual_execute", "research")
+        manual_run._claim_created = False
+        return manual_run
+
+    with patch.object(helpers_module, "_create_run", side_effect=manual_wins), \
+        patch("agent.api.helpers._run_agent_prompt", new=AsyncMock()) as run_agent:
+        result = await process_one_comment_action(request_id="req-comment-race")
+
+    assert result["status"] == "pending"
+    run_agent.assert_not_awaited()
+    db = get_db_session()
+    try:
+        run = db.query(AgentRunModel).filter_by(task_id=task_data["id"]).one()
+        assert run.trigger_source == "manual_execute"
+        assert run.request_id is None
+        action = db.query(CommentActionModel).filter_by(comment_id=comment["id"]).one()
+        action.status = "retry_exhausted"
+        db.commit()
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_comment_autopilot_preserves_review_gate_for_write_task(client):
+    from agent.api.helpers import process_one_comment_action
+
+    task_data = client.post(
+        "/tasks", json={"title": "Blocked comment write", "execution_type": "webflow_publish"}
+    ).json()
+    comment = client.post(
+        f"/tasks/{task_data['id']}/comments", json={"body": "@agent publish this"}
+    ).json()
+    db = get_db_session()
+    try:
+        task = db.query(TaskModel).filter_by(id=task_data["id"]).one()
+        run = _create_run(db, task, "manual_execute", "webflow_publish")
+        _finalize_run_failure(db, run, task, "write failed")
+        action = CommentActionModel(
+            task_id=task.id, comment_id=comment["id"], status="pending",
+            attempts=0, max_attempts=2,
+        )
+        db.add(action)
+        db.commit()
+    finally:
+        db.close()
+
+    with patch("agent.api.helpers._run_agent_prompt", new=AsyncMock()) as run_agent:
+        result = await process_one_comment_action(request_id="req-blocked-comment")
+
+    assert result["status"] == "review_required"
+    run_agent.assert_not_awaited()
+
+
+def test_dataforseo_empty_task_data_is_recoverable(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATAFORSEO_LOGIN", "login")
+    monkeypatch.setenv("DATAFORSEO_PASSWORD", "password")
+    monkeypatch.setattr("agent.dataforseo.client.MANIFEST_DIR", str(tmp_path))
+    client = DataForSEOClient()
+    manifest = client._write_manifest(
+        "post", [{"keyword": "x"}], ["submitted-1"]
+    )
+    client._last_manifest_path = manifest
+    with patch.object(client, "_task_post", return_value=["submitted-1"]), \
+        patch.object(client, "_get", return_value={"status_code": 20000, "tasks": []}), \
+        patch("agent.dataforseo.client.time.sleep"):
+        with pytest.raises(DataForSEORecoveryError) as exc_info:
+            client._task_post_and_poll("post", "get", [{"keyword": "x"}], max_wait=10)
+
+    assert exc_info.value.errors[0]["task_id"] == "submitted-1"
+    saved = json.loads(next(tmp_path.glob("*.json")).read_text())
+    assert saved["recovery_errors"][0]["task_id"] == "submitted-1"
+
+
+def test_dataforseo_partial_submission_is_reported_as_recovery(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATAFORSEO_LOGIN", "login")
+    monkeypatch.setenv("DATAFORSEO_PASSWORD", "password")
+    monkeypatch.setenv("DATAFORSEO_MAX_TASKS_PER_REQUEST", "1")
+    monkeypatch.setattr("agent.dataforseo.client.MANIFEST_DIR", str(tmp_path))
+    client = DataForSEOClient()
+    responses = iter([
+        {"status_code": 20000, "tasks": [{"id": "first", "status_code": 20100}]},
+        {"status_code": 20000, "tasks": [{"status_code": 40000, "status_message": "bad"}]},
+    ])
+    with patch.object(client, "_post", side_effect=lambda *args: next(responses)):
+        with pytest.raises(DataForSEORecoveryError) as exc_info:
+            client._task_post("post", [{"keyword": "one"}, {"keyword": "two"}])
+
+    assert exc_info.value.task_ids == ["first"]
+    assert exc_info.value.manifest_path
+    saved = json.loads(next(tmp_path.glob("*.json")).read_text())
+    assert saved["tasks"][0]["task_id"] == "first"
+    assert saved["submission_errors"]
+
+
+@pytest.mark.asyncio
+async def test_retry_persists_trace_event(client):
+    db = get_db_session()
+    try:
+        task_data = client.post(
+            "/tasks", json={"title": "Retry trace", "execution_type": "research"}
+        ).json()
+        task = db.query(TaskModel).filter_by(id=task_data["id"]).one()
+        run = _create_run(db, task, "manual_execute", "research")
+        attempts = 0
+
+        async def flaky():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("timed out")
+            return "ok"
+
+        result = await _run_with_retry(
+            flaky, max_retries=2, base_delay=0, trace_db=db, trace_run_id=run.run_id
+        )
+        assert result == "ok"
+        events = db.query(RunEventModel).filter_by(
+            run_id=run.run_id, event_type="retry"
+        ).all()
+        assert len(events) == 1
+        payload = json.loads(events[0].payload)
+        assert payload["attempt"] == 1
+        assert events[0].outcome == "retrying"
+    finally:
+        db.close()
+
+
+def test_automation_route_propagates_request_id_to_comment_worker(client):
+    with patch(
+        "agent.api.routers.automation.process_one_comment_action",
+        new=AsyncMock(return_value={"processed": False}),
+    ) as process:
+        response = client.post(
+            "/automation/comments/process-one",
+            headers={"X-Request-ID": "req-automation-comment"},
+        )
+
+    assert response.status_code == 200
+    process.assert_awaited_once_with(request_id="req-automation-comment")
+
+
+@pytest.mark.asyncio
+async def test_comment_autopilot_run_stores_request_id(client):
+    from agent.api.helpers import process_one_comment_action
+
+    task_data = client.post(
+        "/tasks", json={"title": "Comment request trace", "execution_type": "research"}
+    ).json()
+    comment = client.post(
+        f"/tasks/{task_data['id']}/comments", json={"body": "@agent revise this"}
+    ).json()
+    db = get_db_session()
+    try:
+        db.add(CommentActionModel(
+            task_id=task_data["id"], comment_id=comment["id"], status="pending",
+            attempts=0, max_attempts=2,
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    with patch(
+        "agent.api.helpers._run_agent_prompt",
+        new=AsyncMock(return_value=SimpleNamespace(result_text="revision", session_id=None)),
+    ):
+        result = await process_one_comment_action(request_id="req-comment-run")
+
+    assert result["status"] == "succeeded"
+    db = get_db_session()
+    try:
+        run = db.query(AgentRunModel).filter(
+            AgentRunModel.source_comment_id == comment["id"]
+        ).one()
+        assert run.request_id == "req-comment-run"
+    finally:
+        db.close()
