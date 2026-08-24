@@ -14,6 +14,7 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -120,15 +121,20 @@ app.add_middleware(
 @app.middleware("http")
 async def _api_token_check(request: Request, call_next):
     """Optional bearer-token gate. Enabled only when API_TOKEN is set."""
+    request.state.request_id = request.headers.get("X-Request-ID") or str(uuid4())
     token = os.environ.get("API_TOKEN")
     if token:
         expected = f"Bearer {token}"
         if request.headers.get("Authorization") != expected:
-            return JSONResponse(
+            response = JSONResponse(
                 status_code=401,
                 content={"detail": "Invalid or missing API token"},
             )
-    return await call_next(request)
+            response.headers["X-Request-ID"] = request.state.request_id
+            return response
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request.state.request_id
+    return response
 
 
 # ============================================================================

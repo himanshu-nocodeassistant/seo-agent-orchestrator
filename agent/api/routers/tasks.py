@@ -220,10 +220,15 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
                 db.refresh(run)
                 return _run_response(run)
 
-            run = _create_run(db, task, "manual_execute", task.execution_type or "manual")
-            task.status = "in_progress"
-            task.updated_at = _utcnow_iso()
-            db.commit()
+            run = _create_run(
+                db,
+                task,
+                "manual_execute",
+                task.execution_type or "manual",
+                request_id=getattr(request.state, "request_id", None),
+            )
+            if not getattr(run, "_claim_created", True):
+                return _run_response(run)
             add_task_started_comment(db, task_id, task.title)
 
             try:
@@ -236,10 +241,15 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
             return _run_response(run)
         # ── End orchestration branch ──────────────────────────────────────────
 
-        run = _create_run(db, task, "manual_execute", task.execution_type or "manual")
-        task.status = "in_progress"
-        task.updated_at = _utcnow_iso()
-        db.commit()
+        run = _create_run(
+            db,
+            task,
+            "manual_execute",
+            task.execution_type or "manual",
+            request_id=getattr(request.state, "request_id", None),
+        )
+        if not getattr(run, "_claim_created", True):
+            return _run_response(run)
         add_task_started_comment(db, task_id, task.title)
 
         try:

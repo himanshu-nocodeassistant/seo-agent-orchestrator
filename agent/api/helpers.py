@@ -267,6 +267,7 @@ def _task_response(task, db=None) -> dict:
 def _run_response(run) -> dict:
     return {
         "run_id": run.run_id,
+        "request_id": run.request_id,
         "task_id": run.task_id,
         "status": run.status,
         "execution_type": run.execution_type,
@@ -340,9 +341,41 @@ def _upsert_task_session(db, task_id: int, session_id: str, run_id: str) -> None
         record.updated_at = now
     db.commit()
 
-def _create_run(db, task, trigger_source: str, execution_type: Optional[str], source_comment_id: Optional[int] = None):
+def _create_run(
+    db,
+    task,
+    trigger_source: str,
+    execution_type: Optional[str],
+    source_comment_id: Optional[int] = None,
+    request_id: Optional[str] = None,
+):
+    """Create one run and claim its task in one database transaction.
+
+    When a task already has an active run, return that run and mark it as an
+    idempotent result for callers. The conditional update is the claim gate:
+    SQLite serialises the write, so only one concurrent caller can win it.
+    """
+    if task is not None:
+        active_run_id = (
+            db.query(TaskModel.active_run_id)
+            .filter(TaskModel.id == task.id)
+            .scalar()
+        )
+        if active_run_id:
+            existing = (
+                db.query(AgentRunModel)
+                .filter(AgentRunModel.run_id == active_run_id)
+                .first()
+            )
+            if existing is not None:
+                existing._claim_created = False
+                return existing
+
+    run_id = str(uuid4())
+    now = _utcnow_iso()
     run = AgentRunModel(
-        run_id=str(uuid4()),
+        run_id=run_id,
+        request_id=request_id,
         task_id=task.id if task else None,
         status="queued",
         execution_type=execution_type or "manual",
@@ -355,18 +388,58 @@ def _create_run(db, task, trigger_source: str, execution_type: Optional[str], so
         result_summary=None,
         error=None,
         source_comment_id=source_comment_id,
-        started_at=_utcnow_iso(),
+        started_at=now,
         finished_at=None,
     )
+
+    if task is not None:
+        claimed = (
+            db.query(TaskModel)
+            .filter(
+                TaskModel.id == task.id,
+                TaskModel.active_run_id.is_(None),
+            )
+            .update(
+                {
+                    TaskModel.active_run_id: run_id,
+                    TaskModel.last_run_id: run_id,
+                    TaskModel.status: "in_progress",
+                    TaskModel.updated_at: now,
+                },
+                synchronize_session=False,
+            )
+        )
+        if claimed != 1:
+            db.rollback()
+            current = db.query(TaskModel.active_run_id).filter(TaskModel.id == task.id).scalar()
+            if current:
+                existing = db.query(AgentRunModel).filter(AgentRunModel.run_id == current).first()
+                if existing is not None:
+                    existing._claim_created = False
+                    return existing
+            raise RuntimeError("Task claim was lost before the run was created")
+
     db.add(run)
+    if task is not None:
+        db.add(
+            RunEventModel(
+                run_id=run_id,
+                event_type="run_created",
+                payload=json.dumps(
+                    {
+                        "trigger_source": trigger_source,
+                        "request_id": request_id,
+                    },
+                    ensure_ascii=False,
+                ),
+                created_at=now,
+            )
+        )
     db.commit()
     db.refresh(run)
-    if task is not None:
-        task.active_run_id = run.run_id
-        task.last_run_id = run.run_id
-        task.updated_at = _utcnow_iso()
-        db.commit()
-    _log_run_event(db, run.run_id, "run_created", {"trigger_source": trigger_source})
+    run._claim_created = True
+    if task is None:
+        _log_run_event(db, run.run_id, "run_created", {"trigger_source": trigger_source})
     return run
 
 

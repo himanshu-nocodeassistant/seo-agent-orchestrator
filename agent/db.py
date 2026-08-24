@@ -134,6 +134,7 @@ class AgentRunModel(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     run_id = Column(String(64), nullable=False, unique=True, index=True)
+    request_id = Column(String(128), nullable=True, index=True)
     task_id = Column(Integer, nullable=True, index=True)
     parent_run_id = Column(String(64), nullable=True, index=True)
     status = Column(String(30), nullable=False, default="queued")
@@ -214,7 +215,15 @@ def _ensure_orchestration_handoff_column() -> None:
                     "ALTER TABLE orchestration_states "
                     "ADD COLUMN handoff_degraded_json TEXT"
                 )
-                conn.commit()
+            run_columns = {
+                row[1]
+                for row in conn.exec_driver_sql("PRAGMA table_info(agent_runs)")
+            }
+            if "request_id" not in run_columns:
+                conn.exec_driver_sql(
+                    "ALTER TABLE agent_runs ADD COLUMN request_id VARCHAR(128)"
+                )
+            conn.commit()
     except Exception as e:  # pragma: no cover - best-effort migration
         logger.warning("Could not ensure handoff_degraded_json column: %s", e)
 
@@ -300,6 +309,7 @@ class CommentResponse(BaseModel):
 
 class RunResponse(BaseModel):
     run_id: str
+    request_id: Optional[str]
     task_id: Optional[int]
     status: str
     execution_type: Optional[str]
