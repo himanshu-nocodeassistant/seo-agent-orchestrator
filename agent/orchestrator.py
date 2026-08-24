@@ -31,6 +31,34 @@ logger = logging.getLogger(__name__)
 class LostRunOwnership(RuntimeError):
     """Raised when a campaign worker no longer owns its parent run."""
 
+
+async def _await_with_ownership(awaitable, ownership_check, poll_interval: float = 0.05):
+    """Await work while cancelling it when the campaign lease is lost."""
+    if ownership_check is None:
+        return await awaitable
+
+    work = asyncio.ensure_future(awaitable)
+    try:
+        while not work.done():
+            await asyncio.wait({work}, timeout=poll_interval)
+            if work.done():
+                break
+            try:
+                owns_work = ownership_check()
+            except LostRunOwnership:
+                owns_work = False
+            if not owns_work:
+                work.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await work
+                raise LostRunOwnership("Campaign parent run ownership was lost during child execution")
+        return await work
+    finally:
+        if not work.done():
+            work.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await work
+
 # Errors whose message matches these patterns are transient and safe to retry.
 _RETRYABLE_PATTERNS = [
     r"timed out",
@@ -96,8 +124,38 @@ async def _run_with_retry(
     deadline = time.monotonic() + max_total_seconds if max_total_seconds is not None else None
     last_exc: Optional[BaseException] = None
     delay = base_delay
+
+    def trace_retry(attempt: int, error: str, *, retrying: bool, deadline_exceeded: bool = False):
+        if trace_db is None or not trace_run_id:
+            return
+        try:
+            from agent.api.helpers import _log_run_event
+
+            _log_run_event(
+                trace_db,
+                trace_run_id,
+                "retry",
+                {
+                    "attempt": attempt,
+                    "max_retries": max_retries,
+                    "error": error,
+                    "next_delay_seconds": delay if retrying else None,
+                    "deadline_exceeded": deadline_exceeded,
+                },
+                outcome="retrying" if retrying else "exhausted",
+            )
+        except Exception:
+            logger.exception("Could not persist retry trace event")
+
     for attempt in range(max_retries):
         if deadline is not None and time.monotonic() > deadline:
+            if last_exc is not None:
+                trace_retry(
+                    attempt,
+                    str(last_exc),
+                    retrying=False,
+                    deadline_exceeded=True,
+                )
             raise RuntimeError(
                 f"_run_with_retry exceeded max_total_seconds={max_total_seconds} "
                 f"after {attempt} attempt(s)"
@@ -109,28 +167,17 @@ async def _run_with_retry(
                 raise
             last_exc = exc
             retrying = attempt < max_retries - 1
-            if trace_db is not None and trace_run_id:
-                try:
-                    from agent.api.helpers import _log_run_event
-
-                    _log_run_event(
-                        trace_db,
-                        trace_run_id,
-                        "retry",
-                        {
-                            "attempt": attempt + 1,
-                            "max_retries": max_retries,
-                            "error": str(exc),
-                            "next_delay_seconds": delay if retrying else None,
-                        },
-                        outcome="retrying" if retrying else "exhausted",
-                    )
-                except Exception:
-                    logger.exception("Could not persist retry trace event")
+            trace_retry(attempt + 1, str(exc), retrying=retrying)
             if not retrying:
                 break
             if attempt < max_retries - 1:
                 if deadline is not None and time.monotonic() > deadline:
+                    trace_retry(
+                        attempt + 1,
+                        str(exc),
+                        retrying=False,
+                        deadline_exceeded=True,
+                    )
                     raise RuntimeError(
                         f"_run_with_retry exceeded max_total_seconds={max_total_seconds} "
                         f"after {attempt + 1} attempt(s)"
@@ -354,19 +401,36 @@ async def _dispatch_phase(
             child_profile, None, db=phase_db, run_id=child_run.run_id
         )
 
-        child_execution = helpers["_normalize_execution_result"](
-            await _run_with_retry(
-                helpers["_run_agent_prompt"],
-                child_prompt,
-                child_config,
-                child_prompt_context,
-                max_retries=2,
-                base_delay=1.0,
-                max_total_seconds=child_profile.timeout_seconds,
-                trace_db=phase_db,
-                trace_run_id=child_run.run_id,
+        write_capable = helpers.get("_is_write_capable", lambda value: False)(child_exec_type)
+        try:
+            child_execution = helpers["_normalize_execution_result"](
+                await _await_with_ownership(
+                    _run_with_retry(
+                        helpers["_run_agent_prompt"],
+                        child_prompt,
+                        child_config,
+                        child_prompt_context,
+                        max_retries=1 if write_capable else 2,
+                        base_delay=1.0,
+                        max_total_seconds=child_profile.timeout_seconds,
+                        trace_db=phase_db,
+                        trace_run_id=child_run.run_id,
+                    ),
+                    ownership_check,
+                )
             )
-        )
+        except LostRunOwnership:
+            raise
+        except BaseException as exc:
+            if write_capable:
+                helpers["_finalize_run_failure"](
+                    phase_db,
+                    child_run,
+                    child_task,
+                    f"Write result is uncertain: {exc}",
+                    status="review_required",
+                )
+            raise
         result_text = child_execution.result_text or ""
         session_id = child_execution.session_id
 
@@ -374,6 +438,12 @@ async def _dispatch_phase(
         # '## Summary for Next Phase' block. If missing, run ONE correction
         # retry asking only for the block — no extra cost for final phases.
         if phase_has_dependents and _extract_summary_block(result_text) is None:
+            if write_capable:
+                error = "Write result is uncertain: handoff correction would repeat a write-capable phase."
+                helpers["_finalize_run_failure"](
+                    phase_db, child_run, child_task, error, status="review_required"
+                )
+                raise RuntimeError(error)
             retry_prompt = (
                 f"{child_prompt}\n\nIMPORTANT: Your previous output did not include "
                 "a structured handoff for the next phase. Keep everything you "
@@ -384,16 +454,19 @@ async def _dispatch_phase(
                 "## End Summary"
             )
             retry_execution = helpers["_normalize_execution_result"](
-                await _run_with_retry(
-                    helpers["_run_agent_prompt"],
-                    retry_prompt,
-                    child_config,
-                    child_prompt_context,
-                    max_retries=1,
-                    base_delay=1.0,
-                    max_total_seconds=child_profile.timeout_seconds,
-                    trace_db=phase_db,
-                    trace_run_id=child_run.run_id,
+                await _await_with_ownership(
+                    _run_with_retry(
+                        helpers["_run_agent_prompt"],
+                        retry_prompt,
+                        child_config,
+                        child_prompt_context,
+                        max_retries=1,
+                        base_delay=1.0,
+                        max_total_seconds=child_profile.timeout_seconds,
+                        trace_db=phase_db,
+                        trace_run_id=child_run.run_id,
+                    ),
+                    ownership_check,
                 )
             )
             if retry_execution.result_text:
@@ -452,9 +525,14 @@ async def run_campaign_orchestration(
 
     heartbeat_task = asyncio.create_task(heartbeat_loop())
     try:
-        await _run_campaign_orchestration(
-            db, parent_task, orchestrator_run, resume=resume,
-            ownership_lost=ownership_lost,
+        await _await_with_ownership(
+            _run_campaign_orchestration(
+                db, parent_task, orchestrator_run, resume=resume,
+                ownership_lost=ownership_lost,
+            ),
+            lambda: not ownership_lost.is_set() and _campaign_run_owns_task(
+                db, parent_task.id, orchestrator_run.run_id
+            ),
         )
     except LostRunOwnership:
         logger.warning("Campaign worker stopped after losing parent run ownership")
@@ -524,6 +602,7 @@ async def _run_campaign_orchestration(
         "_refresh_context_view": helpers_module._refresh_context_view,
         "_resolve_prompt_context": helpers_module._resolve_prompt_context,
         "_run_agent_prompt": helpers_module._run_agent_prompt,
+        "_is_write_capable": helpers_module._is_write_capable,
     }
 
     campaign_goal = parent_task.description or parent_task.title
@@ -579,6 +658,19 @@ async def _run_campaign_orchestration(
                     db, parent_task, phase_spec, orchestrator_run.run_id
                 )
             child_tasks[phase_spec["phase"]] = child_task
+
+        if _campaign_has_blocking_publisher_child(
+            db, parent_task.id, orchestrator_run.run_id
+        ):
+            state.status = "review_required"
+            state.error = "A publisher child is in review and cannot be retried automatically."
+            state.updated_at = datetime.utcnow().isoformat()
+            db.commit()
+            helpers_module._finalize_run_failure(
+                db, orchestrator_run, parent_task, state.error,
+                status="review_required",
+            )
+            return
 
         completed = set(phase_outputs)
         tiers = [
@@ -732,7 +824,9 @@ async def _run_campaign_orchestration(
                 db, phase_spec, child_tasks[phase_spec["phase"]].id,
                 orchestrator_run.run_id, phase_outputs, campaign_goal, helpers,
                 phase_spec["phase"] in dependents,
-                ownership_check=lambda: _campaign_run_owns_task(
+                ownership_check=lambda: (
+                    ownership_lost is None or not ownership_lost.is_set()
+                ) and _campaign_run_owns_task(
                     db, parent_task.id, orchestrator_run.run_id
                 ),
             )
@@ -753,11 +847,17 @@ async def _run_campaign_orchestration(
                 failed_error = result
                 # Mark failed child task
                 child_task = child_tasks[failed_phase]
+                failed_child_run = _get_latest_run_for_task(
+                    db, AgentRunModel, child_task.id
+                )
                 helpers_module._finalize_run_failure(
                     db,
-                    _get_latest_run_for_task(db, AgentRunModel, child_task.id),
+                    failed_child_run,
                     child_task,
                     str(failed_error),
+                    write_at_risk=bool(
+                        failed_child_run and failed_child_run.status == "review_required"
+                    ),
                 )
                 helpers_module._refresh_context_view(db, task_id=child_task.id)
                 helpers_module.add_task_failed_comment(
@@ -799,9 +899,24 @@ async def _run_campaign_orchestration(
             state.updated_at = datetime.utcnow().isoformat()
             db.commit()
 
+            failed_child_run = _get_latest_run_for_task(
+                db, AgentRunModel, child_tasks[failed_phase].id
+            ) if failed_phase else None
+            parent_review_required = bool(
+                failed_child_run
+                and failed_child_run.status == "review_required"
+                and _is_external_write_phase(pending_in_tier, failed_phase)
+            )
+            if parent_review_required:
+                state.status = "review_required"
+                state.error = (
+                    f"Campaign stopped at phase [{failed_phase}] with an uncertain write: "
+                    f"{failed_error}"
+                )
             helpers_module._finalize_run_failure(
                 db, orchestrator_run, parent_task,
-                f"Campaign stopped at phase [{failed_phase}]: {failed_error}",
+                state.error or f"Campaign stopped at phase [{failed_phase}]: {failed_error}",
+                status="review_required" if parent_review_required else "failed",
             )
             helpers_module.add_task_failed_comment(
                 db, parent_task.id,
@@ -851,6 +966,39 @@ def _campaign_run_owns_task(db, task_id: int, run_id: str) -> bool:
     from agent.db import TaskModel
 
     return db.query(TaskModel.active_run_id).filter(TaskModel.id == task_id).scalar() == run_id
+
+
+def _is_write_capable_for_phase(phases, phase_name: str) -> bool:
+    from agent.api.helpers import _is_write_capable
+
+    for phase in phases:
+        if phase.get("phase") == phase_name:
+            return _is_write_capable(phase.get("execution_type", phase_name))
+    return False
+
+
+def _is_external_write_phase(phases, phase_name: str) -> bool:
+    """Return True for phases whose uncertain result can repeat an external write."""
+    for phase in phases:
+        if phase.get("phase") == phase_name:
+            return phase.get("execution_type", phase_name) == "campaign_publisher"
+    return False
+
+
+def _campaign_has_blocking_publisher_child(db, parent_task_id: int, parent_run_id: str) -> bool:
+    from agent.api.main import AgentRunModel, TaskModel
+
+    child_ids = [row.id for row in db.query(TaskModel.id).filter(
+        TaskModel.parent_task_id == parent_task_id,
+        TaskModel.execution_type == "campaign_publisher",
+    ).all()]
+    if not child_ids:
+        return False
+    return db.query(AgentRunModel).filter(
+        AgentRunModel.parent_run_id == parent_run_id,
+        AgentRunModel.task_id.in_(child_ids),
+        AgentRunModel.status.in_(["failed", "review_required"]),
+    ).first() is not None
 
 
 def _create_child_task(db, parent_task, phase_spec: dict):
@@ -927,21 +1075,30 @@ def _create_child_run(
     db, child_task, parent_run_id: str, execution_type: str, *, commit: bool = True
 ):
     """Create an AgentRunModel for a child phase, linked to the orchestrator run."""
-    from agent.api.main import AgentRunModel, RunEventModel
+    from agent.api.main import AgentRunModel, RunEventModel, TaskModel
 
-    if child_task.active_run_id:
-        existing = db.query(AgentRunModel).filter(
-            AgentRunModel.run_id == child_task.active_run_id
-        ).first()
-        if existing is not None:
-            return existing
-
-    now = datetime.utcnow().isoformat()
     parent_run = (
         db.query(AgentRunModel)
         .filter(AgentRunModel.run_id == parent_run_id)
         .first()
     )
+    if parent_run is None or parent_run.status not in {"queued", "running", "resuming"}:
+        raise LostRunOwnership("Campaign parent run is not active")
+    parent_task = db.query(TaskModel).filter(TaskModel.id == parent_run.task_id).first()
+    if parent_task is not None and parent_task.active_run_id != parent_run_id:
+        raise LostRunOwnership("Campaign parent run no longer owns its task")
+
+    if child_task.active_run_id:
+        existing = db.query(AgentRunModel).filter(
+            AgentRunModel.run_id == child_task.active_run_id
+        ).first()
+        if existing is not None and (
+            existing.parent_run_id == parent_run_id
+            and existing.status in {"queued", "running", "resuming"}
+        ):
+            return existing
+
+    now = datetime.utcnow().isoformat()
     run = AgentRunModel(
         run_id=str(uuid4()),
         request_id=parent_run.request_id if parent_run else None,
@@ -949,6 +1106,9 @@ def _create_child_run(
         parent_run_id=parent_run_id,
         status="queued",
         execution_type=execution_type,
+        write_capable=_is_write_capable_for_phase(
+            [{"phase": execution_type, "execution_type": execution_type}], execution_type
+        ),
         trigger_source="orchestrator",
         session_id=None,
         validator_status="pending",

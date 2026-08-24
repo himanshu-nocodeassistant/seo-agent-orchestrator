@@ -993,6 +993,7 @@ async def test_comment_autopilot_run_stores_request_id(client):
     finally:
         db.close()
 
+
     with patch(
         "agent.api.helpers._run_agent_prompt",
         new=AsyncMock(return_value=SimpleNamespace(result_text="revision", session_id=None)),
@@ -1006,5 +1007,386 @@ async def test_comment_autopilot_run_stores_request_id(client):
             AgentRunModel.source_comment_id == comment["id"]
         ).one()
         assert run.request_id == "req-comment-run"
+    finally:
+        db.close()
+
+
+def _dispatch_test_helpers(agent_prompt):
+    from agent.api.helpers import _is_write_capable
+
+    return {
+        "build_execution_prompt": lambda task, comments=None: "prompt",
+        "_build_runtime_config": lambda *args, **kwargs: SimpleNamespace(),
+        "_finalize_run_failure": _finalize_run_failure,
+        "_finalize_run_success": lambda *args, **kwargs: True,
+        "_mark_run_started": lambda db, run, *args: _mark_run_started_for_test(db, run),
+        "_normalize_execution_result": lambda value: value,
+        "_refresh_context_view": lambda *args, **kwargs: None,
+        "_resolve_prompt_context": lambda *args, **kwargs: {},
+        "_run_agent_prompt": agent_prompt,
+        "_is_write_capable": _is_write_capable,
+    }
+
+
+def _mark_run_started_for_test(db, run):
+    run.status = "running"
+    run.write_capable = True
+    db.commit()
+
+
+@pytest.mark.asyncio
+async def test_write_phase_timeout_is_uncertain_and_not_retried(client):
+    from agent.orchestrator import _dispatch_phase
+
+    db = get_db_session()
+    try:
+        parent_data = client.post(
+            "/tasks", json={"title": "Uncertain write campaign", "execution_type": "orchestrate_seo_campaign"}
+        ).json()
+        parent = db.query(TaskModel).filter_by(id=parent_data["id"]).one()
+        parent_run = _create_run(db, parent, "manual_execute", parent.execution_type)
+        child = TaskModel(
+            title="Campaign: publisher", execution_type="campaign_publisher",
+            parent_task_id=parent.id, status="pending", created_at=_utcnow_iso(), updated_at=_utcnow_iso(),
+        )
+        db.add(child)
+        db.commit()
+        db.refresh(child)
+        calls = 0
+
+        async def uncertain(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("agent timed out after publish request")
+
+        with pytest.raises(RuntimeError, match="timed out"):
+            await _dispatch_phase(
+                db,
+                {"phase": "publisher", "execution_type": "campaign_publisher"},
+                child.id, parent_run.run_id, {}, "goal",
+                _dispatch_test_helpers(uncertain), False,
+                ownership_check=lambda: True,
+            )
+
+        assert calls == 1
+        child_run = db.query(AgentRunModel).filter_by(task_id=child.id).one()
+        assert child_run.status == "review_required"
+        assert child_run.write_capable is True
+        assert "timed out" in child_run.error
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_write_phase_does_not_use_handoff_correction_retry(client):
+    from agent.orchestrator import _dispatch_phase
+
+    db = get_db_session()
+    try:
+        parent_data = client.post(
+            "/tasks", json={"title": "Uncertain handoff", "execution_type": "orchestrate_seo_campaign"}
+        ).json()
+        parent = db.query(TaskModel).filter_by(id=parent_data["id"]).one()
+        parent_run = _create_run(db, parent, "manual_execute", parent.execution_type)
+        child = TaskModel(
+            title="Campaign: publisher", execution_type="campaign_publisher",
+            parent_task_id=parent.id, status="pending", created_at=_utcnow_iso(), updated_at=_utcnow_iso(),
+        )
+        db.add(child)
+        db.commit()
+        db.refresh(child)
+        calls = 0
+
+        async def published_without_handoff(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return SimpleNamespace(result_text="published", session_id=None)
+
+        with pytest.raises(RuntimeError, match="handoff correction"):
+            await _dispatch_phase(
+                db,
+                {"phase": "publisher", "execution_type": "campaign_publisher"},
+                child.id, parent_run.run_id, {}, "goal",
+                _dispatch_test_helpers(published_without_handoff), True,
+                ownership_check=lambda: True,
+            )
+
+        assert calls == 1
+        child_run = db.query(AgentRunModel).filter_by(task_id=child.id).one()
+        assert child_run.status == "review_required"
+    finally:
+        db.close()
+
+
+def test_campaign_retry_is_blocked_by_failed_publisher_child(client):
+    db = get_db_session()
+    try:
+        task, parent_run = _campaign_task(db)
+        state = db.query(OrchestrationStateModel).filter_by(
+            orchestrator_run_id=parent_run.run_id
+        ).one()
+        state.status = "error"
+        state.plan_json = "```json\n" + json.dumps({"phases": [
+            {"phase": "publisher", "execution_type": "campaign_publisher", "depends_on": []}
+        ]}) + "\n```"
+        parent_run.status = "failed"
+        task.status = "blocked"
+        task.active_run_id = None
+        child = TaskModel(
+            title="Campaign: publisher", execution_type="campaign_publisher",
+            parent_task_id=task.id, status="blocked", created_at=_utcnow_iso(), updated_at=_utcnow_iso(),
+        )
+        db.add(child)
+        db.commit()
+        db.refresh(child)
+        child_run = AgentRunModel(
+            run_id="failed-publisher-child", task_id=child.id, parent_run_id=parent_run.run_id,
+            status="review_required", recovery_state="review_required",
+            execution_type="campaign_publisher", write_capable=True,
+            error="write result uncertain", started_at=_utcnow_iso(),
+        )
+        db.add(child_run)
+        db.commit()
+        task_id = task.id
+    finally:
+        db.close()
+
+    with patch("agent.api.routers.tasks._execute_campaign_with_timeout", new=AsyncMock()) as execute:
+        response = client.post(f"/tasks/{task_id}/execute")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "review_required"
+    execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_lost_campaign_ownership_cancels_child_agent_call(client):
+    from agent.orchestrator import _dispatch_phase
+
+    db = get_db_session()
+    try:
+        parent_data = client.post(
+            "/tasks", json={"title": "Cancel stale campaign", "execution_type": "orchestrate_seo_campaign"}
+        ).json()
+        parent = db.query(TaskModel).filter_by(id=parent_data["id"]).one()
+        parent_run = _create_run(db, parent, "manual_execute", parent.execution_type)
+        child = TaskModel(
+            title="Campaign: publisher", execution_type="campaign_publisher",
+            parent_task_id=parent.id, status="pending", created_at=_utcnow_iso(), updated_at=_utcnow_iso(),
+        )
+        db.add(child)
+        db.commit()
+        db.refresh(child)
+        checks = 0
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        def ownership():
+            nonlocal checks
+            checks += 1
+            return checks < 4
+
+        async def long_agent(*args, **kwargs):
+            started.set()
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        work = asyncio.create_task(_dispatch_phase(
+            db,
+            {"phase": "publisher", "execution_type": "campaign_publisher"},
+            child.id, parent_run.run_id, {}, "goal",
+            _dispatch_test_helpers(long_agent), False,
+            ownership_check=ownership,
+        ))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        with pytest.raises(orchestrator_module.LostRunOwnership):
+            await asyncio.wait_for(work, timeout=1)
+        assert cancelled.is_set()
+    finally:
+        db.close()
+
+
+def test_new_campaign_does_not_reuse_old_child_run(client):
+    from agent.orchestrator import _create_child_run
+
+    db = get_db_session()
+    try:
+        task, old_parent = _campaign_task(db)
+        task.active_run_id = None
+        old_parent.status = "review_required"
+        child = TaskModel(
+            title="Campaign: researcher", execution_type="campaign_researcher",
+            parent_task_id=task.id, status="in_progress", created_at=_utcnow_iso(), updated_at=_utcnow_iso(),
+        )
+        db.add(child)
+        db.commit()
+        db.refresh(child)
+        old_child = AgentRunModel(
+            run_id="old-child-run", task_id=child.id, parent_run_id=old_parent.run_id,
+            status="running", execution_type="campaign_researcher", started_at=_utcnow_iso(),
+        )
+        db.add(old_child)
+        child.active_run_id = old_child.run_id
+        db.commit()
+        new_parent = _create_run(db, task, "manual_execute", task.execution_type)
+
+        new_child = _create_child_run(db, child, new_parent.run_id, "campaign_researcher")
+
+        assert new_child.run_id != old_child.run_id
+        assert new_child.parent_run_id == new_parent.run_id
+        assert child.active_run_id == new_child.run_id
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_comment_autopilot_requires_approval_for_campaign_publisher(client):
+    from agent.api.helpers import process_one_comment_action
+
+    task = client.post(
+        "/tasks", json={"title": "Publisher comment approval", "execution_type": "campaign_publisher"}
+    ).json()
+    comment = client.post(
+        f"/tasks/{task['id']}/comments", json={"body": "@agent publish this"}
+    ).json()
+    db = get_db_session()
+    try:
+        db.add(CommentActionModel(
+            task_id=task["id"], comment_id=comment["id"], status="pending", attempts=0, max_attempts=2,
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    with patch("agent.api.helpers._run_agent_prompt", new=AsyncMock()) as run_agent:
+        result = await process_one_comment_action(request_id="req-approval-comment")
+
+    assert result["status"] == "review_required"
+    run_agent.assert_not_awaited()
+    db = get_db_session()
+    try:
+        assert db.query(AgentRunModel).filter_by(task_id=task["id"]).count() == 0
+    finally:
+        db.close()
+
+
+def test_comment_lease_requires_current_task_run_ownership(client):
+    from agent.api.helpers import _update_comment_action_if_owned
+
+    db = get_db_session()
+    try:
+        task_data = client.post(
+            "/tasks", json={"title": "Comment owner check", "execution_type": "research"}
+        ).json()
+        task = db.query(TaskModel).filter_by(id=task_data["id"]).one()
+        old_run = _create_run(db, task, "manual_execute", "research")
+        task.active_run_id = None
+        old_run.status = "review_required"
+        db.commit()
+        new_run = _create_run(db, task, "manual_execute", "research")
+        action = CommentActionModel(
+            task_id=task.id, comment_id=999992, run_id=old_run.run_id, status="running",
+            attempts=1, max_attempts=2, heartbeat_at=_utcnow_iso(),
+            lease_expires_at=_lease_expires_at_for_test(), recovery_state="running",
+        )
+        db.add(action)
+        db.commit()
+        assert _heartbeat_comment_action(db, action, expected_run_id=old_run.run_id) is False
+        assert _update_comment_action_if_owned(
+            db, action.id, old_run.run_id, {CommentActionModel.status: "succeeded"}
+        ) is False
+        db.refresh(action)
+        assert action.status == "running"
+        assert new_run.run_id == task.active_run_id
+    finally:
+        db.close()
+
+
+def _lease_expires_at_for_test():
+    return (datetime.utcnow() + timedelta(minutes=5)).isoformat()
+
+
+def test_stale_approval_campaign_with_queued_publisher_has_resume_path(client):
+    db = get_db_session()
+    try:
+        task, parent_run = _campaign_task(db)
+        state = db.query(OrchestrationStateModel).filter_by(
+            orchestrator_run_id=parent_run.run_id
+        ).one()
+        state.status = "awaiting_approval"
+        state.plan_json = "```json\n" + json.dumps({"phases": [
+            {"phase": "publisher", "execution_type": "campaign_publisher", "depends_on": []}
+        ]}) + "\n```"
+        child = TaskModel(
+            title="Campaign: publisher", execution_type="campaign_publisher",
+            parent_task_id=task.id, status="pending", created_at=_utcnow_iso(), updated_at=_utcnow_iso(),
+        )
+        db.add(child)
+        db.commit()
+        db.refresh(child)
+        child_run = AgentRunModel(
+            run_id="queued-approval-publisher", task_id=child.id, parent_run_id=parent_run.run_id,
+            status="queued", execution_type="campaign_publisher", write_capable=True,
+            started_at=_utcnow_iso(),
+        )
+        db.add(child_run)
+        parent_run.heartbeat_at = _old_timestamp()
+        parent_run.lease_expires_at = _old_timestamp()
+        db.commit()
+
+        recover_stale_runs(db)
+        db.refresh(parent_run)
+        assert parent_run.status == "review_required"
+        assert _claim_campaign_resume(db, parent_run.run_id, request_id="req-resume") is True
+        db.refresh(parent_run)
+        assert parent_run.status == "resuming"
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_retry_deadline_records_exhausted_trace(client):
+    db = get_db_session()
+    try:
+        task_data = client.post(
+            "/tasks", json={"title": "Deadline trace", "execution_type": "research"}
+        ).json()
+        task = db.query(TaskModel).filter_by(id=task_data["id"]).one()
+        run = _create_run(db, task, "manual_execute", "research")
+
+        async def fails():
+            raise RuntimeError("timed out")
+
+        clock = iter([0.0, 0.0, 1.0])
+        with patch("agent.orchestrator.time.monotonic", side_effect=lambda: next(clock)), \
+             patch("agent.orchestrator.asyncio.sleep", new=AsyncMock()):
+            with pytest.raises(RuntimeError):
+                await _run_with_retry(
+                    fails, max_retries=3, base_delay=1, max_total_seconds=0.5,
+                    trace_db=db, trace_run_id=run.run_id,
+                )
+        events = db.query(RunEventModel).filter_by(
+            run_id=run.run_id, event_type="retry"
+        ).order_by(RunEventModel.id).all()
+        assert events[-1].outcome == "exhausted"
+        assert json.loads(events[-1].payload)["attempt"] == 1
+    finally:
+        db.close()
+
+
+def test_resume_request_id_is_stored_on_run_and_event(client):
+    db = get_db_session()
+    try:
+        task, run = _campaign_task(db)
+        assert _claim_campaign_resume(db, run.run_id, request_id="req-resume-trace") is True
+        db.refresh(run)
+        assert run.request_id == "req-resume-trace"
+        event = db.query(RunEventModel).filter_by(
+            run_id=run.run_id, event_type="campaign_resume"
+        ).one()
+        assert event.request_id == "req-resume-trace"
     finally:
         db.close()

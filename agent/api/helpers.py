@@ -553,23 +553,52 @@ def _create_run(
     return run
 
 
-def _claim_campaign_resume(db, run_id: str) -> bool:
+def _claim_campaign_resume(
+    db, run_id: str, request_id: Optional[str] = None
+) -> bool:
     """Atomically claim one approval-gated campaign resume."""
     now = _utcnow_iso()
+    current_run = db.query(AgentRunModel).filter(
+        AgentRunModel.run_id == run_id
+    ).first()
+    if current_run is None:
+        return False
+    task = db.query(TaskModel).filter(TaskModel.id == current_run.task_id).first()
+    state = db.query(OrchestrationStateModel).filter(
+        OrchestrationStateModel.orchestrator_run_id == run_id
+    ).first()
+    safe_review_resume = False
+    if current_run.status == "review_required" and state is not None:
+        active_child = db.query(AgentRunModel).filter(
+            AgentRunModel.parent_run_id == run_id,
+            AgentRunModel.status.in_(["running", "resuming"]),
+        ).first()
+        safe_review_resume = bool(
+            state.status == "awaiting_approval"
+            and task is not None
+            and task.approved_at
+            and active_child is None
+        )
+    allowed_statuses = ["queued", "running", "failed", "recoverable"]
+    if safe_review_resume:
+        allowed_statuses.append("review_required")
+    claim_values = {
+        AgentRunModel.status: "resuming",
+        AgentRunModel.recovery_state: "none",
+        AgentRunModel.heartbeat_at: now,
+        AgentRunModel.lease_expires_at: _lease_expires_at(now),
+        AgentRunModel.finished_at: None,
+    }
+    if request_id is not None:
+        claim_values[AgentRunModel.request_id] = request_id
     claimed = (
         db.query(AgentRunModel)
         .filter(
             AgentRunModel.run_id == run_id,
-            AgentRunModel.status.in_(["queued", "running", "failed", "recoverable"]),
+            AgentRunModel.status.in_(allowed_statuses),
         )
         .update(
-            {
-                AgentRunModel.status: "resuming",
-                AgentRunModel.recovery_state: "none",
-                AgentRunModel.heartbeat_at: now,
-                AgentRunModel.lease_expires_at: _lease_expires_at(now),
-                AgentRunModel.finished_at: None,
-            },
+            claim_values,
             synchronize_session=False,
         )
     )
@@ -591,6 +620,14 @@ def _claim_campaign_resume(db, run_id: str) -> bool:
         task.updated_at = now
     db.commit()
     run._resume_claimed = True
+    _log_run_event(
+        db,
+        run.run_id,
+        "campaign_resume",
+        {"request_id": request_id},
+        request_id=request_id,
+        outcome="claimed",
+    )
     return True
 
 
@@ -737,6 +774,11 @@ def _heartbeat_comment_action(db, action, expected_run_id: Optional[str] = None)
     )
     if expected_run_id is not None:
         query = query.filter(CommentActionModel.run_id == expected_run_id)
+        task_owner = db.query(TaskModel.id).filter(
+            TaskModel.id == CommentActionModel.task_id,
+            TaskModel.active_run_id == expected_run_id,
+        ).exists()
+        query = query.filter(task_owner)
     updated = query.update(
         {
             CommentActionModel.heartbeat_at: now,
@@ -758,12 +800,17 @@ def _update_comment_action_if_owned(
     db, action_id: int, owner_run_id: str, values: dict
 ) -> bool:
     """Update a comment action only while this worker still owns its lease."""
+    task_owner = db.query(TaskModel.id).filter(
+        TaskModel.id == CommentActionModel.task_id,
+        TaskModel.active_run_id == owner_run_id,
+    ).exists()
     updated = (
         db.query(CommentActionModel)
         .filter(
             CommentActionModel.id == action_id,
             CommentActionModel.status == "running",
             CommentActionModel.run_id == owner_run_id,
+            task_owner,
         )
         .update(values, synchronize_session=False)
     )
@@ -785,6 +832,21 @@ def _task_has_review_gate(db, task) -> bool:
         .first()
     )
     return latest is not None and latest.status == "review_required"
+
+
+def _campaign_has_blocking_publisher_child(db, task) -> bool:
+    """Return True when a publisher child makes campaign retry unsafe."""
+    children = db.query(TaskModel).filter(
+        TaskModel.parent_task_id == task.id,
+        TaskModel.execution_type == "campaign_publisher",
+    ).all()
+    child_ids = [child.id for child in children]
+    if not child_ids:
+        return False
+    return db.query(AgentRunModel).filter(
+        AgentRunModel.task_id.in_(child_ids),
+        AgentRunModel.status.in_(["failed", "review_required"]),
+    ).first() is not None
 
 
 def _campaign_has_unrecorded_publisher_write(db, task, parent_run_id: str) -> bool:
@@ -957,10 +1019,19 @@ def _finalize_run_success(
     return owns_task
 
 
-def _finalize_run_failure(db, run, task, error_message: str, status: str = "failed") -> None:
+def _finalize_run_failure(
+    db,
+    run,
+    task,
+    error_message: str,
+    status: str = "failed",
+    write_at_risk: Optional[bool] = None,
+) -> None:
     now = _utcnow_iso()
     if status == "failed" and (
-        bool(run.write_capable) or _is_write_capable(run.execution_type)
+        write_at_risk
+        if write_at_risk is not None
+        else (bool(run.write_capable) or _is_write_capable(run.execution_type))
     ):
         status = "review_required"
     run_updated = (
@@ -1232,6 +1303,22 @@ async def process_one_comment_action(request_id: Optional[str] = None) -> dict:
                     "attempts": action.attempts,
                 }
 
+            if _is_write_capable(task.execution_type) and not task.approved_at:
+                action.status = "review_required"
+                action.recovery_state = "review_required"
+                action.write_capable = True
+                action.last_error = "Write-capable comment work requires task approval."
+                action.updated_at = _utcnow_iso()
+                db.commit()
+                return {
+                    "processed": True,
+                    "task_id": task.id,
+                    "comment_id": comment.id,
+                    "status": action.status,
+                    "attempts": action.attempts,
+                    "max_attempts": action.max_attempts,
+                }
+
             if _task_has_review_gate(db, task):
                 action.status = "review_required"
                 action.recovery_state = "review_required"
@@ -1286,7 +1373,11 @@ async def process_one_comment_action(request_id: Optional[str] = None) -> dict:
                 action.attempts = max(0, action.attempts - 1)
                 action.recovery_state = "deferred"
                 action.last_error = "Campaign resume is active; comment work deferred."
-                if run.status == "review_required":
+                if (
+                    run.status == "review_required"
+                    or bool(run.write_capable)
+                    or _is_write_capable(run.execution_type)
+                ):
                     action.status = "review_required"
                     action.recovery_state = "review_required"
                     action.write_capable = True
@@ -1336,24 +1427,43 @@ async def process_one_comment_action(request_id: Optional[str] = None) -> dict:
                     status="passed" if execution.result_text and execution.result_text.strip() else "failed",
                     message=None if execution.result_text and execution.result_text.strip() else "Revision output was empty.",
                 )
-                _finalize_run_success(db, run, task, execution.result_text, execution.session_id, validation)
-                _refresh_context_view(db, task_id=task.id)
-
-                add_task_comment(
-                    db,
-                    task.id,
-                    f"🤖 Revision completed for comment #{comment.id}\n\n{execution.result_text}",
-                    "agent",
-                )
-
                 action.status = "succeeded" if validation.status == "passed" else "needs_review"
                 action.acted_at = _utcnow_iso()
                 action.last_error = validation.message
-            except Exception as e:
-                _finalize_run_failure(db, run, task, str(e))
+                action_updated = _update_comment_action_if_owned(
+                    db,
+                    action.id,
+                    action_owner_run_id,
+                    {
+                        CommentActionModel.status: action.status,
+                        CommentActionModel.recovery_state: action.recovery_state,
+                        CommentActionModel.acted_at: action.acted_at,
+                        CommentActionModel.last_error: action.last_error,
+                        CommentActionModel.updated_at: _utcnow_iso(),
+                    },
+                )
+                if not action_updated:
+                    return {
+                        "processed": True,
+                        "task_id": task.id,
+                        "comment_id": comment.id,
+                        "status": "deferred",
+                        "attempts": action.attempts,
+                        "max_attempts": action.max_attempts,
+                    }
+                owns_task = _finalize_run_success(
+                    db, run, task, execution.result_text, execution.session_id, validation
+                )
                 _refresh_context_view(db, task_id=task.id)
-                add_task_failed_comment(db, task.id, f"Comment #{comment.id}: {str(e)}")
 
+                if owns_task:
+                    add_task_comment(
+                        db,
+                        task.id,
+                        f"🤖 Revision completed for comment #{comment.id}\n\n{execution.result_text}",
+                        "agent",
+                    )
+            except Exception as e:
                 action.last_error = str(e)
                 if run.status == "review_required":
                     action.status = "review_required"
@@ -1363,19 +1473,30 @@ async def process_one_comment_action(request_id: Optional[str] = None) -> dict:
                     action.status = "retry_exhausted"
                 else:
                     action.status = "failed"
-
-            _update_comment_action_if_owned(
-                db,
-                action.id,
-                action_owner_run_id,
-                {
-                    CommentActionModel.status: action.status,
-                    CommentActionModel.recovery_state: action.recovery_state,
-                    CommentActionModel.acted_at: action.acted_at,
-                    CommentActionModel.last_error: action.last_error,
-                    CommentActionModel.updated_at: _utcnow_iso(),
-                },
-            )
+                action_updated = _update_comment_action_if_owned(
+                    db,
+                    action.id,
+                    action_owner_run_id,
+                    {
+                        CommentActionModel.status: action.status,
+                        CommentActionModel.recovery_state: action.recovery_state,
+                        CommentActionModel.acted_at: action.acted_at,
+                        CommentActionModel.last_error: action.last_error,
+                        CommentActionModel.updated_at: _utcnow_iso(),
+                    },
+                )
+                if not action_updated:
+                    return {
+                        "processed": True,
+                        "task_id": task.id,
+                        "comment_id": comment.id,
+                        "status": "deferred",
+                        "attempts": action.attempts,
+                        "max_attempts": action.max_attempts,
+                    }
+                _finalize_run_failure(db, run, task, str(e))
+                _refresh_context_view(db, task_id=task.id)
+                add_task_failed_comment(db, task.id, f"Comment #{comment.id}: {str(e)}")
             return {
                 "processed": True,
                 "task_id": task.id,

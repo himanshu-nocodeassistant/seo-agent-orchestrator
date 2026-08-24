@@ -206,7 +206,9 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
                         status_code=400,
                         detail="Task not approved yet — set approved_at first.",
                     )
-                if not _claim_campaign_resume(db, run.run_id):
+                if not _claim_campaign_resume(
+                    db, run.run_id, request_id=getattr(request.state, "request_id", None)
+                ):
                     db.refresh(run)
                     return _run_response(run)
                 task.status = "in_progress"
@@ -244,7 +246,23 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
                 and retry_state is not None
                 and retry_state.status == "error"
             ):
-                if not _claim_campaign_resume(db, retry_run.run_id):
+                if helpers_module._campaign_has_blocking_publisher_child(db, task):
+                    retry_run.status = "review_required"
+                    retry_run.recovery_state = "review_required"
+                    task.status = "blocked"
+                    task.active_run_id = None
+                    retry_state.status = "review_required"
+                    retry_state.error = (
+                        "Campaign retry blocked: a publisher child has an uncertain write."
+                    )
+                    retry_state.updated_at = _utcnow_iso()
+                    db.commit()
+                    return _run_response(retry_run)
+                if not _claim_campaign_resume(
+                    db,
+                    retry_run.run_id,
+                    request_id=getattr(request.state, "request_id", None),
+                ):
                     db.refresh(retry_run)
                     return _run_response(retry_run)
                 add_task_comment(
