@@ -277,8 +277,8 @@ class TestTaskComments:
     
     def test_execute_task_adds_failure_comment(self, client):
         """Test: When task fails, an error comment is added."""
-        # Create task with invalid execution type to force failure
-        task_data = {"title": "Failing Task", "description": "Will fail", "execution_type": "invalid_type_xyz"}
+        # Use a valid task type. The unavailable agent path should fail safely.
+        task_data = {"title": "Failing Task", "description": "Will fail", "execution_type": "research"}
         create_response = client.post("/tasks", json=task_data)
         task_id = create_response.json()["id"]
         
@@ -405,8 +405,8 @@ class TestTaskComments:
     
     def test_failure_comment_contains_error_info(self, client):
         """Test: Failed task comments contain error information."""
-        # Use invalid execution type to force failure
-        task_data = {"title": "Error Test", "description": "Test", "execution_type": "invalid_type"}
+        # Use a valid task type. The unavailable agent path should fail safely.
+        task_data = {"title": "Error Test", "description": "Test", "execution_type": "research"}
         create_response = client.post("/tasks", json=task_data)
         task_id = create_response.json()["id"]
         

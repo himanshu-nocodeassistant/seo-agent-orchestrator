@@ -1,60 +1,46 @@
 # SEO Agent Orchestrator
 
-*Turn SEO from a manual, hard-to-measure process into a repeatable system that compounds organic growth.*
-
-**SEO Agent Orchestrator is an open-source SEO operations platform** — an autonomous operator for your site that audits, optimizes, writes, publishes, and — most importantly — **measures whether the changes actually moved rankings**. Built on Python + the Claude Agent SDK and driven through a visual Kanban board, with a human approval gate before anything goes live.
-
-## Why it exists — the business case
-
-- **SEO is measurable but rarely measured.** The agent closes the loop: every CMS change is logged, its ranking impact reviewed against Search Console, and the winning patterns fed back into the next task.
-- **Content work doesn't scale manually.** A researcher → writer → publisher → analyst campaign pipeline turns one campaign request into a coordinated set of specialized tasks that run automatically.
-- **Guardrails protect the business.** Cost ceilings per task, tool permissions per task type, output validators, rate limits, and a human approval step before publishing — automation without losing control.
-- **Decisions come from data, not guesses.** Measured keyword volumes, SERP positions, backlink data, and AI-search visibility (via DataForSEO) are injected into the agent's context so recommendations are grounded in real numbers.
-
-## What it delivers
-
-| Business outcome | How it's delivered |
-|---|---|
-| Faster page-level optimization | One task rewrites titles, meta descriptions, H1s, alt text, schema — with Webflow publish when configured |
-| Consistent content production | Blog posts and rewrites follow brand voice, SEO workflow, and validator checks |
-| Rank changes you can attribute | Every CMS change is change-logged and reviewed against GSC clicks/impressions/position |
-| Learning that compounds | SEO Feedback Loop extracts learnings from measured outcomes and propagates what works |
-| Team leverage | Comment Autopilot picks up "@agent" revision requests and re-runs automatically |
-| Cost control | Per-task budget ceilings, per-minute rate limits, real cost tracking on data pulls |
-
-## Open source, self-hosted, no lock-in
-
-SEO Agent Orchestrator is released under the [MIT License](LICENSE). It runs entirely on your own infrastructure against your existing Claude Code subscription — your ranking data, CMS, and credentials never leave your control. As an open-source project, the entire pipeline is inspectable and extensible: agent logic, SEO skills, data integrations, and the API are all yours to read, fork, and extend. No black box, no per-seat pricing, no vendor lock-in.
+SEO Agent Orchestrator runs SEO tasks through Claude Code. It supports audits, content work, Webflow updates, Google Search Console reads, DataForSEO pulls, and campaign orchestration. A Kanban API tracks tasks, runs, approvals, and results.
 
 ## How it works
 
-The agent runs on your existing Claude Code subscription (OAuth — no API key). Each task maps to an **execution profile** that controls which tools the agent can use, how many turns it gets, its cost ceiling, and a structured validator that checks the output before a run is marked complete.
+The agent uses Claude Code through OAuth. Each task maps to an **execution profile** that controls its tools, turn limit, budget, timeout, and output validator.
 
 A four-layer memory system feeds every prompt:
-- **Semantic** — your site overview, keyword strategy, and extracted ranking learnings from `memory/`
-- **Episodic** — summaries of prior runs for the same task, pulled from the database
-- **Procedural** — the workflow prompt for the execution type (rewrite title, write blog post, etc.)
-- **Short-term** — current run metadata, task notes, and `@agent` comments from the Kanban board
+- **Semantic:** site overview, keyword strategy, and ranking learnings from `memory/`
+- **Episodic:** summaries of prior runs for the same task
+- **Procedural:** the workflow prompt for the execution type
+- **Short-term:** current run metadata, task notes, and `@agent` comments
 
 ## Features
 
-- **Multi-agent campaign orchestration** — one campaign task (researcher → writer → publisher → analyst) with DAG-based parallelism, structured handoffs, retry on transient failures, and an approval gate before publishing
-- **15 SEO Skills** — SEO Audit, Content Strategy, Copywriting, Copy Editing, Brand Voice, Competitor Alternatives, Programmatic SEO, Schema Markup, Analytics Tracking, Page CRO, Marketing Psychology, Webflow CMS, Google Docs, SEO Feedback Loop, Task Breakdown
-- **Kanban UI** — visual task board at `http://localhost:8000/kanban`; create tasks, execute them, leave `@agent` comments for revisions
-- **Comment Autopilot** — background worker that picks up `@agent` comments and re-runs the agent automatically
-- **Run tracking** — every execution is recorded with status, session ID, validator result, and a result summary; child campaign runs link back to the orchestrator run via `parent_run_id`
-- **Session reuse** — the agent resumes the same Claude session for follow-up runs on a task, preserving context
-- **Webflow CMS** — create, update, and publish CMS items directly via the agent
-- **Google Docs** — save audit reports and blog drafts to Google Docs (read/write only — no delete)
-- **Google Search Console** — query live clicks, impressions, CTR, and position; inspect URL indexing status; list sitemaps (read-only)
-- **Measured ranking data (DataForSEO)** — SERP positions, keyword volumes, backlinks, and AI-search visibility come from measured API responses, not estimates, and are injected into the agent's context for research and impact reviews
-- **SEO Feedback Loop** — log CMS changes, review ranking impact using GSC data, extract learnings, propagate winning patterns
+- **Campaign orchestration:** researcher, writer, publisher, and analyst phases with dependencies, retries, handoffs, and approval before publishing
+- **SEO skills:** SEO Audit, Content Strategy, Copywriting, Copy Editing, Brand Voice, Competitor Alternatives, Programmatic SEO, Schema Markup, Analytics Tracking, Page CRO, Marketing Psychology, Webflow CMS, Google Docs, SEO Feedback Loop, Task Breakdown
+- **Kanban UI:** create tasks, execute them, and add `@agent` comments for revisions
+- **Comment Autopilot:** claims comments, runs revisions, and sends unsafe work for review
+- **Run tracing:** records run status, session ID, validator result, request ID, and tool events
+- **Recovery controls:** task claims, leases, heartbeats, stale-run recovery, ownership checks, and review states
+- **Session reuse:** follow-up runs can continue the same Claude session
+- **Integrations:** Webflow CMS, Google Docs, Google Search Console, and DataForSEO
+- **Measured ranking data:** DataForSEO provides keyword volumes, SERP positions, backlinks, and AI-search visibility for research and impact reviews
+- **SEO Feedback Loop:** records CMS changes and reviews ranking data
+
+## Reliability and recovery
+
+The API is designed for a small self-hosted deployment with SQLite and one process:
+
+- Execute requests atomically claim a task. A duplicate request returns the active run instead of starting another paid run.
+- Every run accepts or generates an `X-Request-ID`. The ID is returned in the response and stored on run and event records.
+- Runs use a 15-minute lease with heartbeats. Stale read-only work can recover; write-capable or uncertain work moves to `review_required` and does not retry automatically.
+- Comment actions and campaign children use database claims and ownership checks. A stale worker cannot finish a newer run or add post-run side effects.
+- DataForSEO preserves task IDs, manifests, partial results, and unknown submission outcomes. An uncertain paid POST is not sent again automatically.
+- Query trace events with `GET /runs/{run_id}/events?page=1&limit=50`. The server caps `limit` at 200.
 
 ## Requirements
 
 - Python 3.11+
 - Claude Code CLI (`npm install -g @anthropic-ai/claude-code`)
-- Claude Pro or Max subscription (for OAuth — no API key needed)
+- Claude Pro or Max subscription for OAuth
 
 ## Installation
 
@@ -72,16 +58,16 @@ claude  # completes OAuth on first run
 
 ## Setup
 
-1. **Fill in your site context** — edit `memory/CLAUDE.md` with your site URL, target keywords, content gaps, and what NOT to do. This is loaded at the start of every agent session.
+1. Edit `memory/CLAUDE.md` with your site URL, target keywords, content gaps, and constraints. The agent loads this file at the start of each session.
 
 2. **Copy the env template:**
    ```bash
    cp .env.example .env
    ```
 
-3. **(Optional) Webflow** — add `WEBFLOW_ACCESS_TOKEN`, `WEBFLOW_SITE_ID`, `WEBFLOW_COLLECTION_ID` to `.env`. Webflow CMS tools are enabled automatically when these are set.
+3. To use Webflow, add `WEBFLOW_ACCESS_TOKEN`, `WEBFLOW_SITE_ID`, and `WEBFLOW_COLLECTION_ID` to `.env`. Webflow tools are enabled when these are set.
 
-4. **(Optional) Google Docs / Search Console** — place your Google Service Account JSON in `google-sa-credentials/` (gitignored), then set `GOOGLE_DOCS_CREDENTIALS_PATH` in `.env`. For Search Console, also set `GSC_SITE_URL` (e.g. `sc-domain:example.com`). The same service account covers both — just grant it access to your GSC property in Search Console → Settings → Users and permissions.
+4. To use Google Docs or Search Console, place the service account JSON in `google-sa-credentials/` and set `GOOGLE_DOCS_CREDENTIALS_PATH`. For Search Console, also set `GSC_SITE_URL`, then grant the service account access to the property.
 
 ## Usage
 
@@ -120,12 +106,13 @@ async def main():
 asyncio.run(main())
 ```
 
-## Business guardrails by default
+## Guardrails
 
-- **Human approval before publishing** — `campaign_publisher` phases pause until a person sets `approved_at`; the campaign resumes from where it stopped (no re-planning, no double-billing).
-- **Spend is bounded** — every execution profile has a max budget and turn limit, API rate limits cap cost-triggering endpoints, and DataForSEO pulls track real billed cost per run.
-- **Nothing ships unverified** — outputs must pass a structured validator (grounded research requires cited URLs; CMS changes require a machine-readable change log) before a run is marked complete.
-- **Published changes are attributable** — the SEO Feedback Loop correlates CMS changes with GSC ranking data so you can see what actually worked.
+- Publishing requires approval. `campaign_publisher` pauses until `approved_at` is set.
+- Profiles set the maximum budget, turns, and timeout. Rate limits protect paid endpoints.
+- Validators must pass before a run is marked complete. Research output needs cited URLs. CMS changes need a change log.
+- Uncertain writes, failed write validation, stale write runs, and lost ownership move to review. They aren't retried blindly.
+- CMS changes are stored with ranking data from Google Search Console when the feedback loop runs.
 
 ## Measured data, not guesses (DataForSEO)
 
@@ -160,8 +147,9 @@ Copy `.env.example` to `.env` and fill in the values you need.
 | `APP_ENV` | Kanban DB selection (`production` or `staging`) | `production` |
 | `DATABASE_URL` | Explicit DB URL (overrides `APP_ENV`) | unset |
 | `COMMENT_AUTOPILOT_ENABLED` | Enable `@agent` comment background worker | `true` |
-| `COMMENT_AUTOPILOT_INTERVAL_SECONDS` | Poll interval for comment autopilot | `900` |
+| `COMMENT_AUTOPILOT_INTERVAL_SECONDS` | Poll interval for comment autopilot | `300` |
 | `AGENT_EXECUTION_TIMEOUT_SECONDS` | Timeout per agent execution | `900` |
+| `CAMPAIGN_TIMEOUT_SECONDS` | Maximum wall-clock time for one campaign | `5400` |
 | `ALLOWED_ORIGINS` | Comma-separated CORS origins for the local API | `http://localhost:8000,http://127.0.0.1:8000` |
 | `API_TOKEN` | Optional bearer token; when set every request needs `Authorization: Bearer <token>` | unset |
 | `API_RATE_LIMIT_EXECUTE` | Per-minute rate limit on endpoints that start paid agent runs | `5/minute` |
@@ -195,8 +183,8 @@ Each task type maps to an `ExecutionProfile` in `agent/runtime_profiles.py` that
 | `manual` | 8 | $1.00 | 4 min | Fallback for unknown types |
 | `orchestrate_seo_campaign` | 6 | $1.00 | 3 min | Produces JSON plan; no session reuse |
 | `campaign_researcher` | 14 | $2.50 | 10 min | Read-only + GSC |
-| `campaign_content_writer` | 18 | $4.00 | 15 min | Write + Webflow; validates blog output |
-| `campaign_publisher` | 8 | $1.50 | 5 min | Webflow publish; validates CHANGE_LOG |
+| `campaign_draft_writer` | 18 | $4.00 | 15 min | File edits only; validates blog output |
+| `campaign_publisher` | 8 | $1.50 | 5 min | Webflow publish; approval required; validates CHANGE_LOG |
 | `campaign_analyst` | 16 | $3.00 | 12 min | Read-only + GSC; no session reuse |
 
 ## Memory System
@@ -221,7 +209,8 @@ seo-agent-orchestrator/
 │   ├── seo_agent.py          # SEOAgent class; returns AgentExecutionResult
 │   ├── memory_service.py     # Four-layer prompt composition
 │   ├── runtime_profiles.py   # ExecutionProfile registry (incl. campaign profiles)
-│   ├── orchestrator.py       # Multi-agent dispatch loop; DAG resolution; retry
+│   ├── orchestrator.py       # Multi-agent dispatch, leases, DAG, retry, recovery
+│   ├── dataforseo/            # DataForSEO client, recovery manifests, and pipelines
 │   ├── db.py                 # SQLAlchemy engine, models, and API schemas
 │   ├── prompts.py            # Workflow prompts per execution type
 │   ├── feedback_loop.py      # Change-log/learnings persistence
@@ -258,7 +247,7 @@ python -m pytest tests/ -v
 python -m pytest tests/test_seo_agent.py -v
 ```
 
-API tests use an in-memory SQLite database automatically — no production DB is touched.
+API tests use an in-memory SQLite database. They don't write to the production database.
 
 ## Kanban API Endpoints
 
@@ -271,6 +260,7 @@ API tests use an in-memory SQLite database automatically — no production DB is
 | `PATCH` | `/tasks/{id}` | Update task |
 | `DELETE` | `/tasks/{id}` | Delete task |
 | `POST` | `/tasks/{id}/execute` | Execute task via agent |
+| `GET` | `/runs/{run_id}/events` | Paginated run and tool trace events |
 | `GET` | `/tasks/{id}/comments` | List comments |
 | `POST` | `/tasks/{id}/comments` | Add comment |
 | `POST` | `/automation/comments/process-one` | Manually trigger one autopilot cycle |
@@ -278,7 +268,7 @@ API tests use an in-memory SQLite database automatically — no production DB is
 
 ## Troubleshooting
 
-**Claude CLI not found** — install Claude Code and run `claude` once to complete OAuth:
+**Claude CLI not found.** Install Claude Code and run `claude` once to complete OAuth:
 ```bash
 npm install -g @anthropic-ai/claude-code
 claude
@@ -286,39 +276,45 @@ claude
 
 If Claude is installed in a non-standard location, set `CLAUDE_CLI_PATH` in your `.env`.
 
-**Google credentials** — place your service account JSON in `google-sa-credentials/` (gitignored). The same file works for Google Docs and Search Console. Never commit credential files.
+**Google credentials.** Place the service account JSON in `google-sa-credentials/` (gitignored). The same file works for Google Docs and Search Console. Never commit credential files.
 
-**Google Search Console access** — after adding `GSC_SITE_URL`, grant your service account read access to the property in Search Console → Settings → Users and permissions. The SA email is inside the JSON file under `"client_email"`.
+**Google Search Console access.** After adding `GSC_SITE_URL`, grant the service account read access to the property. Its email is in the JSON file under `"client_email"`.
 
-**Webflow rate limits** — the Webflow API has rate limits. Space out bulk operations or use the `webflow_publish` profile for publish-only runs.
+**Webflow rate limits.** Space out bulk operations or use the `webflow_publish` profile for publish-only runs.
 
-## Known Limitations (Production Scaling)
+## Known limitations
 
-This is a single-user tool. I made deliberate calls to keep it simple — none of these are oversights, and none require a rewrite to fix. Here's what I skipped and why.
+### Campaign execution is inline
 
-**1. Campaigns run inside the HTTP request, not a background worker.**
-The whole orchestration runs inline — if a 4-phase campaign takes 10 minutes, the request is open for 10 minutes. Fine for one user. If you're scaling this up, the fix is a task queue (Celery or arq) and a `202 Accepted` response that the client polls. I actually designed `OrchestrationStateModel` with exactly this in mind — it tracks state phase by phase, so a queue worker can pick up where it left off if it crashes.
+Campaigns run inside the HTTP request. A four phase campaign can keep the request open for several minutes. For more users, move orchestration to a task queue such as Celery or arq and return `202 Accepted`. `OrchestrationStateModel` already stores phase state for this change.
 
-**2. SQLite doesn't handle concurrent writes.**
-Two workers writing at the same time will fight. I used SQLite because there are no ops concerns — nothing to provision, nothing to back up. To go multi-worker, just set `DATABASE_URL` to a Postgres connection string. The schema doesn't change at all.
+### SQLite limits write concurrency
 
-**3. "Parallel" phases aren't truly parallel — they're concurrent.**
-`asyncio.gather` runs them on the same thread, and SQLite only allows one writer at a time anyway. But the actual bottleneck is the Claude API call, which takes seconds to minutes. The DB write takes microseconds. So the parallelism still delivers real time savings. With Postgres and async SQLAlchemy each phase gets its own connection and you get the full benefit.
+SQLite supports the current single process setup. Multiple workers can contend for writes. Set `DATABASE_URL` to a PostgreSQL connection string when moving to multiple workers. The schema stays the same.
 
-**4. If an agent skips the summary block, the next agent gets raw truncated output.**
-Phases with downstream dependents must end with a `## Summary for Next Phase` block. If it's missing, the orchestrator retries once with a correction prompt asking for the block (only for phases that have dependents, so final phases cost nothing extra). If it's still missing, the campaign continues with the 1500-char truncation fallback, but records `handoff_degraded` in the orchestration state and posts a warning comment on the task — the pipeline now knows the handoff was degraded.
+### Phase concurrency uses one process
 
-**5. Unknown SDK result types get logged but not alerted.**
-If the SDK ships a new event type we don't handle, we log a warning and wrap it gracefully — nothing crashes. But in production that warning would be invisible. Wire the logger to Sentry or Datadog if you care about SDK contract changes.
+`asyncio.gather` overlaps Claude calls on one thread. SQLite still serializes writes. The API calls are the slow part, so this is enough for the current setup.
 
-**6. Tool scopes are enforced by convention, not by code.**
-Each agent profile explicitly lists what tools it can use. But there's no startup check that prevents someone from accidentally giving a read-only agent write access. Tests catch it, code review should catch it. For production, add an assertion at boot that validates profiles against their declared tiers.
+### Handoffs have a fallback
 
-**7. Retry has no circuit breaker.**
-If Claude's API goes down completely, each phase retries independently — you get 3 attempts per phase but no shared "stop trying" signal across phases. For one campaign at a time this is fine. At scale you'd want a circuit breaker so once you've confirmed the API is down, everything fails fast instead of hammering it.
+Phases with dependents should end with a `## Summary for Next Phase` block. The orchestrator retries once when it is missing. If it is still missing, it passes a 1500 character fallback, records `handoff_degraded`, and adds a warning comment.
 
-**8. The feedback loop JSON files aren't safe under concurrent writes.**
-`seo-changes.json` is written atomically using `os.replace()`, which is safe for one writer. Two workers writing simultaneously could corrupt it. Single worker, so not a problem here. The comment in the source marks exactly where you'd add `fcntl.flock()` — or just move the state into the database.
+### Unknown SDK events are logged
+
+Unknown SDK result types are wrapped and logged as warnings. They aren't sent to an alerting system.
+
+### Tool scope checks are not enforced at startup
+
+Each profile lists its allowed tools, and tests check the profiles. There is no startup assertion that blocks a read only profile from being given write access.
+
+### Retries have no shared circuit breaker
+
+Each phase retries its own transient failures. There is no shared stop signal when the Claude API is down.
+
+### Feedback loop files support one writer
+
+`seo-changes.json` uses `os.replace()`, which is safe for one writer. Multiple workers need file locking or database storage.
 
 ## License
 

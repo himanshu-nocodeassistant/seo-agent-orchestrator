@@ -231,14 +231,14 @@ class TestValidatorFailureStopsPipeline:
             db.refresh(orch_run)
             db.refresh(parent_task)
 
-            # Campaign must be stopped — not completed
-            assert orch_run.status in ("failed", "blocked")
+            # A draft-writer validation failure is an uncertain write.
+            assert orch_run.status == "review_required"
             assert parent_task.status == "blocked"
 
             state = db.query(main_module.OrchestrationStateModel).filter(
                 main_module.OrchestrationStateModel.orchestrator_run_id == orch_run.run_id
             ).first()
-            assert state.status == "error"
+            assert state.status == "review_required"
         finally:
             db.close()
 

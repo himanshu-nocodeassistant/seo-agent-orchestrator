@@ -4,6 +4,8 @@ import random
 import sys
 import threading
 import time
+from datetime import datetime, timezone
+from uuid import uuid4
 from dotenv import load_dotenv
 import requests
 
@@ -24,6 +26,10 @@ TASK_NOT_READY_STATUSES = (40601, 40602)
 RETRYABLE_HTTP_STATUSES = (429, 502, 503, 504)
 MAX_RETRIES = 5
 RETRY_BACKOFF_BASE = 2.0
+MAX_RETRY_DELAY = 30.0
+MAX_POLL_SECONDS = 30 * 60
+DEFAULT_CONNECT_TIMEOUT = 10.0
+DEFAULT_READ_TIMEOUT = 60.0
 
 
 def _jittered_backoff(attempt: int) -> float:
@@ -81,6 +87,24 @@ class TaskNotReadyError(DataForSEOError):
     pass
 
 
+class DataForSEORecoveryError(DataForSEOError):
+    """A submitted task needs recovery from its preserved manifest."""
+
+    def __init__(
+        self,
+        task_ids: list[str],
+        manifest_path: str | None,
+        message: str,
+        results: list[dict] | None = None,
+        errors: list[dict] | None = None,
+    ):
+        self.task_ids = list(task_ids)
+        self.manifest_path = manifest_path
+        self.results = list(results or [])
+        self.errors = list(errors or [])
+        super().__init__(0, message)
+
+
 class DataForSEOClient:
     def __init__(self, login: str = None, password: str = None):
         self.login = login or os.environ["DATAFORSEO_LOGIN"]
@@ -92,6 +116,7 @@ class DataForSEOClient:
         # response's own `cost` field (not an estimate). Per-instance, not
         # global, so concurrent pipelines don't cross-contaminate totals.
         self.total_cost: float = 0.0
+        self._last_manifest_path: str | None = None
 
     def _accumulate_cost(self, data: dict) -> None:
         cost = data.get("cost")
@@ -105,7 +130,9 @@ class DataForSEOClient:
         Anything else (auth errors, 4xx other than 429, etc.) raises immediately.
         """
         last_exc = None
-        for attempt in range(MAX_RETRIES):
+        kwargs.setdefault("timeout", self._request_timeout())
+        max_attempts = 1 if method.upper() == "POST" else MAX_RETRIES
+        for attempt in range(max_attempts):
             try:
                 response = self.session.request(method, url, **kwargs)
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
@@ -119,23 +146,43 @@ class DataForSEOClient:
                 )
 
                 retry_after = response.headers.get("Retry-After")
-                if retry_after and attempt < MAX_RETRIES - 1:
+                if retry_after and attempt < max_attempts - 1:
                     try:
-                        delay = float(retry_after)
+                        delay = min(max(float(retry_after), 0.0), MAX_RETRY_DELAY)
                     except (ValueError, TypeError):
                         delay = _jittered_backoff(attempt)
                     time.sleep(delay)
                     continue
 
-            if attempt < MAX_RETRIES - 1:
+            if attempt < max_attempts - 1:
                 time.sleep(_jittered_backoff(attempt))
 
         raise last_exc
 
     def _post(self, endpoint: str, payload: list) -> dict:
         url = f"{BASE_URL}/{endpoint.lstrip('/')}"
-        response = self._request_with_retry("POST", url, json=payload)
-        data = response.json()
+        try:
+            response = self._request_with_retry("POST", url, json=payload)
+        except Exception as exc:
+            self._raise_unknown_post_outcome(endpoint, payload, exc)
+        try:
+            data = response.json()
+        except Exception as exc:
+            self._raise_unknown_post_outcome(endpoint, payload, exc)
+        if not isinstance(data, dict):
+            self._raise_unknown_post_outcome(
+                endpoint,
+                payload,
+                TypeError("DataForSEO POST response was not a JSON object"),
+            )
+        if "/live/" in endpoint and (
+            not isinstance(data.get("tasks"), list) or not data.get("tasks")
+        ):
+            self._raise_unknown_post_outcome(
+                endpoint,
+                payload,
+                ValueError("DataForSEO live POST response contained no task data"),
+            )
         # Accumulate before _check_status can raise — a rejected/errored
         # call can still report nonzero cost, and that spend is real
         # regardless of whether we go on to raise for it.
@@ -143,6 +190,26 @@ class DataForSEOClient:
         self._check_status(data)
         self._safe_log(endpoint, payload, data)
         return data
+
+    def _raise_unknown_post_outcome(self, endpoint: str, payload: list, exc: Exception):
+        """Preserve a paid POST whose server-side outcome cannot be known."""
+        manifest_path = self._write_manifest(endpoint, [], [])
+        self._last_manifest_path = manifest_path
+        error = {
+            "task_id": None,
+            "status": "unknown",
+            "error": str(exc),
+            "request": payload,
+        }
+        self._update_manifest_submission_errors(
+            manifest_path, [error], unknown_requests=payload
+        )
+        raise DataForSEORecoveryError(
+            [],
+            manifest_path,
+            "Paid task submission outcome is unknown; do not retry automatically.",
+            errors=[error],
+        ) from exc
 
     def _get(self, endpoint: str) -> dict:
         url = f"{BASE_URL}/{endpoint.lstrip('/')}"
@@ -184,32 +251,216 @@ class DataForSEOClient:
         )
         task_ids = []
         request_payloads = []
+        manifest_path = None
         for start in range(0, len(payload), batch_size):
             chunk = payload[start:start + batch_size]
             _get_task_bucket().consume(len(chunk))
-            data = self._post(endpoint, chunk)
-            for task, req in zip(data.get("tasks", []), chunk):
+            try:
+                data = self._post(endpoint, chunk)
+            except DataForSEORecoveryError as exc:
+                # _post() creates a recovery manifest for an uncertain POST.
+                # If earlier chunks already created paid tasks, merge those IDs
+                # into the same manifest before surfacing the error. Otherwise
+                # recovery tooling would see only the uncertain chunk and a
+                # retry could duplicate the earlier paid work.
+                if exc.manifest_path and (task_ids or request_payloads):
+                    try:
+                        with open(exc.manifest_path) as manifest_file:
+                            uncertain_manifest = json.load(manifest_file)
+                        prior_ids = list(task_ids)
+                        prior_payloads = list(request_payloads)
+                        merged_ids = prior_ids + [
+                            task_id for task_id in exc.task_ids
+                            if task_id not in prior_ids
+                        ]
+                        merged_payloads = prior_payloads
+                        self._write_manifest(
+                            endpoint,
+                            merged_payloads,
+                            prior_ids,
+                            manifest_path=exc.manifest_path,
+                        )
+                        self._update_manifest_submission_errors(
+                            exc.manifest_path,
+                            uncertain_manifest.get("submission_errors") or exc.errors,
+                            unknown_requests=uncertain_manifest.get("unknown_requests"),
+                        )
+                        exc.task_ids = merged_ids
+                        exc.manifest_path = self._last_manifest_path = exc.manifest_path
+                    except Exception as merge_error:
+                        # The original typed error is still safer than a blind
+                        # retry. Preserve its manifest and make the merge
+                        # failure visible to recovery tooling.
+                        exc.errors.append({
+                            "task_id": None,
+                            "status": "manifest_merge_failed",
+                            "error": str(merge_error),
+                        })
+                raise
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+                manifest_path = self._write_manifest(
+                    endpoint,
+                    request_payloads,
+                    task_ids,
+                    manifest_path=manifest_path,
+                )
+                self._last_manifest_path = manifest_path
+                error = {
+                    "task_id": None,
+                    "status": "unknown",
+                    "error": str(exc),
+                    "request": chunk,
+                }
+                self._update_manifest_submission_errors(
+                    manifest_path, [error], unknown_requests=chunk
+                )
+                raise DataForSEORecoveryError(
+                    task_ids,
+                    manifest_path,
+                    "Task submission outcome is unknown; do not retry the paid POST automatically.",
+                    errors=[error],
+                ) from exc
+            except Exception as exc:
+                manifest_path = self._write_manifest(
+                    endpoint,
+                    request_payloads,
+                    task_ids,
+                    manifest_path=manifest_path,
+                )
+                self._last_manifest_path = manifest_path
+                error = {
+                    "task_id": None,
+                    "status": "unknown",
+                    "error": str(exc),
+                    "request": chunk,
+                }
+                self._update_manifest_submission_errors(
+                    manifest_path, [error], unknown_requests=chunk
+                )
+                raise DataForSEORecoveryError(
+                    task_ids,
+                    manifest_path,
+                    "Task submission outcome is unknown; do not retry the paid POST automatically.",
+                    errors=[error],
+                ) from exc
+            tasks = data.get("tasks")
+            if not isinstance(tasks, list) or not tasks:
+                manifest_path = self._write_manifest(
+                    endpoint,
+                    request_payloads,
+                    task_ids,
+                    manifest_path=manifest_path,
+                )
+                self._last_manifest_path = manifest_path
+                errors = [{
+                    "task_id": None,
+                    "error": "Task submission response contained no task data.",
+                    "request": chunk,
+                }]
+                self._update_manifest_submission_errors(
+                    manifest_path, errors, unsubmitted_requests=chunk
+                )
+                raise DataForSEORecoveryError(
+                    task_ids,
+                    manifest_path,
+                    "Task submission returned no task data; do not retry automatically.",
+                    errors=errors,
+                )
+            for task, req in zip(tasks, chunk):
                 task_status = task.get("status_code")
                 if task_status == TASK_CREATED_STATUS:
-                    task_ids.append(task["id"])
+                    task_id = task.get("id")
+                    if not task_id:
+                        manifest_path = self._write_manifest(
+                            endpoint,
+                            request_payloads,
+                            task_ids,
+                            manifest_path=manifest_path,
+                        )
+                        self._last_manifest_path = manifest_path
+                        error = {
+                            "task_id": None,
+                            "error": "Created task response did not include a task ID.",
+                            "request": req,
+                        }
+                        self._update_manifest_submission_errors(manifest_path, [error])
+                        raise DataForSEORecoveryError(
+                            task_ids,
+                            manifest_path,
+                            "Task submission returned an incomplete task record; do not retry automatically.",
+                            errors=[error],
+                        )
+                    task_ids.append(task_id)
                     request_payloads.append(req)
                 else:
-                    raise DataForSEOError(
-                        task_status,
-                        task.get("status_message", "Task creation failed"),
+                    manifest_path = self._write_manifest(
+                        endpoint,
+                        request_payloads,
+                        task_ids,
+                        manifest_path=manifest_path,
                     )
-        self._write_manifest(endpoint, request_payloads, task_ids)
+                    self._last_manifest_path = manifest_path
+                    error = {
+                        "task_id": task.get("id"),
+                        "status_code": task_status,
+                        "error": task.get("status_message", "Task creation failed"),
+                        "request": req,
+                    }
+                    self._update_manifest_submission_errors(manifest_path, [error])
+                    raise DataForSEORecoveryError(
+                        task_ids,
+                        manifest_path,
+                        "Task submission partially failed; do not retry automatically.",
+                        errors=[error],
+                    )
+            if len(tasks) != len(chunk):
+                manifest_path = self._write_manifest(
+                    endpoint,
+                    request_payloads,
+                    task_ids,
+                    manifest_path=manifest_path,
+                )
+                self._last_manifest_path = manifest_path
+                error = {
+                    "task_id": None,
+                    "error": "Task submission response omitted one or more task records.",
+                    "request": chunk[len(tasks):],
+                }
+                self._update_manifest_submission_errors(
+                    manifest_path, [error], unsubmitted_requests=chunk[len(tasks):]
+                )
+                raise DataForSEORecoveryError(
+                    task_ids,
+                    manifest_path,
+                    "Task submission returned incomplete task data; do not retry automatically.",
+                    errors=[error],
+                )
+            manifest_path = self._write_manifest(
+                endpoint,
+                request_payloads,
+                task_ids,
+                manifest_path=manifest_path,
+            )
+            self._last_manifest_path = manifest_path
+        self._last_manifest_path = manifest_path
         return task_ids
 
     @staticmethod
-    def _write_manifest(endpoint: str, payload: list, task_ids: list[str]) -> str:
+    def _write_manifest(
+        endpoint: str,
+        payload: list,
+        task_ids: list[str],
+        manifest_path: str | None = None,
+    ) -> str:
         """Persist {task_id: request_task} to logs/task_manifests/ so a crash
         during polling can resume from disk instead of losing the IDs."""
         os.makedirs(MANIFEST_DIR, exist_ok=True)
-        # Microsecond timestamp so concurrent pipeline runs never collide.
-        timestamp = time.strftime("%Y%m%d-%H%M%S-%f")
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
         safe_endpoint = endpoint.strip("/").replace("/", "_")
-        manifest_path = os.path.join(MANIFEST_DIR, f"{timestamp}_{safe_endpoint}.json")
+        manifest_path = manifest_path or os.path.join(
+            MANIFEST_DIR,
+            f"{timestamp}_{uuid4().hex[:12]}_{safe_endpoint}.json",
+        )
         manifest = {
             "endpoint": endpoint,
             "created_at": timestamp,
@@ -224,10 +475,94 @@ class DataForSEOClient:
         os.replace(tmp_path, manifest_path)
         return manifest_path
 
+    @staticmethod
+    def _request_timeout() -> tuple[float, float]:
+        def read_timeout(name: str, default: float) -> float:
+            try:
+                return max(float(os.environ.get(name, default)), 0.1)
+            except (TypeError, ValueError):
+                return default
+
+        return (
+            read_timeout("DATAFORSEO_CONNECT_TIMEOUT_SECONDS", DEFAULT_CONNECT_TIMEOUT),
+            read_timeout("DATAFORSEO_READ_TIMEOUT_SECONDS", DEFAULT_READ_TIMEOUT),
+        )
+
+    @staticmethod
+    def _update_manifest_results(manifest_path: str | None, results: list[dict]) -> None:
+        """Persist ready results beside submitted IDs for recovery tooling."""
+        if not manifest_path or not os.path.exists(manifest_path):
+            return
+        try:
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+            manifest["completed_results"] = results
+            tmp_path = manifest_path + ".tmp"
+            with open(tmp_path, "w") as f:
+                json.dump(manifest, f, indent=2)
+            os.replace(tmp_path, manifest_path)
+        except Exception as exc:
+            print(
+                f"WARNING: failed to update recovery manifest {manifest_path}: {exc}",
+                file=sys.stderr,
+            )
+
+    @staticmethod
+    def _update_manifest_recovery(
+        manifest_path: str | None, errors: list[dict]
+    ) -> None:
+        """Persist permanent polling errors beside completed results."""
+        if not manifest_path or not os.path.exists(manifest_path):
+            return
+        try:
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+            manifest["recovery_errors"] = errors
+            tmp_path = manifest_path + ".tmp"
+            with open(tmp_path, "w") as f:
+                json.dump(manifest, f, indent=2)
+            os.replace(tmp_path, manifest_path)
+        except Exception as exc:
+            print(
+                f"WARNING: failed to update recovery manifest {manifest_path}: {exc}",
+                file=sys.stderr,
+            )
+
+    @staticmethod
+    def _update_manifest_submission_errors(
+        manifest_path: str | None,
+        errors: list[dict],
+        unsubmitted_requests: list[dict] | None = None,
+        unknown_requests: list[dict] | None = None,
+    ) -> None:
+        """Persist submission uncertainty without making a retry look safe."""
+        if not manifest_path or not os.path.exists(manifest_path):
+            return
+        try:
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+            manifest["submission_errors"] = errors
+            if unsubmitted_requests:
+                manifest["unsubmitted_requests"] = unsubmitted_requests
+            if unknown_requests:
+                manifest["unknown_requests"] = unknown_requests
+            tmp_path = manifest_path + ".tmp"
+            with open(tmp_path, "w") as f:
+                json.dump(manifest, f, indent=2)
+            os.replace(tmp_path, manifest_path)
+        except Exception as exc:
+            print(
+                f"WARNING: failed to update submission recovery manifest {manifest_path}: {exc}",
+                file=sys.stderr,
+            )
+
     def _task_get(self, endpoint: str, task_id: str) -> dict:
         """Retrieve results for a single completed task."""
         data = self._get(f"{endpoint}/{task_id}")
-        for task in data.get("tasks", []):
+        tasks = data.get("tasks")
+        if not isinstance(tasks, list) or not tasks:
+            raise DataForSEOError(0, "Task response contained no task data")
+        for task in tasks:
             task_status = task.get("status_code")
             if task_status in TASK_NOT_READY_STATUSES:
                 raise TaskNotReadyError(task_status, "Task still in queue")
@@ -258,20 +593,23 @@ class DataForSEOClient:
         Returns:
             Combined list of result dicts from all tasks.
 
-        A task that isn't ready by max_wait is skipped (not raised) so one
-        straggler can't discard results already collected for the rest of
-        the batch. Skipped task IDs are still in the manifest written by
-        _task_post, so they can be recovered later without re-billing.
+        A task that isn't ready by max_wait is skipped (not raised), and a
+        permanent task error is recorded, so neither can discard results
+        already collected for the rest of the batch. Skipped task IDs and
+        polling errors are preserved in the manifest for recovery.
         """
         task_ids = self._task_post(post_endpoint, payload)
+        manifest_path = getattr(self, "_last_manifest_path", None)
 
         all_results = []
         skipped = []
+        recovery_errors = []
         pending = list(task_ids)
         # Global deadline across all tasks: one round polls every still-pending
         # task, so a batch of N tasks takes O(max_wait) worst case instead of
         # O(N × max_wait).
-        deadline = time.monotonic() + max_wait
+        effective_max_wait = min(max_wait, MAX_POLL_SECONDS)
+        deadline = time.monotonic() + effective_max_wait
         while pending:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -286,17 +624,52 @@ class DataForSEOClient:
                     if tasks:
                         result = tasks[0].get("result") or []
                         all_results.extend(result)
+                        self._update_manifest_results(manifest_path, all_results)
                         # Remove earlier not-ready snapshots for this keyword/location;
                         # they have no value once the final result is on disk.
                         purge_stale_poll_logs(tasks[0])
                 except TaskNotReadyError:
                     still_pending.append(task_id)
+                except (
+                    DataForSEOError,
+                    ValueError,
+                    TypeError,
+                    requests.exceptions.RequestException,
+                ) as exc:
+                    error = {
+                        "task_id": task_id,
+                        "status_code": getattr(exc, "status_code", None),
+                        "error": str(exc),
+                    }
+                    recovery_errors.append(error)
+                    self._update_manifest_recovery(manifest_path, recovery_errors)
             pending = still_pending
 
-        if skipped:
-            print(
-                f"Warning: {len(skipped)} task(s) not ready after {max_wait}s, "
-                f"skipped (recoverable from manifest, not re-billed): {skipped}"
+        if skipped or recovery_errors:
+            if skipped:
+                print(
+                    f"Warning: {len(skipped)} task(s) not ready after {effective_max_wait}s, "
+                    f"recoverable from manifest {manifest_path}: {skipped}"
+                )
+            if recovery_errors:
+                print(
+                    f"Warning: {len(recovery_errors)} task(s) failed during polling; "
+                    f"details saved in manifest {manifest_path}"
+                )
+            recoverable_set = set(skipped)
+            recoverable_set.update(
+                error["task_id"] for error in recovery_errors if error.get("task_id")
+            )
+            recoverable_task_ids = [
+                task_id for task_id in task_ids if task_id in recoverable_set
+            ]
+            raise DataForSEORecoveryError(
+                recoverable_task_ids,
+                manifest_path,
+                f"Polling produced partial results; recover task IDs from "
+                f"{manifest_path or 'the DataForSEO manifest'}.",
+                results=all_results,
+                errors=recovery_errors,
             )
 
         return all_results

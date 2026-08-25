@@ -466,8 +466,8 @@ class TestFullOrchestration:
             db.refresh(orch_run)
             db.refresh(parent_task)
 
-            # Orchestrator run should be failed/blocked
-            assert orch_run.status in ("failed", "blocked")
+            # A draft-writer failure is an uncertain write and needs review.
+            assert orch_run.status == "review_required"
 
             # Parent task should be blocked
             assert parent_task.status == "blocked"
@@ -477,7 +477,7 @@ class TestFullOrchestration:
                 main_module.OrchestrationStateModel.orchestrator_run_id == orch_run.run_id
             ).first()
             assert state is not None
-            assert state.status == "error"
+            assert state.status == "review_required"
 
             # Only researcher output should have been captured
             phase_outputs = json.loads(state.phase_outputs_json)
