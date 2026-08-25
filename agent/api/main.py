@@ -54,7 +54,7 @@ EXECUTABLE_TYPES = {
     # agents — blast radius grows with each new profile. If a new child type
     # needs Webflow, add it to runtime_profiles.py with explicit WEBFLOW_TOOLS,
     # not by expanding EXECUTABLE_TYPES here.
-    "campaign_researcher", "campaign_content_writer", "campaign_publisher",
+    "campaign_researcher", "campaign_draft_writer", "campaign_publisher",
     "campaign_analyst",
 }
 

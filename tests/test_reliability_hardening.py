@@ -41,6 +41,9 @@ from agent.dataforseo.client import (
     DataForSEORecoveryError,
     TaskNotReadyError,
 )
+from agent.dataforseo.serp.google_organic import GoogleOrganicSERP
+from agent.prompts import build_execution_prompt
+from agent.runtime_profiles import PROFILE_REGISTRY
 from agent.runtime_profiles import ValidationResult
 import agent.orchestrator as orchestrator_module
 from agent.orchestrator import _run_with_retry
@@ -1635,7 +1638,7 @@ def test_uncertain_dataforseo_post_is_not_retried_and_is_manifested(tmp_path, mo
 
     assert request.call_count == 1
     assert exc_info.value.task_ids == []
-    manifest = json.loads((tmp_path / next(p.name for p in tmp_path.glob("*.json"))).read_text())
+    manifest = json.loads(exc_info.value.manifest_path and open(exc_info.value.manifest_path).read())
     assert manifest["unknown_requests"] == payload
     assert manifest["submission_errors"][0]["status"] == "unknown"
 
@@ -1759,6 +1762,163 @@ async def test_normal_worker_stops_when_run_ownership_is_lost(client):
 
     assert started.is_set()
     assert cancelled.is_set()
+
+
+def test_campaign_retry_blocks_uncertain_draft_writer(client):
+    """A draft writer may edit files, so an uncertain result must not replay."""
+    db = get_db_session()
+    try:
+        task, parent_run = _campaign_task(db)
+        state = db.query(OrchestrationStateModel).filter_by(
+            orchestrator_run_id=parent_run.run_id
+        ).one()
+        state.status = "error"
+        state.plan_json = "```json\n" + json.dumps({"phases": [
+            {"phase": "content_writer", "execution_type": "campaign_draft_writer", "depends_on": []}
+        ]}) + "\n```"
+        parent_run.status = "failed"
+        task.status = "blocked"
+        task.active_run_id = None
+        child = TaskModel(
+            title="Campaign: content_writer", execution_type="campaign_draft_writer",
+            parent_task_id=task.id, status="blocked",
+            created_at=_utcnow_iso(), updated_at=_utcnow_iso(),
+        )
+        db.add(child)
+        db.commit()
+        db.refresh(child)
+        db.add(AgentRunModel(
+            run_id="uncertain-draft-writer", task_id=child.id,
+            parent_run_id=parent_run.run_id, status="review_required",
+            recovery_state="review_required", execution_type="campaign_draft_writer",
+            write_capable=True, error="write result uncertain", started_at=_utcnow_iso(),
+        ))
+        db.commit()
+        task_id = task.id
+    finally:
+        db.close()
+
+    with patch("agent.api.routers.tasks._execute_campaign_with_timeout", new=AsyncMock()) as execute:
+        response = client.post(f"/tasks/{task_id}/execute")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "review_required"
+    execute.assert_not_awaited()
+
+
+def test_post_finalize_side_effect_fence_rejects_newer_run(client):
+    """A newer claim must fence comments, logs, and context writes from an old worker."""
+    from agent.api.helpers import _run_post_finalize_side_effects
+
+    db = get_db_session()
+    try:
+        task_data = client.post(
+            "/tasks", json={"title": "Post-finalization fence", "execution_type": "research"}
+        ).json()
+        task = db.query(TaskModel).filter_by(id=task_data["id"]).one()
+        old_run = _create_run(db, task, "manual_execute", "research")
+        task.active_run_id = None
+        db.commit()
+        new_run = _create_run(db, task, "manual_execute", "research")
+        called = []
+
+        assert _run_post_finalize_side_effects(
+            db, task.id, old_run.run_id, lambda: called.append("stale side effect")
+        ) is False
+
+        db.refresh(task)
+        assert called == []
+        assert task.active_run_id == new_run.run_id
+        assert task.last_run_id == new_run.run_id
+    finally:
+        db.close()
+
+
+def test_retry_review_blocker_does_not_clear_newer_active_run(client):
+    """Blocking an old retry must use the current active-run pointer as a fence."""
+    from agent.api.helpers import _mark_campaign_retry_review_required
+
+    db = get_db_session()
+    try:
+        task, old_run = _campaign_task(db)
+        state = db.query(OrchestrationStateModel).filter_by(
+            orchestrator_run_id=old_run.run_id
+        ).one()
+        old_run.status = "failed"
+        state.status = "error"
+        task.active_run_id = None
+        db.commit()
+        new_run = _create_run(db, task, "manual_execute", task.execution_type)
+
+        assert _mark_campaign_retry_review_required(
+            db, task, old_run, state, "unsafe retry"
+        ) is False
+
+        db.refresh(task)
+        db.refresh(old_run)
+        db.refresh(new_run)
+        assert task.active_run_id == new_run.run_id
+        assert old_run.status == "failed"
+        assert new_run.status == "queued"
+    finally:
+        db.close()
+
+
+def test_fresh_campaign_prompt_uses_registered_execution_types():
+    """Every execution_type emitted by a fresh campaign prompt must be registered."""
+    task = SimpleNamespace(
+        title="Fresh campaign",
+        description="Improve organic traffic",
+        execution_type="orchestrate_seo_campaign",
+    )
+    prompt = build_execution_prompt(task, comments=[])
+    emitted = {
+        name
+        for name in PROFILE_REGISTRY
+        if f'"execution_type": "{name}"' in prompt
+    }
+    assert emitted <= set(PROFILE_REGISTRY)
+    assert "campaign_content_writer" not in prompt
+    assert "campaign_draft_writer" in emitted
+
+
+@pytest.mark.parametrize("failure", [
+    requests.exceptions.ReadTimeout("response lost after acceptance"),
+    "server_error",
+    "malformed_response",
+])
+def test_live_dataforseo_post_failure_is_manifested_without_retry(
+    tmp_path, monkeypatch, failure
+):
+    """The live paid POST path must preserve an unknown outcome and never replay it."""
+    monkeypatch.setenv("DATAFORSEO_LOGIN", "login")
+    monkeypatch.setenv("DATAFORSEO_PASSWORD", "password")
+    monkeypatch.setattr("agent.dataforseo.client.MANIFEST_DIR", str(tmp_path))
+    client = GoogleOrganicSERP()
+    payload = [{"keyword": "uncertain live request"}]
+
+    if failure == "server_error":
+        response = requests.Response()
+        response.status_code = 503
+        response.reason = "upstream unavailable"
+        side_effect = [response]
+    elif failure == "malformed_response":
+        response = requests.Response()
+        response.status_code = 200
+        response.json = lambda: (_ for _ in ()).throw(ValueError("invalid JSON"))
+        side_effect = [response]
+    else:
+        side_effect = [failure]
+
+    with patch.object(client.session, "request", side_effect=side_effect) as request:
+        with pytest.raises(DataForSEORecoveryError) as exc_info:
+            client.live_advanced(payload)
+
+    assert request.call_count == 1
+    assert exc_info.value.task_ids == []
+    manifest = json.loads(next(tmp_path.glob("*.json")).read_text())
+    assert manifest["unknown_requests"] == payload
+    assert manifest["submission_errors"][0]["status"] == "unknown"
 
 
 @pytest.mark.asyncio
@@ -2044,3 +2204,57 @@ async def test_write_agent_stops_when_heartbeat_database_fails(client):
 
     assert started.is_set()
     assert cancelled.is_set()
+
+
+def test_partial_real_dataforseo_post_failure_keeps_paid_ids_and_unknown_batch(
+    tmp_path, monkeypatch
+):
+    """A later uncertain POST must preserve earlier paid tasks in one manifest."""
+    monkeypatch.setenv("DATAFORSEO_LOGIN", "login")
+    monkeypatch.setenv("DATAFORSEO_PASSWORD", "password")
+    monkeypatch.setenv("DATAFORSEO_MAX_TASKS_PER_REQUEST", "1")
+    monkeypatch.setattr("agent.dataforseo.client.MANIFEST_DIR", str(tmp_path))
+    client = DataForSEOClient()
+    first = SimpleNamespace(status_code=200, reason="OK")
+    first.raise_for_status = lambda: None
+    first.json = lambda: {
+        "status_code": 20000,
+        "tasks": [{"id": "paid-first", "status_code": 20100}],
+    }
+    with patch.object(
+        client.session,
+        "request",
+        side_effect=[first, requests.exceptions.ReadTimeout("response lost")],
+    ) as request:
+        with pytest.raises(DataForSEORecoveryError) as exc_info:
+            client._task_post(
+                "serp/google/organic/task_post",
+                [{"keyword": "first"}, {"keyword": "second"}],
+            )
+
+    assert request.call_count == 2
+    assert exc_info.value.task_ids == ["paid-first"]
+    manifest = json.loads(
+        exc_info.value.manifest_path and open(exc_info.value.manifest_path).read()
+    )
+    assert manifest["tasks"] == [{"task_id": "paid-first", "request": {"keyword": "first"}}]
+    assert manifest["unknown_requests"] == [{"keyword": "second"}]
+
+
+def test_live_dataforseo_empty_task_list_is_unknown_recovery(tmp_path, monkeypatch):
+    """A live paid POST with no task list is not a safe successful response."""
+    monkeypatch.setenv("DATAFORSEO_LOGIN", "login")
+    monkeypatch.setenv("DATAFORSEO_PASSWORD", "password")
+    monkeypatch.setattr("agent.dataforseo.client.MANIFEST_DIR", str(tmp_path))
+    client = GoogleOrganicSERP()
+    response = SimpleNamespace(status_code=200, reason="OK")
+    response.json = lambda: {"status_code": 20000, "tasks": []}
+
+    with patch.object(client.session, "request", return_value=response) as request:
+        with pytest.raises(DataForSEORecoveryError) as exc_info:
+            client.live_advanced([{"keyword": "empty-live-response"}])
+
+    assert request.call_count == 1
+    assert exc_info.value.manifest_path
+    manifest = json.loads((tmp_path / next(p.name for p in tmp_path.glob("*.json"))).read_text())
+    assert manifest["unknown_requests"] == [{"keyword": "empty-live-response"}]

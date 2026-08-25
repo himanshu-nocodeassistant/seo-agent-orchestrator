@@ -664,7 +664,7 @@ Then produce a JSON plan wrapped in ```json ... ``` with exactly this schema:
       "phase": "content_writer",
       "task_title": "Write: <specific content>",
       "task_description": "<one paragraph, actionable>",
-      "execution_type": "campaign_content_writer",
+      "execution_type": "campaign_draft_writer",
       "depends_on": ["researcher"]
     }},
     {{
@@ -699,4 +699,3 @@ Rules:
         if task.description:
             _prompt += f"\n\n{task.description}"
         return _append_user_notes(_prompt, comments)
-

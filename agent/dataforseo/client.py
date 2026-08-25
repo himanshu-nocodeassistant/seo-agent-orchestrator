@@ -161,8 +161,28 @@ class DataForSEOClient:
 
     def _post(self, endpoint: str, payload: list) -> dict:
         url = f"{BASE_URL}/{endpoint.lstrip('/')}"
-        response = self._request_with_retry("POST", url, json=payload)
-        data = response.json()
+        try:
+            response = self._request_with_retry("POST", url, json=payload)
+        except Exception as exc:
+            self._raise_unknown_post_outcome(endpoint, payload, exc)
+        try:
+            data = response.json()
+        except Exception as exc:
+            self._raise_unknown_post_outcome(endpoint, payload, exc)
+        if not isinstance(data, dict):
+            self._raise_unknown_post_outcome(
+                endpoint,
+                payload,
+                TypeError("DataForSEO POST response was not a JSON object"),
+            )
+        if "/live/" in endpoint and (
+            not isinstance(data.get("tasks"), list) or not data.get("tasks")
+        ):
+            self._raise_unknown_post_outcome(
+                endpoint,
+                payload,
+                ValueError("DataForSEO live POST response contained no task data"),
+            )
         # Accumulate before _check_status can raise — a rejected/errored
         # call can still report nonzero cost, and that spend is real
         # regardless of whether we go on to raise for it.
@@ -170,6 +190,26 @@ class DataForSEOClient:
         self._check_status(data)
         self._safe_log(endpoint, payload, data)
         return data
+
+    def _raise_unknown_post_outcome(self, endpoint: str, payload: list, exc: Exception):
+        """Preserve a paid POST whose server-side outcome cannot be known."""
+        manifest_path = self._write_manifest(endpoint, [], [])
+        self._last_manifest_path = manifest_path
+        error = {
+            "task_id": None,
+            "status": "unknown",
+            "error": str(exc),
+            "request": payload,
+        }
+        self._update_manifest_submission_errors(
+            manifest_path, [error], unknown_requests=payload
+        )
+        raise DataForSEORecoveryError(
+            [],
+            manifest_path,
+            "Paid task submission outcome is unknown; do not retry automatically.",
+            errors=[error],
+        ) from exc
 
     def _get(self, endpoint: str) -> dict:
         url = f"{BASE_URL}/{endpoint.lstrip('/')}"
@@ -217,6 +257,46 @@ class DataForSEOClient:
             _get_task_bucket().consume(len(chunk))
             try:
                 data = self._post(endpoint, chunk)
+            except DataForSEORecoveryError as exc:
+                # _post() creates a recovery manifest for an uncertain POST.
+                # If earlier chunks already created paid tasks, merge those IDs
+                # into the same manifest before surfacing the error. Otherwise
+                # recovery tooling would see only the uncertain chunk and a
+                # retry could duplicate the earlier paid work.
+                if exc.manifest_path and (task_ids or request_payloads):
+                    try:
+                        with open(exc.manifest_path) as manifest_file:
+                            uncertain_manifest = json.load(manifest_file)
+                        prior_ids = list(task_ids)
+                        prior_payloads = list(request_payloads)
+                        merged_ids = prior_ids + [
+                            task_id for task_id in exc.task_ids
+                            if task_id not in prior_ids
+                        ]
+                        merged_payloads = prior_payloads
+                        self._write_manifest(
+                            endpoint,
+                            merged_payloads,
+                            prior_ids,
+                            manifest_path=exc.manifest_path,
+                        )
+                        self._update_manifest_submission_errors(
+                            exc.manifest_path,
+                            uncertain_manifest.get("submission_errors") or exc.errors,
+                            unknown_requests=uncertain_manifest.get("unknown_requests"),
+                        )
+                        exc.task_ids = merged_ids
+                        exc.manifest_path = self._last_manifest_path = exc.manifest_path
+                    except Exception as merge_error:
+                        # The original typed error is still safer than a blind
+                        # retry. Preserve its manifest and make the merge
+                        # failure visible to recovery tooling.
+                        exc.errors.append({
+                            "task_id": None,
+                            "status": "manifest_merge_failed",
+                            "error": str(merge_error),
+                        })
+                raise
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
                 manifest_path = self._write_manifest(
                     endpoint,

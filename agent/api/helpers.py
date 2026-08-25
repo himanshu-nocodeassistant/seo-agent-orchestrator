@@ -66,7 +66,9 @@ _WRITE_CAPABLE_TOOLS = {
 class RunOwnershipLost(RuntimeError):
     """Raised when a worker loses its run or action lease."""
 
-def add_task_comment(db, task_id: int, body: str, author: str = "agent") -> CommentModel:
+def add_task_comment(
+    db, task_id: int, body: str, author: str = "agent", *, commit: bool = True
+) -> CommentModel:
     """
     Add a comment to a task and increment comment_count.
     
@@ -95,8 +97,9 @@ def add_task_comment(db, task_id: int, body: str, author: str = "agent") -> Comm
     # Increment comment count
     task.comment_count += 1
     
-    db.commit()
-    db.refresh(db_comment)
+    if commit:
+        db.commit()
+        db.refresh(db_comment)
     
     return db_comment
 
@@ -107,7 +110,9 @@ def add_task_started_comment(db, task_id: int, task_title: str) -> CommentModel:
     return add_task_comment(db, task_id, comment_body, "agent")
 
 
-def add_task_completed_comment(db, task_id: int, result_summary: str = None) -> CommentModel:
+def add_task_completed_comment(
+    db, task_id: int, result_summary: str = None, *, commit: bool = True
+) -> CommentModel:
     """Add a comment when task completes."""
     if result_summary:
         # Truncate result for comment
@@ -115,15 +120,17 @@ def add_task_completed_comment(db, task_id: int, result_summary: str = None) -> 
         comment_body = f"✅ Task completed\n\n{summary}"
     else:
         comment_body = "✅ Task completed"
-    return add_task_comment(db, task_id, comment_body, "agent")
+    return add_task_comment(db, task_id, comment_body, "agent", commit=commit)
 
 
-def add_task_failed_comment(db, task_id: int, error_message: str) -> CommentModel:
+def add_task_failed_comment(
+    db, task_id: int, error_message: str, *, commit: bool = True
+) -> CommentModel:
     """Add a comment when task fails."""
     # Truncate error message
     error = error_message[:300] + "..." if len(error_message) > 300 else error_message
     comment_body = f"❌ Task failed\n\nError: {error}"
-    return add_task_comment(db, task_id, comment_body, "agent")
+    return add_task_comment(db, task_id, comment_body, "agent", commit=commit)
 
 
 def add_google_doc_comment(db, task_id: int, doc_url: str) -> CommentModel:
@@ -423,6 +430,17 @@ def _get_task_session_id(db, task_id: Optional[int]) -> Optional[str]:
 
 
 def _upsert_task_session(db, task_id: int, session_id: str, run_id: str) -> None:
+    fenced = (
+        db.query(TaskModel)
+        .filter(TaskModel.id == task_id, TaskModel.last_run_id == run_id)
+        .update(
+            {TaskModel.updated_at: _utcnow_iso()},
+            synchronize_session=False,
+        )
+    )
+    if fenced != 1:
+        db.rollback()
+        return False
     record = db.query(TaskSessionModel).filter(TaskSessionModel.task_id == task_id).first()
     now = _utcnow_iso()
     if record is None:
@@ -438,6 +456,57 @@ def _upsert_task_session(db, task_id: int, session_id: str, run_id: str) -> None
         record.last_run_id = run_id
         record.updated_at = now
     db.commit()
+    return True
+
+
+def _run_post_finalize_side_effects(db, task_id: int, run_id: str, callback) -> bool:
+    """Run post-finalization effects while holding the run's DB ownership fence.
+
+    ``last_run_id`` remains the completed run until a newer run claims the task.
+    A conditional update takes the row lock, so a newer claim cannot interleave
+    between the ownership check and the callback's comments or file writes.
+    """
+    fenced = (
+        db.query(TaskModel)
+        .filter(TaskModel.id == task_id, TaskModel.last_run_id == run_id)
+        .update(
+            {TaskModel.updated_at: _utcnow_iso()},
+            synchronize_session=False,
+        )
+    )
+    if fenced != 1:
+        db.rollback()
+        return False
+    try:
+        callback()
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return True
+
+
+def _add_owned_task_comment(
+    db, task_id: int, run_id: str, body: str, author: str = "agent"
+) -> bool:
+    """Add a comment only while ``run_id`` owns the task.
+
+    The conditional task update and comment insert share one transaction. This
+    prevents a stale worker from passing a separate ownership read and then
+    writing a comment after a newer run claims the task.
+    """
+    now = _utcnow_iso()
+    owned = (
+        db.query(TaskModel)
+        .filter(TaskModel.id == task_id, TaskModel.active_run_id == run_id)
+        .update({TaskModel.updated_at: now}, synchronize_session=False)
+    )
+    if owned != 1:
+        db.rollback()
+        return False
+    add_task_comment(db, task_id, body, author, commit=False)
+    db.commit()
+    return True
 
 def _create_run(
     db,
@@ -595,16 +664,34 @@ def _claim_campaign_resume(
     }
     if request_id is not None:
         claim_values[AgentRunModel.request_id] = request_id
+    if task is not None:
+        task_claimed = (
+            db.query(TaskModel)
+            .filter(
+                TaskModel.id == task.id,
+                (TaskModel.active_run_id.is_(None) | (TaskModel.active_run_id == run_id)),
+            )
+            .update(
+                {
+                    TaskModel.active_run_id: run_id,
+                    TaskModel.last_run_id: run_id,
+                    TaskModel.status: "in_progress",
+                    TaskModel.updated_at: now,
+                },
+                synchronize_session=False,
+            )
+        )
+        if task_claimed != 1:
+            db.rollback()
+            return False
+
     claimed = (
         db.query(AgentRunModel)
         .filter(
             AgentRunModel.run_id == run_id,
             AgentRunModel.status.in_(allowed_statuses),
         )
-        .update(
-            claim_values,
-            synchronize_session=False,
-        )
+        .update(claim_values, synchronize_session=False)
     )
     if claimed != 1:
         db.rollback()
@@ -613,15 +700,6 @@ def _claim_campaign_resume(
     if run is None:
         db.rollback()
         return False
-    task = db.query(TaskModel).filter(TaskModel.id == run.task_id).first()
-    if task is not None:
-        if task.active_run_id not in (None, run.run_id):
-            db.rollback()
-            return False
-        task.active_run_id = run.run_id
-        task.last_run_id = run.run_id
-        task.status = "in_progress"
-        task.updated_at = now
     db.commit()
     run._resume_claimed = True
     _log_run_event(
@@ -848,13 +926,83 @@ def _task_has_review_gate(db, task) -> bool:
     )
 
 
+def _mark_campaign_retry_review_required(
+    db, task, run, state, error_message: str
+) -> bool:
+    """Block an unsafe retry only while the retry run still owns the pointer."""
+    now = _utcnow_iso()
+    run_updated = (
+        db.query(AgentRunModel)
+        .filter(
+            AgentRunModel.run_id == run.run_id,
+            AgentRunModel.status == "failed",
+        )
+        .update(
+            {
+                AgentRunModel.status: "review_required",
+                AgentRunModel.recovery_state: "review_required",
+                AgentRunModel.error: error_message,
+                AgentRunModel.finished_at: now,
+            },
+            synchronize_session=False,
+        )
+    )
+    if run_updated != 1:
+        db.rollback()
+        return False
+
+    task_updated = (
+        db.query(TaskModel)
+        .filter(
+            TaskModel.id == task.id,
+            (TaskModel.active_run_id.is_(None) | (TaskModel.active_run_id == run.run_id)),
+        )
+        .update(
+            {
+                TaskModel.status: "blocked",
+                TaskModel.notes: f"Error: {error_message}",
+                TaskModel.active_run_id: None,
+                TaskModel.last_run_id: run.run_id,
+                TaskModel.updated_at: now,
+            },
+            synchronize_session=False,
+        )
+    )
+    if task_updated != 1:
+        db.rollback()
+        return False
+
+    state_updated = (
+        db.query(OrchestrationStateModel)
+        .filter(OrchestrationStateModel.orchestrator_run_id == run.run_id)
+        .update(
+            {
+                OrchestrationStateModel.status: "review_required",
+                OrchestrationStateModel.error: error_message,
+                OrchestrationStateModel.updated_at: now,
+            },
+            synchronize_session=False,
+        )
+    )
+    if state_updated != 1:
+        db.rollback()
+        return False
+    db.commit()
+    db.refresh(run)
+    db.refresh(task)
+    db.refresh(state)
+    return True
+
+
 def _campaign_has_blocking_publisher_child(
     db, task, parent_run_id: Optional[str] = None
 ) -> bool:
     """Return True when a publisher child makes campaign retry unsafe."""
     children = db.query(TaskModel).filter(
         TaskModel.parent_task_id == task.id,
-        TaskModel.execution_type == "campaign_publisher",
+        TaskModel.execution_type.in_(
+            ["campaign_publisher", "campaign_draft_writer"]
+        ),
     ).all()
     child_ids = [child.id for child in children]
     if not child_ids:
@@ -890,8 +1038,22 @@ def _campaign_has_unrecorded_publisher_write(db, task, parent_run_id: str) -> bo
         return True
     children = db.query(TaskModel).filter(
         TaskModel.parent_task_id == task.id,
-        TaskModel.execution_type == "campaign_publisher",
+        TaskModel.execution_type.in_(
+            ["campaign_publisher", "campaign_draft_writer"]
+        ),
     ).all()
+    planned_phase_by_title = {}
+    try:
+        plan_text = (state.plan_json or "").strip()
+        if "```json" in plan_text:
+            plan_text = plan_text.split("```json", 1)[1].split("```", 1)[0].strip()
+        plan = json.loads(plan_text)
+        planned_phase_by_title = {
+            phase.get("task_title", f"Campaign: {phase['phase']}"): phase["phase"]
+            for phase in plan.get("phases", [])
+        }
+    except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+        return True
     for child in children:
         child_run = db.query(AgentRunModel).filter(
             AgentRunModel.parent_run_id == parent_run_id,
@@ -900,7 +1062,9 @@ def _campaign_has_unrecorded_publisher_write(db, task, parent_run_id: str) -> bo
         ).order_by(AgentRunModel.id.desc()).first()
         if child_run is None:
             continue
-        phase_name = child.title.removeprefix("Campaign: ").strip()
+        phase_name = planned_phase_by_title.get(child.title)
+        if phase_name is None:
+            phase_name = child.title.removeprefix("Campaign: ").strip()
         if phase_name not in phase_outputs or child_run.run_id not in child_run_ids:
             return True
     return False
@@ -924,7 +1088,10 @@ def recover_stale_runs(db, now: Optional[datetime] = None) -> list[AgentRunModel
                 AgentRunModel.status != "completed",
                 (
                     AgentRunModel.write_capable.is_(True)
-                    | AgentRunModel.execution_type.in_(["campaign_publisher"])
+                    | AgentRunModel.execution_type.in_([
+                        "campaign_publisher",
+                        "campaign_draft_writer",
+                    ])
                 ),
             ).first() is not None
         has_unrecorded_publisher_write = (
@@ -1157,7 +1324,9 @@ async def _run_agent_prompt(prompt: str, config: AgentConfig, prompt_context) ->
                     ) is False:
                         ownership_lost.set()
             except Exception:
-                if getattr(config, "_write_capable", False):
+                if getattr(config, "_heartbeat_db", None) is not None and getattr(
+                    config, "_heartbeat_run_id", None
+                ):
                     ownership_lost.set()
                 logger.exception("Could not refresh execution lease")
 
@@ -1463,7 +1632,20 @@ async def process_one_comment_action(request_id: Optional[str] = None) -> dict:
             task.status = "in_progress"
             task.updated_at = _utcnow_iso()
             db.commit()
-            add_task_comment(db, task.id, f"🤖 Started revision from comment #{comment.id}", "agent")
+            if not _add_owned_task_comment(
+                db,
+                task.id,
+                run.run_id,
+                f"🤖 Started revision from comment #{comment.id}",
+            ):
+                return {
+                    "processed": True,
+                    "task_id": task.id,
+                    "comment_id": comment.id,
+                    "status": "deferred",
+                    "attempts": action.attempts,
+                    "max_attempts": action.max_attempts,
+                }
             action.run_id = run.run_id
             db.commit()
             action_owner_run_id = run.run_id
@@ -1523,12 +1705,20 @@ async def process_one_comment_action(request_id: Optional[str] = None) -> dict:
                     db, run, task, execution.result_text, execution.session_id, validation
                 )
                 if owns_task:
-                    _refresh_context_view(db, task_id=task.id)
-                    add_task_comment(
+                    _run_post_finalize_side_effects(
                         db,
                         task.id,
-                        f"🤖 Revision completed for comment #{comment.id}\n\n{execution.result_text}",
-                        "agent",
+                        run.run_id,
+                        lambda: (
+                            _refresh_context_view(db, task_id=task.id),
+                            add_task_comment(
+                                db,
+                                task.id,
+                                f"🤖 Revision completed for comment #{comment.id}\n\n{execution.result_text}",
+                                "agent",
+                                commit=False,
+                            ),
+                        ),
                     )
             except RunOwnershipLost:
                 # The lease owner changed while the agent was running. The
@@ -1567,8 +1757,20 @@ async def process_one_comment_action(request_id: Optional[str] = None) -> dict:
                     }
                 owns_task = _finalize_run_failure(db, run, task, str(e))
                 if owns_task:
-                    _refresh_context_view(db, task_id=task.id)
-                    add_task_failed_comment(db, task.id, f"Comment #{comment.id}: {str(e)}")
+                    _run_post_finalize_side_effects(
+                        db,
+                        task.id,
+                        run.run_id,
+                        lambda: (
+                            _refresh_context_view(db, task_id=task.id),
+                            add_task_failed_comment(
+                                db,
+                                task.id,
+                                f"Comment #{comment.id}: {str(e)}",
+                                commit=False,
+                            ),
+                        ),
+                    )
             return {
                 "processed": True,
                 "task_id": task.id,

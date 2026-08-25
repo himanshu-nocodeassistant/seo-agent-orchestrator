@@ -174,6 +174,13 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
 
+        latest_task_run = (
+            db.query(AgentRunModel)
+            .filter(AgentRunModel.task_id == task.id)
+            .order_by(AgentRunModel.id.desc())
+            .first()
+        )
+
         # ── Orchestration branch ──────────────────────────────────────────────
         if task.execution_type == "orchestrate_seo_campaign":
             if not resume:
@@ -202,7 +209,11 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
                     latest_campaign_run is not None
                     and latest_campaign_run.status in {"review_required", "needs_review"}
                 )
-                if (task.status == "blocked" and not safe_failed_retry) or review_gate:
+                if (
+                    task.status in {"review_required"}
+                    or (task.status == "blocked" and not safe_failed_retry)
+                    or review_gate
+                ):
                     if latest_campaign_run is None:
                         raise HTTPException(
                             status_code=409,
@@ -252,14 +263,16 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
                 task.status = "in_progress"
                 task.updated_at = _utcnow_iso()
                 db.commit()
-                add_task_comment(
+                if not helpers_module._add_owned_task_comment(
                     db,
                     task_id,
+                    run.run_id,
                     "🤖 Campaign resuming saved state"
                     if state.status != "awaiting_approval"
                     else "🤖 Campaign resuming after approval",
-                    "agent",
-                )
+                ):
+                    db.refresh(run)
+                    return _run_response(run)
                 try:
                     await _execute_campaign_with_timeout(db, task, run, resume=True)
                 except Exception as e:
@@ -267,8 +280,17 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
                     if not owns_task:
                         db.refresh(run)
                         return _run_response(run)
-                    _refresh_context_view(db, task_id=task.id)
-                    add_task_failed_comment(db, task_id, str(e))
+                    if helpers_module._run_post_finalize_side_effects(
+                        db,
+                        task.id,
+                        run.run_id,
+                        lambda: (
+                            _refresh_context_view(db, task_id=task.id),
+                            add_task_failed_comment(db, task_id, str(e), commit=False),
+                        ),
+                    ) is False:
+                        db.refresh(run)
+                        return _run_response(run)
                 db.refresh(run)
                 return _run_response(run)
 
@@ -295,16 +317,15 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
                 if helpers_module._campaign_has_blocking_publisher_child(
                     db, task, retry_run.run_id
                 ):
-                    retry_run.status = "review_required"
-                    retry_run.recovery_state = "review_required"
-                    task.status = "blocked"
-                    task.active_run_id = None
-                    retry_state.status = "review_required"
-                    retry_state.error = (
-                        "Campaign retry blocked: a publisher child has an uncertain write."
+                    blocked = helpers_module._mark_campaign_retry_review_required(
+                        db,
+                        task,
+                        retry_run,
+                        retry_state,
+                        "Campaign retry blocked: a write-capable child has an uncertain write.",
                     )
-                    retry_state.updated_at = _utcnow_iso()
-                    db.commit()
+                    if not blocked:
+                        db.refresh(retry_run)
                     return _run_response(retry_run)
                 if not _claim_campaign_resume(
                     db,
@@ -313,9 +334,14 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
                 ):
                     db.refresh(retry_run)
                     return _run_response(retry_run)
-                add_task_comment(
-                    db, task_id, "🤖 Campaign retry resuming saved phases", "agent"
-                )
+                if not helpers_module._add_owned_task_comment(
+                    db,
+                    task_id,
+                    retry_run.run_id,
+                    "🤖 Campaign retry resuming saved phases",
+                ):
+                    db.refresh(retry_run)
+                    return _run_response(retry_run)
                 try:
                     await _execute_campaign_with_timeout(
                         db, task, retry_run, resume=True
@@ -325,8 +351,17 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
                     if not owns_task:
                         db.refresh(retry_run)
                         return _run_response(retry_run)
-                    _refresh_context_view(db, task_id=task.id)
-                    add_task_failed_comment(db, task_id, str(e))
+                    if helpers_module._run_post_finalize_side_effects(
+                        db,
+                        task.id,
+                        retry_run.run_id,
+                        lambda: (
+                            _refresh_context_view(db, task_id=task.id),
+                            add_task_failed_comment(db, task_id, str(e), commit=False),
+                        ),
+                    ) is False:
+                        db.refresh(retry_run)
+                        return _run_response(retry_run)
                 db.refresh(retry_run)
                 return _run_response(retry_run)
 
@@ -344,9 +379,14 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
                 ):
                     db.refresh(retry_run)
                     return _run_response(retry_run)
-                add_task_comment(
-                    db, task_id, "🤖 Campaign recovering saved read-only phases", "agent"
-                )
+                if not helpers_module._add_owned_task_comment(
+                    db,
+                    task_id,
+                    retry_run.run_id,
+                    "🤖 Campaign recovering saved read-only phases",
+                ):
+                    db.refresh(retry_run)
+                    return _run_response(retry_run)
                 try:
                     await _execute_campaign_with_timeout(
                         db, task, retry_run, resume=True
@@ -356,8 +396,17 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
                     if not owns_task:
                         db.refresh(retry_run)
                         return _run_response(retry_run)
-                    _refresh_context_view(db, task_id=task.id)
-                    add_task_failed_comment(db, task_id, str(e))
+                    if helpers_module._run_post_finalize_side_effects(
+                        db,
+                        task.id,
+                        retry_run.run_id,
+                        lambda: (
+                            _refresh_context_view(db, task_id=task.id),
+                            add_task_failed_comment(db, task_id, str(e), commit=False),
+                        ),
+                    ) is False:
+                        db.refresh(retry_run)
+                        return _run_response(retry_run)
                 db.refresh(retry_run)
                 return _run_response(retry_run)
 
@@ -370,7 +419,11 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
             )
             if not getattr(run, "_claim_created", True):
                 return _run_response(run)
-            add_task_started_comment(db, task_id, task.title)
+            if not helpers_module._add_owned_task_comment(
+                db, task_id, run.run_id, "🤖 Task started by agent"
+            ):
+                db.refresh(run)
+                return _run_response(run)
 
             try:
                 await _execute_campaign_with_timeout(db, task, run)
@@ -379,11 +432,34 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
                 if not owns_task:
                     db.refresh(run)
                     return _run_response(run)
-                _refresh_context_view(db, task_id=task.id)
-                add_task_failed_comment(db, task_id, str(e))
+                if helpers_module._run_post_finalize_side_effects(
+                    db,
+                    task.id,
+                    run.run_id,
+                    lambda: (
+                        _refresh_context_view(db, task_id=task.id),
+                        add_task_failed_comment(db, task_id, str(e), commit=False),
+                    ),
+                ) is False:
+                    db.refresh(run)
+                    return _run_response(run)
             db.refresh(run)
             return _run_response(run)
         # ── End orchestration branch ──────────────────────────────────────────
+
+        # A blocked or review-gated task can only run again after an explicit
+        # review resolution. Changing the task card back to ``pending`` must
+        # not bypass the durable run-level safety gate.
+        if not resume and (
+            task.status in {"blocked", "review_required"}
+            or helpers_module._task_has_review_gate(db, task)
+        ):
+            if latest_task_run is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Task is blocked pending explicit review resolution.",
+                )
+            return _run_response(latest_task_run)
 
         profile = get_execution_profile(task.execution_type)
         if profile.requires_approval and not task.approved_at:
@@ -401,7 +477,11 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
         )
         if not getattr(run, "_claim_created", True):
             return _run_response(run)
-        add_task_started_comment(db, task_id, task.title)
+        if not helpers_module._add_owned_task_comment(
+            db, task_id, run.run_id, "🤖 Task started by agent"
+        ):
+            db.refresh(run)
+            return _run_response(run)
 
         try:
             task_comments = db.query(CommentModel).filter(CommentModel.task_id == task_id).order_by(CommentModel.created_at).all()
@@ -425,24 +505,40 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
             if not owns_task:
                 db.refresh(run)
                 return _run_response(run)
-            _refresh_context_view(db, task_id=task.id)
+            def post_success_side_effects():
+                _refresh_context_view(db, task_id=task.id)
 
-            # Deterministic application-layer change logging (guaranteed, not prompt-dependent)
-            if task.execution_type in CMS_CHANGE_FIELD_MAP:
-                try:
-                    _write_change_log_entry(task, execution.result_text, task_comments)
-                except Exception as log_err:
-                    add_task_comment(db, task_id, f"⚠️ Change log write failed: {log_err}", "agent")
+                # Deterministic application-layer change logging (guaranteed, not prompt-dependent)
+                if task.execution_type in CMS_CHANGE_FIELD_MAP:
+                    try:
+                        _write_change_log_entry(task, execution.result_text, task_comments)
+                    except Exception as log_err:
+                        add_task_comment(
+                            db,
+                            task_id,
+                            f"⚠️ Change log write failed: {log_err}",
+                            "agent",
+                            commit=False,
+                        )
 
-            if validation.status == "passed":
-                add_task_completed_comment(db, task_id, execution.result_text)
-            else:
-                add_task_comment(
-                    db,
-                    task_id,
-                    f"⚠️ Run completed but failed validation: {validation.message}",
-                    "agent",
-                )
+                if validation.status == "passed":
+                    add_task_completed_comment(
+                        db, task_id, execution.result_text, commit=False
+                    )
+                else:
+                    add_task_comment(
+                        db,
+                        task_id,
+                        f"⚠️ Run completed but failed validation: {validation.message}",
+                        "agent",
+                        commit=False,
+                    )
+
+            if not helpers_module._run_post_finalize_side_effects(
+                db, task.id, run.run_id, post_success_side_effects
+            ):
+                db.refresh(run)
+                return _run_response(run)
         except helpers_module.RunOwnershipLost:
             # The heartbeat fenced this worker. Do not finalize or clear state
             # for a run that may now belong to another worker.
@@ -452,8 +548,15 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
             if not owns_task:
                 db.refresh(run)
                 return _run_response(run)
-            _refresh_context_view(db, task_id=task.id)
-            add_task_failed_comment(db, task_id, str(e))
+            def post_failure_side_effects():
+                _refresh_context_view(db, task_id=task.id)
+                add_task_failed_comment(db, task_id, str(e), commit=False)
+
+            if not helpers_module._run_post_finalize_side_effects(
+                db, task.id, run.run_id, post_failure_side_effects
+            ):
+                db.refresh(run)
+                return _run_response(run)
 
         db.refresh(run)
         return _run_response(run)
