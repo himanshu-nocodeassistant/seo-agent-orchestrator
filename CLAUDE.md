@@ -32,8 +32,8 @@ keep business impact in mind when choosing between "expedient" and "correct".
 - `agent/config.py` - Configuration dataclass (AgentConfig); exports `PROJECT_ROOT`; supports `SEO_AGENT_CWD` env var and `max_thinking_tokens`
 - `agent/memory_service.py` - Layered memory composition: builds `ShortTermContext`, `EpisodicContext`, `SemanticContext`, `ProceduralContext` into a `ComposedPromptContext` for prompt injection
 - `agent/runtime_profiles.py` - `ExecutionProfile` registry; maps each execution type to tool policy, budget, timeout, turn limit, validator, semantic char limits, and `requires_approval` flag
-- `agent/orchestrator.py` - Multi-agent campaign dispatch loop; DAG tier resolution (`_resolve_execution_tiers`), structured inter-agent handoffs (`_extract_summary_block`), retry with backoff (`_run_with_retry`), parallel execution via `asyncio.gather`
-- `agent/db.py` - SQLAlchemy engine, session factory, ORM models, and Pydantic API schemas (WAL + busy_timeout enabled for SQLite)
+- `agent/orchestrator.py` - Multi-agent campaign dispatch loop; DAG tier resolution (`_resolve_execution_tiers`), structured inter-agent handoffs (`_extract_summary_block`), retry with backoff (`_run_with_retry`), parallel execution via `asyncio.gather`, leases, and ownership fencing
+- `agent/db.py` - SQLAlchemy engine, session factory, ORM models, and Pydantic API schemas (WAL + busy_timeout enabled for SQLite; atomic claims use short transactions)
 - `agent/prompts.py` - Workflow prompts per execution type (`build_execution_prompt`)
 - `agent/feedback_loop.py` - Change-log/learnings persistence (`seo-changes.json`, `seo-learnings.json`, markdown views)
 - `main.py` - CLI entry point; uses `PROJECT_ROOT` for portable working directory
@@ -60,7 +60,7 @@ Trigger: create a Kanban task with `execution_type = "orchestrate_seo_campaign"`
    - **Resume is explicit**: `POST /tasks/{id}/execute?resume=true` (or the Resume button in the UI) continues the SAME orchestrator run — the plan is not regenerated and completed phases are not re-run.
 6. Each phase agent receives prior outputs via structured `## Summary for Next Phase` blocks (falls back to 1500-char truncation)
    - Phases with downstream dependents get ONE correction retry when the block is missing; if still missing, `handoff_degraded` is recorded in the orchestration state (`handoff_degraded_json`) plus a warning comment
-7. `OrchestrationStateModel` persists state: plan JSON, current phase, all phase outputs, child run IDs, and final status (`running | awaiting_approval | completed | error`)
+7. `OrchestrationStateModel` persists state: plan JSON, current phase, all phase outputs, child run IDs, and final status (`running | awaiting_approval | completed | error | review_required`)
 8. All child `AgentRunModel` rows carry `parent_run_id` pointing to the orchestrator run
 
 **Phase plan schema** (what the orchestrator agent must output):
@@ -97,6 +97,16 @@ Trigger: create a Kanban task with `execution_type = "orchestrate_seo_campaign"`
 **Grounding requirement:** `research` and `campaign_researcher` profiles carry the `grounding-required` procedural tag. The injected system prompt requires every factual claim to cite a source URL; the validator also checks for at least one `https://` URL in the output.
 
 **Audit log:** every tool call made during a run is written to `RunEventModel` via a `PostToolUse` SDK hook wired in `_build_runtime_config`.
+
+## Reliability and Recovery Invariants
+
+- A task has at most one active run. Execute and resume claims are atomic and return the existing active run when a duplicate request arrives.
+- Every request has an `X-Request-ID` (accepted or generated). The ID is returned in the response and stored with run and event records, including background comment work.
+- Run leases last 15 minutes. Heartbeats refresh active work. Stale read-only work can recover; uncertain, write-capable, or ownership-lost work becomes `review_required` and cannot retry automatically.
+- Finalizers and side effects must verify current run ownership. A stale worker must not update task state, comments, change logs, memory, or orchestration phase output.
+- Campaign publishers and draft writers are separate profiles. `campaign_draft_writer` edits files only; `campaign_publisher` can publish through Webflow and always requires approval.
+- DataForSEO never blindly retries an uncertain paid POST. Manifests preserve known IDs, unknown submission state, request payloads, partial results, and polling errors for manual recovery.
+- Run events are available at `GET /runs/{run_id}/events?page=<n>&limit=<n>` with a server-enforced maximum page size of 200.
 
 **Scalability boundaries** (annotated in source with `# Scalability note`):
 - `#1` — move `run_campaign_orchestration` call to a task queue (Celery/arq) for production; return 202 + polling
@@ -524,6 +534,7 @@ Then open http://localhost:8000/kanban
 - `PATCH /tasks/{id}` - Update task
 - `DELETE /tasks/{id}` - Delete task
 - `POST /tasks/{id}/execute` - Execute task via SEOAgent
+- `GET /runs/{run_id}/events` - Paginated lifecycle, tool, retry, and recovery events
 - `GET /tasks/{id}/comments` - Get task comments
 - `POST /tasks/{id}/comments` - Add comment
 - `POST /automation/comments/process-one` - Process one eligible `@agent` comment action
@@ -535,6 +546,7 @@ Then open http://localhost:8000/kanban
 - `in_progress` - Tasks currently being executed
 - `completed` - Tasks finished successfully
 - `blocked` - Tasks that encountered errors
+- `review_required` - Tasks that need explicit human review before another run
 
 ### Database
 
@@ -559,6 +571,7 @@ Comment automation environment variables:
 - `COMMENT_AUTOPILOT_ENABLED` (default `true`)
 - `COMMENT_AUTOPILOT_INTERVAL_SECONDS` (default `300` — 5 minutes)
 - `AGENT_EXECUTION_TIMEOUT_SECONDS` (default `900`)
+- `CAMPAIGN_TIMEOUT_SECONDS` (default `5400`)
 
 API hardening environment variables:
 - `ALLOWED_ORIGINS` (comma-separated CORS origins; default localhost:8000)

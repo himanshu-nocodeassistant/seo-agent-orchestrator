@@ -41,13 +41,25 @@ A four-layer memory system feeds every prompt:
 - **Multi-agent campaign orchestration** — one campaign task (researcher → writer → publisher → analyst) with DAG-based parallelism, structured handoffs, retry on transient failures, and an approval gate before publishing
 - **15 SEO Skills** — SEO Audit, Content Strategy, Copywriting, Copy Editing, Brand Voice, Competitor Alternatives, Programmatic SEO, Schema Markup, Analytics Tracking, Page CRO, Marketing Psychology, Webflow CMS, Google Docs, SEO Feedback Loop, Task Breakdown
 - **Kanban UI** — visual task board at `http://localhost:8000/kanban`; create tasks, execute them, leave `@agent` comments for revisions
-- **Comment Autopilot** — background worker that picks up `@agent` comments and re-runs the agent automatically
-- **Run tracking** — every execution is recorded with status, session ID, validator result, and a result summary; child campaign runs link back to the orchestrator run via `parent_run_id`
+- **Comment Autopilot** — background worker that picks up `@agent` comments, uses leased claims, and defers unsafe or review-required work
+- **Run tracking and tracing** — every run records status, session ID, validator result, request ID, and a result summary; child campaign runs link back to the orchestrator run via `parent_run_id`, with paginated lifecycle and tool events
+- **Reliability controls** — atomic task claims, run leases, heartbeats, stale-run recovery, ownership fencing, and review gates prevent duplicate paid work and unsafe external writes
 - **Session reuse** — the agent resumes the same Claude session for follow-up runs on a task, preserving context
 - **Webflow CMS** — create, update, and publish CMS items directly via the agent
 - **Google Docs** — save audit reports and blog drafts to Google Docs (read/write only — no delete)
 - **Google Search Console** — query live clicks, impressions, CTR, and position; inspect URL indexing status; list sitemaps (read-only)
 - **SEO Feedback Loop** — log CMS changes, review ranking impact using GSC data, extract learnings, propagate winning patterns
+
+## Reliability and recovery
+
+The API is designed for a small self-hosted deployment with SQLite and one process:
+
+- Execute requests atomically claim a task. A duplicate request returns the active run instead of starting another paid run.
+- Every run accepts or generates an `X-Request-ID`. The ID is returned in the response and stored on run and event records.
+- Runs use a 15-minute lease with heartbeats. Stale read-only work can recover; write-capable or uncertain work moves to `review_required` and does not retry automatically.
+- Comment actions and campaign children use database claims and ownership checks. A stale worker cannot finish a newer run or add post-run side effects.
+- DataForSEO preserves task IDs, manifests, partial results, and unknown submission outcomes. An uncertain paid POST is not sent again automatically.
+- Query trace events with `GET /runs/{run_id}/events?page=1&limit=50`. The server caps `limit` at 200.
 
 ## Requirements
 
@@ -124,6 +136,7 @@ asyncio.run(main())
 - **Human approval before publishing** — `campaign_publisher` phases pause until a person sets `approved_at`; the campaign resumes from where it stopped (no re-planning, no double-billing).
 - **Spend is bounded** — every execution profile has a max budget and turn limit, API rate limits cap cost-triggering endpoints, and DataForSEO pulls track real billed cost per run.
 - **Nothing ships unverified** — outputs must pass a structured validator (grounded research requires cited URLs; CMS changes require a machine-readable change log) before a run is marked complete.
+- **Unsafe work stops for review** — uncertain writes, failed write validation, stale write runs, and lost ownership are recorded for review instead of being retried blindly.
 - **Published changes are attributable** — the SEO Feedback Loop correlates CMS changes with GSC ranking data so you can see what actually worked.
 
 ## Configuration
@@ -149,8 +162,9 @@ Copy `.env.example` to `.env` and fill in the values you need.
 | `APP_ENV` | Kanban DB selection (`production` or `staging`) | `production` |
 | `DATABASE_URL` | Explicit DB URL (overrides `APP_ENV`) | unset |
 | `COMMENT_AUTOPILOT_ENABLED` | Enable `@agent` comment background worker | `true` |
-| `COMMENT_AUTOPILOT_INTERVAL_SECONDS` | Poll interval for comment autopilot | `900` |
+| `COMMENT_AUTOPILOT_INTERVAL_SECONDS` | Poll interval for comment autopilot | `300` |
 | `AGENT_EXECUTION_TIMEOUT_SECONDS` | Timeout per agent execution | `900` |
+| `CAMPAIGN_TIMEOUT_SECONDS` | Maximum wall-clock time for one campaign | `5400` |
 | `ALLOWED_ORIGINS` | Comma-separated CORS origins for the local API | `http://localhost:8000,http://127.0.0.1:8000` |
 | `API_TOKEN` | Optional bearer token; when set every request needs `Authorization: Bearer <token>` | unset |
 | `API_RATE_LIMIT_EXECUTE` | Per-minute rate limit on endpoints that start paid agent runs | `5/minute` |
@@ -184,8 +198,8 @@ Each task type maps to an `ExecutionProfile` in `agent/runtime_profiles.py` that
 | `manual` | 8 | $1.00 | 4 min | Fallback for unknown types |
 | `orchestrate_seo_campaign` | 6 | $1.00 | 3 min | Produces JSON plan; no session reuse |
 | `campaign_researcher` | 14 | $2.50 | 10 min | Read-only + GSC |
-| `campaign_content_writer` | 18 | $4.00 | 15 min | Write + Webflow; validates blog output |
-| `campaign_publisher` | 8 | $1.50 | 5 min | Webflow publish; validates CHANGE_LOG |
+| `campaign_draft_writer` | 18 | $4.00 | 15 min | File edits only; validates blog output |
+| `campaign_publisher` | 8 | $1.50 | 5 min | Webflow publish; approval required; validates CHANGE_LOG |
 | `campaign_analyst` | 16 | $3.00 | 12 min | Read-only + GSC; no session reuse |
 
 ## Memory System
@@ -210,7 +224,8 @@ seo-agent-orchestrator/
 │   ├── seo_agent.py          # SEOAgent class; returns AgentExecutionResult
 │   ├── memory_service.py     # Four-layer prompt composition
 │   ├── runtime_profiles.py   # ExecutionProfile registry (incl. campaign profiles)
-│   ├── orchestrator.py       # Multi-agent dispatch loop; DAG resolution; retry
+│   ├── orchestrator.py       # Multi-agent dispatch, leases, DAG, retry, recovery
+│   ├── dataforseo/            # DataForSEO client, recovery manifests, and pipelines
 │   ├── db.py                 # SQLAlchemy engine, models, and API schemas
 │   ├── prompts.py            # Workflow prompts per execution type
 │   ├── feedback_loop.py      # Change-log/learnings persistence
@@ -260,6 +275,7 @@ API tests use an in-memory SQLite database automatically — no production DB is
 | `PATCH` | `/tasks/{id}` | Update task |
 | `DELETE` | `/tasks/{id}` | Delete task |
 | `POST` | `/tasks/{id}/execute` | Execute task via agent |
+| `GET` | `/runs/{run_id}/events` | Paginated run and tool trace events |
 | `GET` | `/tasks/{id}/comments` | List comments |
 | `POST` | `/tasks/{id}/comments` | Add comment |
 | `POST` | `/automation/comments/process-one` | Manually trigger one autopilot cycle |
