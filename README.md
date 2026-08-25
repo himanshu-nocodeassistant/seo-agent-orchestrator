@@ -2,8 +2,6 @@
 
 SEO Agent Orchestrator runs SEO tasks through Claude Code. It supports audits, content work, Webflow updates, Google Search Console reads, DataForSEO pulls, and campaign orchestration. A Kanban API tracks tasks, runs, approvals, and results.
 
-The project is self-hosted and released under the [MIT License](LICENSE). It uses your Claude Code subscription and your own credentials.
-
 ## How it works
 
 The agent uses Claude Code through OAuth. Each task maps to an **execution profile** that controls its tools, turn limit, budget, timeout, and output validator.
@@ -24,6 +22,7 @@ A four-layer memory system feeds every prompt:
 - **Recovery controls:** task claims, leases, heartbeats, stale-run recovery, ownership checks, and review states
 - **Session reuse:** follow-up runs can continue the same Claude session
 - **Integrations:** Webflow CMS, Google Docs, Google Search Console, and DataForSEO
+- **Measured ranking data:** DataForSEO provides keyword volumes, SERP positions, backlinks, and AI-search visibility for research and impact reviews
 - **SEO Feedback Loop:** records CMS changes and reviews ranking data
 
 ## Reliability and recovery
@@ -114,6 +113,16 @@ asyncio.run(main())
 - Validators must pass before a run is marked complete. Research output needs cited URLs. CMS changes need a change log.
 - Uncertain writes, failed write validation, stale write runs, and lost ownership move to review. They aren't retried blindly.
 - CMS changes are stored with ranking data from Google Search Console when the feedback loop runs.
+
+## Measured data, not guesses (DataForSEO)
+
+Keyword volumes, SERP positions, backlink counts, and AI-search visibility come from **measured DataForSEO API responses**, never from the agent guessing at numbers. A batch extraction pipeline pulls the data, rollups are compiled under `dataforseo/compiled/`, and the newest results per pipeline are injected into the agent's context as a "Measured Data" section for research, campaign-research, and impact-review tasks.
+
+- **What it powers** — keyword research grounded in real volume/CPC, SERP position tracking, competitor and backlink analysis, and AI-search (LLM mention) visibility; the SEO Feedback Loop reviews ranking impact against this measured data.
+- **How it runs** — one CLI script per data source under `scripts/pipelines/` (SERP, keyword volume, backlinks, AI visibility), plus `scripts/pipelines/refresh.py` for scheduled refreshes via cron/launchd (see the script's header for a ready-made schedule line).
+- **Cost is controlled and visible** — every pipeline prints the real billed cost of the run (from the API's `cost` field, not an estimate); task creation is rate-limited (`DATAFORSEO_TASKS_PER_MINUTE`) and batched (`DATAFORSEO_MAX_TASKS_PER_REQUEST`) to stay inside API quotas.
+
+Configuration: `DATAFORSEO_LOGIN` / `DATAFORSEO_PASSWORD` (API password from the DataForSEO dashboard) plus the rate-limit env vars in the Configuration table below. Full pipeline design and reliability notes live in `agent/dataforseo/RELIABILITY.md` and `agent/dataforseo/LOG_ORGANIZATION.md`.
 
 ## Configuration
 
