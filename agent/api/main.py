@@ -14,18 +14,21 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime  # noqa: F401 - compatibility export used by legacy callers
 from pathlib import Path
+from uuid import uuid4
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
+from sqlalchemy import text
 
+from agent import db as db_module
 from agent.api.helpers import (
     _autopilot_enabled,
     _autopilot_interval_seconds,
     comment_autopilot_lock,
-    process_one_comment_action,
+    recover_stale_runs,
 )
 from agent.api.rate_limit import _rate_limit_value, limiter  # noqa: F401 - compatibility export
 from agent.api.routers import automation, comments, runs, tasks
@@ -50,7 +53,7 @@ EXECUTABLE_TYPES = {
     # agents — blast radius grows with each new profile. If a new child type
     # needs Webflow, add it to runtime_profiles.py with explicit WEBFLOW_TOOLS,
     # not by expanding EXECUTABLE_TYPES here.
-    "campaign_researcher", "campaign_content_writer", "campaign_publisher",
+    "campaign_researcher", "campaign_draft_writer", "campaign_publisher",
     "campaign_analyst",
 }
 
@@ -78,7 +81,7 @@ async def _comment_autopilot_loop():
     """Background loop that periodically processes one trigger comment."""
     interval = _autopilot_interval_seconds()
     while True:
-        await process_one_comment_action()
+        await run_comment_autopilot_cycle()
         await asyncio.sleep(interval)
 
 
@@ -86,6 +89,14 @@ async def _comment_autopilot_loop():
 async def _lifespan(app: FastAPI):
     """Start/stop the comment autopilot and apply one-off DB migrations."""
     _ensure_orchestration_handoff_column()
+    db = db_module.get_db_session()
+    try:
+        try:
+            recover_stale_runs(db)
+        except Exception:
+            logger.exception("Could not recover stale runs during startup")
+    finally:
+        db.close()
     task = None
     if _autopilot_enabled():
         task = asyncio.create_task(_comment_autopilot_loop())
@@ -119,7 +130,8 @@ app.add_middleware(
 
 @app.middleware("http")
 async def _api_token_check(request: Request, call_next):
-    """Protect the API and fail closed for production approval routes."""
+    """Optional bearer-token gate. Approval routes fail closed in production."""
+    request.state.request_id = request.headers.get("X-Request-ID") or str(uuid4())
     token = os.environ.get("API_TOKEN")
     app_env = os.environ.get("APP_ENV", "production").strip().lower()
     approval_route = "/webflow-proposals" in request.url.path
@@ -131,11 +143,15 @@ async def _api_token_check(request: Request, call_next):
     if token:
         expected = f"Bearer {token}"
         if request.headers.get("Authorization") != expected:
-            return JSONResponse(
+            response = JSONResponse(
                 status_code=401,
                 content={"detail": "Invalid or missing API token"},
             )
-    return await call_next(request)
+            response.headers["X-Request-ID"] = request.state.request_id
+            return response
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request.state.request_id
+    return response
 
 
 # ============================================================================
@@ -145,8 +161,40 @@ async def _api_token_check(request: Request, call_next):
 
 @app.get("/health")
 def health_check():
-    """Health check endpoint."""
-    return {"status": "ok", "service": "seo-bot-kanban"}
+    """Fast dependency health check with safe, stable output."""
+    database_status = "ok"
+    db = None
+    try:
+        db = db_module.get_db_session()
+        db.execute(text("SELECT 1"))
+    except Exception:
+        database_status = "unavailable"
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+    if not _autopilot_enabled():
+        worker_status = "disabled"
+    else:
+        worker = getattr(app.state, "comment_autopilot_task", None)
+        if worker is None:
+            worker_status = "not_running"
+        elif worker.cancelled() or worker.done():
+            worker_status = "failed"
+        else:
+            worker_status = "running"
+
+    healthy_worker = worker_status in {"running", "disabled"}
+    overall_status = "ok" if database_status == "ok" and healthy_worker else "degraded"
+    return {
+        "status": overall_status,
+        "service": "seo-bot-kanban",
+        "database": {"status": database_status},
+        "worker": {"status": worker_status},
+    }
 
 
 KANBAN_HTML_PATH = Path(__file__).parent / "static" / "kanban.html"
@@ -188,6 +236,7 @@ from agent.api.helpers import (  # noqa: E402,F401
     build_post_tool_use_hook,
     extract_agent_comment_instruction,
     is_agent_trigger_comment,
+    run_comment_autopilot_cycle,
     _acquire_next_comment_action,
     _agent_execution_timeout_seconds,
     _build_runtime_config,

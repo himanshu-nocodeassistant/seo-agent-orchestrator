@@ -5,8 +5,14 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
-- **Webflow write approvals** — Webflow-capable profiles are read-only and return complete create/update/publish proposals. The Kanban UI and API support approve/reject, stale snapshot checks, duplicate-slug checks, idempotency, batch retry, and campaign publisher handoff.
-- **Profile and audit safeguards** — Webflow writes have a server-side guard, approval routes fail closed without `API_TOKEN` outside explicit local/test modes, and audit payloads redact secrets and bound log-only strings.
+- **Webflow write approvals** — Execute stores the full proposal; approval checks for stale content before applying it. Campaign publisher proposals pause the campaign until resolved.
+- **Reliability and tracing hardening** — atomic task claims, request correlation through `X-Request-ID`, paginated run events, run leases, heartbeats, stale-run recovery, and ownership fencing for runs, campaigns, and comment actions.
+- **Safe campaign recovery** — resumable phase state, durable child-run claims, approval gates, and review-required states for uncertain or write-capable failures.
+- **DataForSEO recovery records** — collision-safe manifests preserve submitted IDs, partial results, and uncertain POST outcomes; the CLI reports recovery details instead of retrying paid work blindly.
+
+### Changed
+- **Validation and health reporting** — strict task and comment validation, bounded list and audit inputs, server-controlled comment authors, and dependency-aware `/health` output.
+- **Comment Autopilot** — leased claims, heartbeats, stale-action recovery, request IDs, and review gates prevent duplicate or unsafe comment-triggered runs.
 
 ## [2.3.0] - 2026-08-05
 
@@ -31,6 +37,7 @@ All notable changes to this project will be documented in this file.
 - `seo_audit` is now an executable profile (previously a nonexistent type referenced by the broken audit endpoint and UI)
 - `main.py` CLI uses `SEO_AGENT_CWD`/repo root instead of a hardcoded path
 - README/CLAUDE.md reframed business-first (open-source platform positioning, what it delivers and why, guardrails, measurable outcomes) with all technical detail preserved below
+- README gained a dedicated "Measured data, not guesses (DataForSEO)" section covering what it powers, how it runs, and cost control
 
 ### Added
 - **DataForSEO batch extraction pipeline** (`agent/dataforseo/`) — ported from the sibling `seo-bot` project as a standalone sync pipeline, not agent-facing MCP tools. Replaces guessed keyword volumes/SERP data with measured DataForSEO API responses.

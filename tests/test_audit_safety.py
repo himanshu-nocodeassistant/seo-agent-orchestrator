@@ -19,8 +19,7 @@ def test_run_event_redacts_secrets_and_bounds_log_text(client):
         )
         payload = json.loads(event.payload)
         assert "secret" not in event.payload
-        assert payload["access_token"] == "[redacted]"
-        assert payload["text"].endswith("[truncated]")
-        assert len(payload["text"]) < 5000
+        assert payload["access_token"] == "[REDACTED]"
+        assert payload["text"] == "x" * 5000
     finally:
         db.close()

@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Mapping, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import (
     Boolean,
     Column,
@@ -20,6 +20,8 @@ from sqlalchemy import (
     event,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
+
+from agent.runtime_profiles import PROFILE_REGISTRY
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +124,10 @@ class CommentActionModel(Base):
     attempts = Column(Integer, nullable=False, default=0)
     max_attempts = Column(Integer, nullable=False, default=2)
     last_error = Column(Text, nullable=True)
+    heartbeat_at = Column(String(20), nullable=True)
+    lease_expires_at = Column(String(20), nullable=True)
+    recovery_state = Column(String(30), nullable=False, default="none")
+    write_capable = Column(Boolean, nullable=False, default=False)
     created_at = Column(String(20), default=lambda: _utcnow_iso())
     updated_at = Column(String(20), default=lambda: _utcnow_iso())
     acted_at = Column(String(20), nullable=True)
@@ -133,6 +139,12 @@ class AgentRunModel(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     run_id = Column(String(64), nullable=False, unique=True, index=True)
+    request_id = Column(String(128), nullable=True, index=True)
+    heartbeat_at = Column(String(20), nullable=True)
+    lease_expires_at = Column(String(20), nullable=True)
+    recovery_state = Column(String(30), nullable=False, default="none")
+    recovery_attempts = Column(Integer, nullable=False, default=0)
+    write_capable = Column(Boolean, nullable=False, default=False)
     task_id = Column(Integer, nullable=True, index=True)
     parent_run_id = Column(String(64), nullable=True, index=True)
     status = Column(String(30), nullable=False, default="queued")
@@ -156,8 +168,12 @@ class RunEventModel(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     run_id = Column(String(64), nullable=False, index=True)
+    request_id = Column(String(128), nullable=True, index=True)
+    session_id = Column(String(255), nullable=True)
     event_type = Column(String(50), nullable=False)
     payload = Column(Text, nullable=True)
+    duration_ms = Column(Integer, nullable=True)
+    outcome = Column(String(30), nullable=True)
     created_at = Column(String(20), default=lambda: _utcnow_iso())
 
 
@@ -236,7 +252,57 @@ def _ensure_orchestration_handoff_column() -> None:
                     "ALTER TABLE orchestration_states "
                     "ADD COLUMN handoff_degraded_json TEXT"
                 )
-                conn.commit()
+            run_columns = {
+                row[1]
+                for row in conn.exec_driver_sql("PRAGMA table_info(agent_runs)")
+            }
+            if "request_id" not in run_columns:
+                conn.exec_driver_sql(
+                    "ALTER TABLE agent_runs ADD COLUMN request_id VARCHAR(128)"
+                )
+            run_column_defs = {
+                "heartbeat_at": "VARCHAR(20)",
+                "lease_expires_at": "VARCHAR(20)",
+                "recovery_state": "VARCHAR(30) DEFAULT 'none'",
+                "recovery_attempts": "INTEGER DEFAULT 0",
+                "write_capable": "BOOLEAN DEFAULT 0",
+            }
+            for column, column_type in run_column_defs.items():
+                if column not in run_columns:
+                    conn.exec_driver_sql(
+                        f"ALTER TABLE agent_runs ADD COLUMN {column} {column_type}"
+                    )
+            action_columns = {
+                row[1]
+                for row in conn.exec_driver_sql("PRAGMA table_info(comment_actions)")
+            }
+            action_column_defs = {
+                "heartbeat_at": "VARCHAR(20)",
+                "lease_expires_at": "VARCHAR(20)",
+                "recovery_state": "VARCHAR(30) DEFAULT 'none'",
+                "write_capable": "BOOLEAN DEFAULT 0",
+            }
+            for column, column_type in action_column_defs.items():
+                if column not in action_columns:
+                    conn.exec_driver_sql(
+                        f"ALTER TABLE comment_actions ADD COLUMN {column} {column_type}"
+                    )
+            event_columns = {
+                row[1]
+                for row in conn.exec_driver_sql("PRAGMA table_info(run_events)")
+            }
+            event_column_defs = {
+                "request_id": "VARCHAR(128)",
+                "session_id": "VARCHAR(255)",
+                "duration_ms": "INTEGER",
+                "outcome": "VARCHAR(30)",
+            }
+            for column, column_type in event_column_defs.items():
+                if column not in event_columns:
+                    conn.exec_driver_sql(
+                        f"ALTER TABLE run_events ADD COLUMN {column} {column_type}"
+                    )
+            conn.commit()
     except Exception as e:  # pragma: no cover - best-effort migration
         logger.warning("Could not ensure handoff_degraded_json column: %s", e)
 
@@ -247,29 +313,43 @@ def _ensure_orchestration_handoff_column() -> None:
 
 class TaskCreate(BaseModel):
     """Task creation schema."""
-    title: str
-    description: Optional[str] = None
-    priority: int = 0
-    status: str = "pending"
+    title: str = Field(max_length=500)
+    description: Optional[str] = Field(default=None, max_length=20_000)
+    priority: int = Field(default=0, ge=0, le=5)
+    status: TaskStatus = TaskStatus.pending
     assignee: Optional[str] = None
     due_date: Optional[str] = None
     execution_type: Optional[str] = None
     requires_approval: bool = False
 
+    @field_validator("execution_type")
+    @classmethod
+    def validate_execution_type(cls, value):
+        if value is not None and value not in PROFILE_REGISTRY:
+            raise ValueError(f"Unknown execution_type '{value}'")
+        return value
+
 
 class TaskUpdate(BaseModel):
     """Task update schema."""
-    title: Optional[str] = None
-    description: Optional[str] = None
-    status: Optional[str] = None
-    priority: Optional[int] = None
+    title: Optional[str] = Field(default=None, max_length=500)
+    description: Optional[str] = Field(default=None, max_length=20_000)
+    status: Optional[TaskStatus] = None
+    priority: Optional[int] = Field(default=None, ge=0, le=5)
     assignee: Optional[str] = None
     due_date: Optional[str] = None
     execution_type: Optional[str] = None
     requires_approval: Optional[bool] = None
     approved_at: Optional[str] = None
-    notes: Optional[str] = None
+    notes: Optional[str] = Field(default=None, max_length=20_000)
     model: Optional[str] = None
+
+    @field_validator("execution_type")
+    @classmethod
+    def validate_execution_type(cls, value):
+        if value is not None and value not in PROFILE_REGISTRY:
+            raise ValueError(f"Unknown execution_type '{value}'")
+        return value
 
 
 class TaskResponse(BaseModel):
@@ -307,8 +387,7 @@ class TaskListResponse(BaseModel):
 
 class CommentCreate(BaseModel):
     """Comment creation schema."""
-    author: str = "user"
-    body: str
+    body: str = Field(max_length=10_000)
 
 
 class CommentResponse(BaseModel):
@@ -322,6 +401,12 @@ class CommentResponse(BaseModel):
 
 class RunResponse(BaseModel):
     run_id: str
+    request_id: Optional[str]
+    heartbeat_at: Optional[str]
+    lease_expires_at: Optional[str]
+    recovery_state: Optional[str]
+    recovery_attempts: Optional[int]
+    write_capable: bool = False
     task_id: Optional[int]
     status: str
     execution_type: Optional[str]
@@ -344,7 +429,7 @@ class TaskMemoryResponse(BaseModel):
 class SeoAuditRequest(BaseModel):
     """Body for POST /runs/{run_id}/seo-audit."""
 
-    days: int = 28
+    days: int = Field(default=28, ge=1, le=365)
 
 
 class WebflowProposalCreate(BaseModel):

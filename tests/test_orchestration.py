@@ -102,7 +102,8 @@ def mock_run_agent_prompt():
         _make_exec_result(_with_summary(
             "Published item 123.\n<!-- CHANGE_LOG\n"
             '{"url": "https://example.com/no-code-automation-guide", "field": "publish", "before": null, "after": "published"}\n'
-            "-->",
+            "-->\n"
+            '```json\n{"webflow_proposal":{"operation":"publish","resource_id":"item-123","snapshot":{"id":"item-123","version":1},"payload":{}}}\n```',
             "Item is live.",
         ), "s3"),
         _make_exec_result("Analysis complete. No ranking data yet.", "s4"),
@@ -376,9 +377,9 @@ class TestAPIRouting:
 
 class TestFullOrchestration:
     @pytest.mark.asyncio
-    async def test_happy_path_all_phases_complete(self, mock_run_agent_prompt):
+    async def test_happy_path_pauses_for_webflow_approval(self, mock_run_agent_prompt):
         """
-        All 4 phases run. OrchestrationStateModel.status='completed'.
+        The publisher proposal pauses the campaign before the analyst runs.
         Each child AgentRunModel has parent_run_id set.
         phase_outputs_json contains all 4 phase keys.
         """
@@ -408,23 +409,23 @@ class TestFullOrchestration:
             await run_campaign_orchestration(db, parent_task, orch_run)
             db.refresh(orch_run)
 
-            # Orchestrator run should be completed
-            assert orch_run.status == "completed"
+            # Orchestrator run should wait for the stored Webflow proposal
+            assert orch_run.status == "awaiting_approval"
 
-            # OrchestrationStateModel should exist and be completed
+            # OrchestrationStateModel should also wait for approval
             state = db.query(main_module.OrchestrationStateModel).filter(
                 main_module.OrchestrationStateModel.orchestrator_run_id == orch_run.run_id
             ).first()
             assert state is not None
-            assert state.status == "completed"
+            assert state.status == "awaiting_approval"
 
-            # All 4 phases should appear in phase_outputs
+            # The first three phases should appear in phase_outputs
             phase_outputs = json.loads(state.phase_outputs_json)
-            assert set(phase_outputs.keys()) == {"researcher", "content_writer", "publisher", "analyst"}
+            assert set(phase_outputs.keys()) == {"researcher", "content_writer", "publisher"}
 
             # Child runs should have parent_run_id set
             child_run_ids = json.loads(state.child_run_ids_json)
-            assert len(child_run_ids) == 4
+            assert len(child_run_ids) == 3
             for child_run_id in child_run_ids:
                 child_run = db.query(main_module.AgentRunModel).filter(
                     main_module.AgentRunModel.run_id == child_run_id
@@ -466,8 +467,8 @@ class TestFullOrchestration:
             db.refresh(orch_run)
             db.refresh(parent_task)
 
-            # Orchestrator run should be failed/blocked
-            assert orch_run.status in ("failed", "blocked")
+            # A draft-writer failure is an uncertain write and needs review.
+            assert orch_run.status == "review_required"
 
             # Parent task should be blocked
             assert parent_task.status == "blocked"
@@ -477,7 +478,7 @@ class TestFullOrchestration:
                 main_module.OrchestrationStateModel.orchestrator_run_id == orch_run.run_id
             ).first()
             assert state is not None
-            assert state.status == "error"
+            assert state.status == "review_required"
 
             # Only researcher output should have been captured
             phase_outputs = json.loads(state.phase_outputs_json)
@@ -895,8 +896,6 @@ class TestSDKResultHardening:
     def test_normalize_unknown_type_logs_and_wraps(self):
         """An unexpected result type is logged and converted to a safe wrapper."""
         from agent.api.main import _normalize_execution_result
-        import logging
-
         unknown = {"type": "unexpected_sdk_event", "data": "something"}
         with patch("agent.api.helpers.logger") as mock_logger:
             result = _normalize_execution_result(unknown)
@@ -920,11 +919,10 @@ class TestSDKResultHardening:
 
 class TestApprovalResume:
     @pytest.mark.asyncio
-    async def test_resume_after_approval_completes_campaign(self, mock_run_agent_prompt):
+    async def test_resume_after_approval_reaches_webflow_proposal(self, mock_run_agent_prompt):
         """
-        First call pauses at the publisher approval gate. After approved_at is
-        set, resume=True finishes the campaign on the same orchestrator run
-        without re-running the plan agent.
+        After the parent campaign approval, resume=True runs the publisher and
+        pauses on its stored Webflow proposal without re-running the plan agent.
         """
         import agent.api.main as main_module
         from agent.orchestrator import run_campaign_orchestration
@@ -967,13 +965,11 @@ class TestApprovalResume:
             db.refresh(orch_run)
             db.refresh(parent_task)
             db.refresh(state)
-            assert orch_run.status == "completed"
-            assert state.status == "completed"
+            assert orch_run.status == "awaiting_approval"
+            assert state.status == "awaiting_approval"
 
             phase_outputs = json.loads(state.phase_outputs_json)
-            assert set(phase_outputs.keys()) == {
-                "researcher", "content_writer", "publisher", "analyst",
-            }
+            assert set(phase_outputs.keys()) == {"researcher", "content_writer", "publisher"}
             # Same run — no new orchestrator run was created
             runs = db.query(main_module.AgentRunModel).filter(
                 main_module.AgentRunModel.task_id == parent_task.id,
