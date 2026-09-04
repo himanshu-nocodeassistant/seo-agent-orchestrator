@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Optional
 from uuid import uuid4
 
-from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
 
 from agent import db as db_module
@@ -77,7 +76,7 @@ def add_task_comment(db, task_id: int, body: str, author: str = "agent") -> Comm
 
 def add_task_started_comment(db, task_id: int, task_title: str) -> CommentModel:
     """Add a comment when task execution starts."""
-    comment_body = f"🤖 Task started by agent"
+    comment_body = "🤖 Task started by agent"
     return add_task_comment(db, task_id, comment_body, "agent")
 
 
@@ -279,12 +278,33 @@ def _run_response(run) -> dict:
         "finished_at": run.finished_at,
     }
 
+_SENSITIVE_LOG_KEYS = {
+    "access_token", "api_key", "authorization", "password", "secret",
+    "session_id", "token", "private_key",
+}
+_MAX_LOG_STRING = 1000
+
+
+def _safe_log_value(value):
+    """Keep audit metadata useful without storing secrets or large content."""
+    if isinstance(value, dict):
+        return {
+            key: "[redacted]" if key.lower() in _SENSITIVE_LOG_KEYS else _safe_log_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_safe_log_value(item) for item in value]
+    if isinstance(value, str) and len(value) > _MAX_LOG_STRING:
+        return value[:_MAX_LOG_STRING] + "[truncated]"
+    return value
+
+
 def _log_run_event(db, run_id: str, event_type: str, payload: Optional[dict] = None) -> None:
     db.add(
         RunEventModel(
             run_id=run_id,
             event_type=event_type,
-            payload=json.dumps(payload or {}, ensure_ascii=False),
+            payload=json.dumps(_safe_log_value(payload or {}), ensure_ascii=False),
             created_at=_utcnow_iso(),
         )
     )
@@ -600,7 +620,9 @@ async def process_one_comment_action() -> dict:
                 prompt_context = _resolve_prompt_context(db, run, task, [comment], workflow_prompt, profile)
                 run.prompt_text = workflow_prompt
                 _mark_run_started(db, run, prompt_context, profile.execution_type, resume_session_id)
-                config = _build_runtime_config(profile, resume_session_id)
+                config = _build_runtime_config(
+                    profile, resume_session_id, db=db, run_id=run.run_id
+                )
                 execution = _normalize_execution_result(await _run_agent_prompt(workflow_prompt, config, prompt_context))
                 validation = ValidationResult(
                     status="passed" if execution.result_text and execution.result_text.strip() else "failed",

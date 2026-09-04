@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from datetime import datetime
@@ -271,9 +272,10 @@ async def _dispatch_phase(
     campaign_goal: str,
     helpers: dict,
     phase_has_dependents: bool,
-) -> tuple[str, str, bool]:
+) -> tuple[str, str, bool, bool]:
     """
-    Run a single child agent phase and return (phase_name, result_text, degraded).
+    Run a single child agent phase and return (phase_name, result_text, degraded,
+    awaiting_webflow_approval).
 
     ``degraded`` is True when the phase had downstream dependents but its final
     output still lacked a ``## Summary for Next Phase`` block after one
@@ -285,8 +287,9 @@ async def _dispatch_phase(
     phases never share/interleave a SQLAlchemy session (the PostToolUse hook
     and run/task writes all go through the phase-local session).
     """
-    from agent.db import SessionLocal, TaskModel
+    from agent.db import SessionLocal, TaskModel, WebflowProposalModel
     from agent.runtime_profiles import get_execution_profile
+    from agent.webflow.proposal_parser import extract_webflow_proposal
 
     phase_name = phase_spec["phase"]
     child_exec_type = phase_spec.get("execution_type", phase_name)
@@ -365,16 +368,45 @@ async def _dispatch_phase(
             raise RuntimeError(
                 f"Phase [{phase_name}] output failed validation: {child_validation.message}"
             )
+        proposal_data = None
+        if child_profile.requires_webflow_approval and os.environ.get("WEBFLOW_ACCESS_TOKEN"):
+            proposal_data = extract_webflow_proposal(result_text)
+            if proposal_data is None:
+                raise RuntimeError(
+                    f"Phase [{phase_name}] did not return a complete Webflow proposal."
+                )
         helpers["_finalize_run_success"](
             phase_db, child_run, child_task,
             result_text,
             session_id,
             child_validation,
         )
+        awaiting_webflow_approval = proposal_data is not None
+        if proposal_data is not None:
+            now = datetime.utcnow().isoformat()
+            phase_db.add(
+                WebflowProposalModel(
+                    task_id=child_task.id,
+                    run_id=child_run.run_id,
+                    operation=proposal_data["operation"],
+                    resource_id=proposal_data.get("resource_id"),
+                    idempotency_key=child_run.run_id,
+                    snapshot_json=json.dumps(proposal_data["snapshot"], ensure_ascii=False),
+                    payload_json=json.dumps(proposal_data["payload"], ensure_ascii=False),
+                    status="pending_approval",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            child_task.status = "blocked"
+            child_run.status = "awaiting_approval"
+            child_run.validator_status = "pending_approval"
+            child_task.updated_at = now
+            phase_db.commit()
         helpers["_refresh_context_view"](phase_db, task_id=child_task.id)
 
         degraded = phase_has_dependents and _extract_summary_block(result_text) is None
-        return phase_name, result_text, degraded
+        return phase_name, result_text, degraded, awaiting_webflow_approval
     finally:
         phase_db.close()
 
@@ -498,7 +530,9 @@ async def run_campaign_orchestration(
     # ── Fresh run: orchestrator produces plan ────────────────────────────────
     else:
         orch_profile = get_execution_profile("orchestrate_seo_campaign")
-        orch_config = helpers_module._build_runtime_config(orch_profile, None)
+        orch_config = helpers_module._build_runtime_config(
+            orch_profile, None, db=db, run_id=orchestrator_run.run_id
+        )
 
         orch_prompt_context = helpers_module._resolve_prompt_context(
             db, orchestrator_run, parent_task, [], "", orch_profile
@@ -634,6 +668,7 @@ async def run_campaign_orchestration(
         # Check for failures (fail-fast)
         failed_phase = None
         failed_error = None
+        awaiting_phase = None
         for phase_spec, result in zip(pending_in_tier, tier_results):
             if isinstance(result, BaseException):
                 failed_phase = phase_spec["phase"]
@@ -651,7 +686,7 @@ async def run_campaign_orchestration(
                     db, child_task.id, str(failed_error)
                 )
             else:
-                phase_name, result_text, degraded = result
+                phase_name, result_text, degraded, awaiting_webflow_approval = result
                 phase_outputs[phase_name] = result_text
                 child_run_ids.append(
                     _get_latest_run_id_for_task(
@@ -672,6 +707,8 @@ async def run_campaign_orchestration(
                         "the next agent will receive a truncated handoff.",
                         "agent",
                     )
+                if awaiting_webflow_approval and awaiting_phase is None:
+                    awaiting_phase = phase_name
 
         state.phase_outputs_json = json.dumps(phase_outputs)
         state.child_run_ids_json = json.dumps(child_run_ids)
@@ -691,6 +728,23 @@ async def run_campaign_orchestration(
             helpers_module.add_task_failed_comment(
                 db, parent_task.id,
                 f"Campaign stopped at phase [{failed_phase}]: {failed_error}",
+            )
+            return
+
+        if awaiting_phase is not None:
+            state.status = "awaiting_approval"
+            state.current_phase = awaiting_phase
+            state.updated_at = datetime.utcnow().isoformat()
+            parent_task.status = "blocked"
+            parent_task.updated_at = state.updated_at
+            orchestrator_run.status = "awaiting_approval"
+            orchestrator_run.validator_status = "pending_approval"
+            db.commit()
+            helpers_module.add_task_comment(
+                db,
+                parent_task.id,
+                f"Campaign paused at phase [{awaiting_phase}] — Webflow proposal ready for approval.",
+                "agent",
             )
             return
 

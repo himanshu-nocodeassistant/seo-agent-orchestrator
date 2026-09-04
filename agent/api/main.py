@@ -12,7 +12,7 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime  # noqa: F401 - compatibility export used by legacy callers
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -27,7 +27,7 @@ from agent.api.helpers import (
     comment_autopilot_lock,
     process_one_comment_action,
 )
-from agent.api.rate_limit import _rate_limit_value, limiter
+from agent.api.rate_limit import _rate_limit_value, limiter  # noqa: F401 - compatibility export
 from agent.api.routers import automation, comments, runs, tasks
 from agent.db import _ensure_orchestration_handoff_column
 
@@ -112,15 +112,22 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins(),
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Actor"],
 )
 
 
 @app.middleware("http")
 async def _api_token_check(request: Request, call_next):
-    """Optional bearer-token gate. Enabled only when API_TOKEN is set."""
+    """Protect the API and fail closed for production approval routes."""
     token = os.environ.get("API_TOKEN")
+    app_env = os.environ.get("APP_ENV", "production").strip().lower()
+    approval_route = "/webflow-proposals" in request.url.path
+    if approval_route and not token and app_env not in {"test", "local", "development"}:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "API_TOKEN must be configured for approval routes"},
+        )
     if token:
         expected = f"Bearer {token}"
         if request.headers.get("Authorization") != expected:
@@ -181,11 +188,8 @@ from agent.api.helpers import (  # noqa: E402,F401
     build_post_tool_use_hook,
     extract_agent_comment_instruction,
     is_agent_trigger_comment,
-    process_one_comment_action,
     _acquire_next_comment_action,
     _agent_execution_timeout_seconds,
-    _autopilot_enabled,
-    _autopilot_interval_seconds,
     _build_runtime_config,
     _campaign_timeout_seconds,
     _create_run,
@@ -226,6 +230,10 @@ from agent.db import (  # noqa: E402,F401
     TaskSessionModel,
     TaskStatus,
     TaskUpdate,
+    WebflowProposalCreate,
+    WebflowProposalModel,
+    WebflowProposalReject,
+    WebflowProposalResponse,
     engine,
     get_db,
     get_db_session,

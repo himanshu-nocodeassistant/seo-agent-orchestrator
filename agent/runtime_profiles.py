@@ -19,6 +19,11 @@ WEBFLOW_TOOLS = [
     "mcp__webflow__publish_cms_item",
     "mcp__webflow__get_collection_info",
 ]
+WEBFLOW_READ_TOOLS = [
+    "mcp__webflow__list_cms_items",
+    "mcp__webflow__get_cms_item",
+    "mcp__webflow__get_collection_info",
+]
 # Read-only GSC tools — safe to include in any profile that reads web data
 GSC_TOOLS = [
     "mcp__gsc__gsc_query_search_analytics",
@@ -47,6 +52,7 @@ class ExecutionProfile:
     should_resume_session: bool = True
     procedural_tags: list[str] = field(default_factory=list)
     requires_approval: bool = False
+    requires_webflow_approval: bool = False
 
 
 def _validate_non_empty(output: str) -> ValidationResult:
@@ -170,6 +176,7 @@ def _profile(
     should_resume_session: bool = True,
     procedural_tags: Optional[list[str]] = None,
     requires_approval: bool = False,
+    requires_webflow_approval: bool = False,
 ) -> ExecutionProfile:
     return ExecutionProfile(
         execution_type=execution_type,
@@ -184,13 +191,14 @@ def _profile(
         should_resume_session=should_resume_session,
         procedural_tags=procedural_tags or [],
         requires_approval=requires_approval,
+        requires_webflow_approval=requires_webflow_approval,
     )
 
 
 PROFILE_REGISTRY: dict[str, ExecutionProfile] = {
     "rewrite_title": _profile(
         "rewrite_title",
-        allowed_tools=EDIT_ALLOWED_TOOLS + WEBFLOW_TOOLS,
+        allowed_tools=EDIT_ALLOWED_TOOLS + WEBFLOW_READ_TOOLS,
         max_turns=10,
         max_budget_usd=1.5,
         timeout_seconds=300,
@@ -199,10 +207,11 @@ PROFILE_REGISTRY: dict[str, ExecutionProfile] = {
         semantic_char_limit=2200,
         validator=_with_change_log(_validate_rewrite_title),
         procedural_tags=["brand-voice", "title-rewrite"],
+        requires_webflow_approval=True,
     ),
     "rewrite_meta_desc": _profile(
         "rewrite_meta_desc",
-        allowed_tools=EDIT_ALLOWED_TOOLS + WEBFLOW_TOOLS,
+        allowed_tools=EDIT_ALLOWED_TOOLS + WEBFLOW_READ_TOOLS,
         max_turns=10,
         max_budget_usd=1.5,
         timeout_seconds=300,
@@ -211,10 +220,11 @@ PROFILE_REGISTRY: dict[str, ExecutionProfile] = {
         semantic_char_limit=2200,
         validator=_with_change_log(_validate_rewrite_meta_desc),
         procedural_tags=["brand-voice", "meta-description"],
+        requires_webflow_approval=True,
     ),
     "rewrite_h1": _profile(
         "rewrite_h1",
-        allowed_tools=EDIT_ALLOWED_TOOLS + WEBFLOW_TOOLS,
+        allowed_tools=EDIT_ALLOWED_TOOLS + WEBFLOW_READ_TOOLS,
         max_turns=10,
         max_budget_usd=1.5,
         timeout_seconds=300,
@@ -223,10 +233,11 @@ PROFILE_REGISTRY: dict[str, ExecutionProfile] = {
         semantic_char_limit=2200,
         validator=_with_change_log(_validate_rewrite_h1),
         procedural_tags=["brand-voice", "heading-rewrite"],
+        requires_webflow_approval=True,
     ),
     "blog_write": _profile(
         "blog_write",
-        allowed_tools=EDIT_ALLOWED_TOOLS + WEBFLOW_TOOLS,
+        allowed_tools=EDIT_ALLOWED_TOOLS + WEBFLOW_READ_TOOLS,
         max_turns=18,
         max_budget_usd=4.0,
         timeout_seconds=900,
@@ -235,10 +246,11 @@ PROFILE_REGISTRY: dict[str, ExecutionProfile] = {
         semantic_char_limit=3500,
         validator=_with_change_log(_validate_blog_write),
         procedural_tags=["brand-voice", "copywriting", "publishable-output"],
+        requires_webflow_approval=True,
     ),
     "rewrite_blog_content": _profile(
         "rewrite_blog_content",
-        allowed_tools=EDIT_ALLOWED_TOOLS + WEBFLOW_TOOLS,
+        allowed_tools=EDIT_ALLOWED_TOOLS + WEBFLOW_READ_TOOLS,
         max_turns=18,
         max_budget_usd=4.0,
         timeout_seconds=900,
@@ -247,10 +259,11 @@ PROFILE_REGISTRY: dict[str, ExecutionProfile] = {
         semantic_char_limit=3500,
         validator=_with_change_log(_validate_non_empty),
         procedural_tags=["brand-voice", "copy-editing", "content-rewrite"],
+        requires_webflow_approval=True,
     ),
     "webflow_publish": _profile(
         "webflow_publish",
-        allowed_tools=EDIT_ALLOWED_TOOLS + WEBFLOW_TOOLS,
+        allowed_tools=EDIT_ALLOWED_TOOLS + WEBFLOW_READ_TOOLS,
         max_turns=8,
         max_budget_usd=1.0,
         timeout_seconds=240,
@@ -259,10 +272,11 @@ PROFILE_REGISTRY: dict[str, ExecutionProfile] = {
         semantic_char_limit=1200,
         validator=_with_change_log(_validate_non_empty),
         procedural_tags=["publish"],
+        requires_webflow_approval=True,
     ),
     "internal_links": _profile(
         "internal_links",
-        allowed_tools=EDIT_ALLOWED_TOOLS + WEBFLOW_TOOLS,
+        allowed_tools=EDIT_ALLOWED_TOOLS + WEBFLOW_READ_TOOLS,
         max_turns=14,
         max_budget_usd=2.5,
         timeout_seconds=600,
@@ -271,6 +285,7 @@ PROFILE_REGISTRY: dict[str, ExecutionProfile] = {
         semantic_char_limit=2800,
         validator=_with_change_log(_validate_non_empty),
         procedural_tags=["brand-voice", "internal-linking"],
+        requires_webflow_approval=True,
     ),
     "research": _profile(
         "research",
@@ -389,7 +404,7 @@ PROFILE_REGISTRY: dict[str, ExecutionProfile] = {
     ),
     "campaign_publisher": _profile(
         "campaign_publisher",
-        allowed_tools=BASE_ALLOWED_TOOLS + WEBFLOW_TOOLS,  # read + publish; no Write/Edit
+        allowed_tools=BASE_ALLOWED_TOOLS + WEBFLOW_READ_TOOLS,
         max_turns=8,
         max_budget_usd=1.5,
         timeout_seconds=300,
@@ -399,6 +414,7 @@ PROFILE_REGISTRY: dict[str, ExecutionProfile] = {
         validator=_with_change_log(_validate_non_empty),
         procedural_tags=["publish", "campaign"],
         requires_approval=True,
+        requires_webflow_approval=True,
     ),
     "campaign_analyst": _profile(
         "campaign_analyst",
