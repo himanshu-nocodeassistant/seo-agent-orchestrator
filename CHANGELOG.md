@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Webflow write approvals** — Webflow-capable profiles are read-only and return complete create/update/publish proposals. The Kanban UI and API support approve/reject, stale snapshot checks, duplicate-slug checks, idempotency, batch retry, and campaign publisher handoff.
+- **Profile and audit safeguards** — Webflow writes have a server-side guard, approval routes fail closed without `API_TOKEN` outside explicit local/test modes, and audit payloads redact secrets and bound log-only strings.
+
 ## [2.3.0] - 2026-08-05
 
 ### Added

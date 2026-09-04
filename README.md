@@ -44,7 +44,7 @@ A four-layer memory system feeds every prompt:
 - **Comment Autopilot** — background worker that picks up `@agent` comments and re-runs the agent automatically
 - **Run tracking** — every execution is recorded with status, session ID, validator result, and a result summary; child campaign runs link back to the orchestrator run via `parent_run_id`
 - **Session reuse** — the agent resumes the same Claude session for follow-up runs on a task, preserving context
-- **Webflow CMS** — create, update, and publish CMS items directly via the agent
+- **Webflow CMS** — agents read CMS items and propose changes; the API applies create, update, and publish actions after approval
 - **Google Docs** — save audit reports and blog drafts to Google Docs (read/write only — no delete)
 - **Google Search Console** — query live clicks, impressions, CTR, and position; inspect URL indexing status; list sitemaps (read-only)
 - **SEO Feedback Loop** — log CMS changes, review ranking impact using GSC data, extract learnings, propagate winning patterns
@@ -78,7 +78,7 @@ claude  # completes OAuth on first run
    cp .env.example .env
    ```
 
-3. **(Optional) Webflow** — add `WEBFLOW_ACCESS_TOKEN`, `WEBFLOW_SITE_ID`, `WEBFLOW_COLLECTION_ID` to `.env`. Webflow CMS tools are enabled automatically when these are set.
+3. **(Optional) Webflow** — add `WEBFLOW_ACCESS_TOKEN`, `WEBFLOW_SITE_ID`, `WEBFLOW_COLLECTION_ID` to `.env`. Agents receive read access automatically. Webflow writes require an approved proposal.
 
 4. **(Optional) Google Docs / Search Console** — place your Google Service Account JSON in `google-sa-credentials/` (gitignored), then set `GOOGLE_DOCS_CREDENTIALS_PATH` in `.env`. For Search Console, also set `GSC_SITE_URL` (e.g. `sc-domain:example.com`). The same service account covers both — just grant it access to your GSC property in Search Console → Settings → Users and permissions.
 
@@ -121,7 +121,7 @@ asyncio.run(main())
 
 ## Business guardrails by default
 
-- **Human approval before publishing** — `campaign_publisher` phases pause until a person sets `approved_at`; the campaign resumes from where it stopped (no re-planning, no double-billing).
+- **Human approval before publishing** — campaigns first require parent approval, then show the exact Webflow proposal for approval. The campaign resumes from where it stopped (no re-planning, no double-billing).
 - **Spend is bounded** — every execution profile has a max budget and turn limit, API rate limits cap cost-triggering endpoints, and DataForSEO pulls track real billed cost per run.
 - **Nothing ships unverified** — outputs must pass a structured validator (grounded research requires cited URLs; CMS changes require a machine-readable change log) before a run is marked complete.
 - **Published changes are attributable** — the SEO Feedback Loop correlates CMS changes with GSC ranking data so you can see what actually worked.
@@ -152,7 +152,7 @@ Copy `.env.example` to `.env` and fill in the values you need.
 | `COMMENT_AUTOPILOT_INTERVAL_SECONDS` | Poll interval for comment autopilot | `900` |
 | `AGENT_EXECUTION_TIMEOUT_SECONDS` | Timeout per agent execution | `900` |
 | `ALLOWED_ORIGINS` | Comma-separated CORS origins for the local API | `http://localhost:8000,http://127.0.0.1:8000` |
-| `API_TOKEN` | Optional bearer token; when set every request needs `Authorization: Bearer <token>` | unset |
+| `API_TOKEN` | Bearer token; required for approval routes unless `APP_ENV` is explicitly `local`, `development`, or `test`. When set, every request needs `Authorization: Bearer <token>` | unset |
 | `API_RATE_LIMIT_EXECUTE` | Per-minute rate limit on endpoints that start paid agent runs | `5/minute` |
 | `WEBFLOW_ACCESS_TOKEN` | Webflow API token | unset |
 | `WEBFLOW_SITE_ID` | Webflow site ID | unset |
@@ -170,13 +170,13 @@ Each task type maps to an `ExecutionProfile` in `agent/runtime_profiles.py` that
 
 | Profile | Max Turns | Budget | Timeout | Notes |
 |---------|-----------|--------|---------|-------|
-| `rewrite_title` | 10 | $1.50 | 5 min | Writes to Webflow, validates CHANGE_LOG block |
-| `rewrite_meta_desc` | 10 | $1.50 | 5 min | Writes to Webflow |
-| `rewrite_h1` | 10 | $1.50 | 5 min | Writes to Webflow |
-| `blog_write` | 18 | $4.00 | 15 min | Full post, validates title/slug/word count |
-| `rewrite_blog_content` | 18 | $4.00 | 15 min | Rewrites existing content |
-| `webflow_publish` | 8 | $1.00 | 4 min | Publishes staged items |
-| `internal_links` | 14 | $2.50 | 10 min | Adds internal links across pages |
+| `rewrite_title` | 10 | $1.50 | 5 min | Proposes a Webflow update; validates CHANGE_LOG block |
+| `rewrite_meta_desc` | 10 | $1.50 | 5 min | Proposes a Webflow update |
+| `rewrite_h1` | 10 | $1.50 | 5 min | Proposes a Webflow update |
+| `blog_write` | 18 | $4.00 | 15 min | Proposes a CMS item; validates title/slug/word count |
+| `rewrite_blog_content` | 18 | $4.00 | 15 min | Proposes a content update |
+| `webflow_publish` | 8 | $1.00 | 4 min | Proposes publishing a staged item |
+| `internal_links` | 14 | $2.50 | 10 min | Proposes batch updates across pages |
 | `research` | 12 | $2.00 | 8 min | Read-only + GSC; produces structured report |
 | `alt_text` | 8 | $1.00 | 4 min | Read-only; produces alt text recommendations |
 | `update_schema` | 10 | $1.50 | 5 min | Produces JSON-LD blocks for manual paste |
@@ -184,8 +184,8 @@ Each task type maps to an `ExecutionProfile` in `agent/runtime_profiles.py` that
 | `manual` | 8 | $1.00 | 4 min | Fallback for unknown types |
 | `orchestrate_seo_campaign` | 6 | $1.00 | 3 min | Produces JSON plan; no session reuse |
 | `campaign_researcher` | 14 | $2.50 | 10 min | Read-only + GSC |
-| `campaign_content_writer` | 18 | $4.00 | 15 min | Write + Webflow; validates blog output |
-| `campaign_publisher` | 8 | $1.50 | 5 min | Webflow publish; validates CHANGE_LOG |
+| `campaign_draft_writer` | 18 | $4.00 | 15 min | File edits only; validates blog output |
+| `campaign_publisher` | 8 | $1.50 | 5 min | Read-only Webflow access; returns a publish proposal |
 | `campaign_analyst` | 16 | $3.00 | 12 min | Read-only + GSC; no session reuse |
 
 ## Memory System
@@ -221,6 +221,9 @@ seo-agent-orchestrator/
 │   │   ├── routers/          # tasks, comments, runs, automation routers
 │   │   └── static/           # kanban.html board
 │   ├── webflow/              # Webflow CMS MCP integration
+│   │   ├── approvals.py      # Proposal state and snapshot rules
+│   │   ├── proposal_parser.py# Extracts complete proposals from agent output
+│   │   └── text_safety.py    # Fences notes and preserves full text
 │   ├── google_docs/          # Google Docs MCP integration
 │   └── gsc/                  # Google Search Console MCP integration (read-only)
 ├── memory/                   # Persistent site context (gitignored except seo-strategy.md)
@@ -264,6 +267,36 @@ API tests use an in-memory SQLite database automatically — no production DB is
 | `POST` | `/tasks/{id}/comments` | Add comment |
 | `POST` | `/automation/comments/process-one` | Manually trigger one autopilot cycle |
 | `GET` | `/orchestrations/{run_id}` | Campaign state, phase outputs, child tasks |
+| `GET` | `/tasks/{id}/webflow-proposals` | List complete Webflow proposals |
+| `POST` | `/tasks/{id}/webflow-proposals` | Create a pending proposal; never writes to Webflow |
+| `POST` | `/tasks/{id}/webflow-proposals/{proposal_id}/approve` | Re-check and apply one proposal |
+| `POST` | `/tasks/{id}/webflow-proposals/{proposal_id}/reject` | Reject one proposal |
+
+## Webflow approval flow
+
+Webflow write profiles are proposal-only:
+
+```text
+Agent reads Webflow
+      ↓
+Agent returns the full proposal
+      ↓
+API stores pending_approval
+      ↓
+User approves or rejects in Kanban
+      ↓
+API re-reads Webflow and checks the saved snapshot
+      ↓
+API applies the exact payload, once
+```
+
+The SDK receives a per-profile tool allowlist. Webflow write tools are absent from
+agent profiles. The write functions also reject calls without approved proposal
+context. Prompts are guidance only; the allowlist and server checks enforce the rule.
+
+For campaigns, `campaign_publisher` is a child profile, not a separate agent class.
+The orchestrator pauses after it stores the child's Webflow proposal. Approve that
+proposal, then resume the parent campaign.
 
 ## Troubleshooting
 
@@ -300,8 +333,10 @@ Phases with downstream dependents must end with a `## Summary for Next Phase` bl
 **5. Unknown SDK result types get logged but not alerted.**
 If the SDK ships a new event type we don't handle, we log a warning and wrap it gracefully — nothing crashes. But in production that warning would be invisible. Wire the logger to Sentry or Datadog if you care about SDK contract changes.
 
-**6. Tool scopes are enforced by convention, not by code.**
-Each agent profile explicitly lists what tools it can use. But there's no startup check that prevents someone from accidentally giving a read-only agent write access. Tests catch it, code review should catch it. For production, add an assertion at boot that validates profiles against their declared tiers.
+**6. Tool scopes use two runtime checks.**
+Each run receives the allowlist from its execution profile through the Claude SDK.
+Webflow mutation functions also require approved proposal context. Tests protect the
+profile definitions. A future change can add a startup assertion for profile tiers.
 
 **7. Retry has no circuit breaker.**
 If Claude's API goes down completely, each phase retries independently — you get 3 attempts per phase but no shared "stop trying" signal across phases. For one campaign at a time this is fine. At scale you'd want a circuit breaker so once you've confirmed the API is down, everything fails fast instead of hammering it.

@@ -31,7 +31,7 @@ keep business impact in mind when choosing between "expedient" and "correct".
 - `agent/seo_agent.py` - Main SEOAgent class using Claude Agent SDK; returns `AgentExecutionResult`
 - `agent/config.py` - Configuration dataclass (AgentConfig); exports `PROJECT_ROOT`; supports `SEO_AGENT_CWD` env var and `max_thinking_tokens`
 - `agent/memory_service.py` - Layered memory composition: builds `ShortTermContext`, `EpisodicContext`, `SemanticContext`, `ProceduralContext` into a `ComposedPromptContext` for prompt injection
-- `agent/runtime_profiles.py` - `ExecutionProfile` registry; maps each execution type to tool policy, budget, timeout, turn limit, validator, semantic char limits, and `requires_approval` flag
+- `agent/runtime_profiles.py` - `ExecutionProfile` registry; maps each execution type to tool policy, budget, timeout, turn limit, validator, semantic char limits, and approval flags (`requires_approval`, `requires_webflow_approval`)
 - `agent/orchestrator.py` - Multi-agent campaign dispatch loop; DAG tier resolution (`_resolve_execution_tiers`), structured inter-agent handoffs (`_extract_summary_block`), retry with backoff (`_run_with_retry`), parallel execution via `asyncio.gather`
 - `agent/db.py` - SQLAlchemy engine, session factory, ORM models, and Pydantic API schemas (WAL + busy_timeout enabled for SQLite)
 - `agent/prompts.py` - Workflow prompts per execution type (`build_execution_prompt`)
@@ -56,12 +56,13 @@ Trigger: create a Kanban task with `execution_type = "orchestrate_seo_campaign"`
 3. Child `TaskModel` rows are created (one per phase, with `parent_task_id` set)
 4. Tiers execute sequentially; phases within a tier run concurrently via `asyncio.gather`
    - Each phase runs on its **own DB session** (closed in `finally`), so concurrent phases never share/interleave a SQLAlchemy session
-5. **Approval gate**: before dispatching any phase whose `ExecutionProfile.requires_approval=True`, the orchestrator checks `parent_task.approved_at`. If unset, sets `state.status='awaiting_approval'` and halts. Campaign resumes when `approved_at` is set via `PATCH /tasks/{id}`.
+5. **Campaign approval gate**: before dispatching any phase whose `ExecutionProfile.requires_approval=True`, the orchestrator checks `parent_task.approved_at`. If unset, sets `state.status='awaiting_approval'` and halts. Campaign resumes when `approved_at` is set via `PATCH /tasks/{id}`.
    - **Resume is explicit**: `POST /tasks/{id}/execute?resume=true` (or the Resume button in the UI) continues the SAME orchestrator run — the plan is not regenerated and completed phases are not re-run.
-6. Each phase agent receives prior outputs via structured `## Summary for Next Phase` blocks (falls back to 1500-char truncation)
+6. **Webflow proposal gate**: profiles with `requires_webflow_approval=True` receive Webflow read tools only. They return a complete proposal. The API stores it, pauses the campaign, and applies it only after user approval and a fresh snapshot check.
+7. Each phase agent receives prior outputs via structured `## Summary for Next Phase` blocks (falls back to 1500-char truncation)
    - Phases with downstream dependents get ONE correction retry when the block is missing; if still missing, `handoff_degraded` is recorded in the orchestration state (`handoff_degraded_json`) plus a warning comment
-7. `OrchestrationStateModel` persists state: plan JSON, current phase, all phase outputs, child run IDs, and final status (`running | awaiting_approval | completed | error`)
-8. All child `AgentRunModel` rows carry `parent_run_id` pointing to the orchestrator run
+8. `OrchestrationStateModel` persists state: plan JSON, current phase, all phase outputs, child run IDs, and final status (`running | awaiting_approval | completed | error`)
+9. All child `AgentRunModel` rows carry `parent_run_id` pointing to the orchestrator run
 
 **Phase plan schema** (what the orchestrator agent must output):
 ```json
@@ -92,7 +93,7 @@ Trigger: create a Kanban task with `execution_type = "orchestrate_seo_campaign"`
 
 **Plan validation:** every phase's `execution_type` is validated against the profile registry right after parsing — a bad plan fails fast with a clear error before any child task is created.
 
-**Approval gate:** `campaign_publisher` has `requires_approval=True`. The orchestrator halts before that tier and sets `state.status='awaiting_approval'`. Set `approved_at` on the parent task via the Kanban UI (PATCH) to resume.
+**Approval gates:** `campaign_publisher` has both `requires_approval=True` and `requires_webflow_approval=True`. The first gate allows the phase to run. The second gate stores the exact Webflow proposal and blocks the write until a user approves it. Approval routes require `API_TOKEN` unless the app is explicitly running in local, development, or test mode.
 
 **Grounding requirement:** `research` and `campaign_researcher` profiles carry the `grounding-required` procedural tag. The injected system prompt requires every factual claim to cite a source URL; the validator also checks for at least one `https://` URL in the output.
 
@@ -101,7 +102,7 @@ Trigger: create a Kanban task with `execution_type = "orchestrate_seo_campaign"`
 **Scalability boundaries** (annotated in source with `# Scalability note`):
 - `#1` — move `run_campaign_orchestration` call to a task queue (Celery/arq) for production; return 202 + polling
 - `#2` — swap SQLite for Postgres via `DATABASE_URL`; schema is unchanged
-- `#6` — child agent tool scopes are enforced in `runtime_profiles.py`; never expand via `EXECUTABLE_TYPES`
+- `#6` — child agent tool scopes are enforced by profile allowlists passed to the SDK plus Webflow write guards; never expand via `EXECUTABLE_TYPES`
 - `#8` — `_atomic_json_write` uses `os.replace()` (POSIX-atomic); add `fcntl.flock()` for multi-worker
 
 ## Technology Stack

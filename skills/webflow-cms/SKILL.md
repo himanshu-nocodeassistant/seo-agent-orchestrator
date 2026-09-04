@@ -39,16 +39,32 @@ Use this skill when the user wants to:
 
 ## Available Webflow Tools
 
-These tools are automatically available when Webflow is configured:
+These read tools are available to agents when Webflow is configured:
 
 | Tool | Purpose |
 |------|---------|
 | `mcp__webflow__list_cms_items` | List items in collection (supports pagination) |
 | `mcp__webflow__get_cms_item` | Get a single item by ID |
-| `mcp__webflow__create_cms_item` | Create new post |
-| `mcp__webflow__update_cms_item` | Update existing post |
-| `mcp__webflow__publish_cms_item` | Publish to live site |
 | `mcp__webflow__get_collection_info` | Get collection schema |
+
+---
+
+## Approval model
+
+Agents must not call Webflow write tools. For every create, update, or publish action:
+
+1. Read the current item or collection.
+2. Prepare the complete payload and current snapshot.
+3. Return this JSON block:
+
+```json
+{"webflow_proposal":{"operation":"update|create|publish","resource_id":"id or null","snapshot":{},"payload":{}}}
+```
+
+4. Wait for approval in Kanban or through the API.
+
+The server checks the snapshot again, then applies the exact payload. A changed item
+becomes stale and needs a new proposal.
 
 ---
 
@@ -57,7 +73,7 @@ These tools are automatically available when Webflow is configured:
 ### 1. Create a New Blog Post
 
 ```python
-# Use create_cms_item tool with fields:
+# Return these fields inside the proposal payload:
 {
     "name": "Post Title",
     "slug": "post-title-slug",
@@ -78,7 +94,7 @@ These tools are automatically available when Webflow is configured:
 
 ### 2. Update SEO Meta Tags
 
-Use `update_cms_item` with the item ID:
+Use the item ID and current snapshot in a proposal:
 ```python
 {
     "item_id": "69a1671821da0058e48b43b1",
@@ -113,14 +129,15 @@ get_cms_item(item_id="69a1671821da0058e48b43b1")
 ### 4. Publish to Live Site
 
 ```python
-# Publish a single item
-publish_cms_item(item_id="69a1671821da0058e48b43b1")
+# Publish a single item through an approved proposal
+{"operation":"publish","resource_id":"69a1671821da0058e48b43b1","snapshot":{},"payload":{}}
 ```
 
 **Workflow:**
-1. Create or update item (saved as draft by default)
-2. Test preview
-3. Use publish_cms_item to go live
+1. Return the complete create or update proposal.
+2. Review the preview.
+3. Approve the proposal to apply it.
+4. Return a separate publish proposal when it should go live.
 
 ---
 
@@ -202,6 +219,9 @@ WEBFLOW_ACCESS_TOKEN=your_token
 WEBFLOW_SITE_ID=your_site_id
 WEBFLOW_COLLECTION_ID=your_collection_id
 ```
+
+Configuration exposes read tools to agents. It does not grant agents permission to
+write. Webflow mutations use the approval API.
 
 Or programmatically:
 ```python
