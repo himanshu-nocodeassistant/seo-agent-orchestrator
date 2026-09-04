@@ -17,6 +17,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     create_engine,
     event,
 )
@@ -149,6 +150,61 @@ class AgentRunModel(Base):
     source_comment_id = Column(Integer, nullable=True, index=True)
     started_at = Column(String(20), default=lambda: _utcnow_iso())
     finished_at = Column(String(20), nullable=True)
+
+
+class RunLeaseModel(Base):
+    """Durable, fenced ownership record for work on one task.
+
+    There is at most one lease row per task.  The owner token and fence
+    version are both required for every mutation after acquisition.
+    """
+
+    __tablename__ = "run_leases"
+    __table_args__ = (UniqueConstraint("task_id", name="uq_run_leases_task"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, nullable=False, index=True)
+    run_id = Column(String(64), nullable=False, unique=True, index=True)
+    owner_token = Column(String(128), nullable=False)
+    fence_version = Column(Integer, nullable=False, default=1)
+    status = Column(String(30), nullable=False, default="active")
+    acquired_at = Column(DateTime, nullable=False)
+    heartbeat_at = Column(DateTime, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    released_at = Column(DateTime, nullable=True)
+
+
+class ExecuteRequestModel(Base):
+    """Durable idempotency record for a run-starting request."""
+
+    __tablename__ = "execute_requests"
+    __table_args__ = (
+        UniqueConstraint(
+            "request_scope", "idempotency_key", name="uq_execute_requests_scope_key"
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    request_scope = Column(String(255), nullable=False, index=True)
+    idempotency_key = Column(String(255), nullable=False)
+    fingerprint = Column(String(128), nullable=False)
+    task_id = Column(Integer, nullable=False, index=True)
+    run_id = Column(String(64), nullable=False, index=True)
+    created_at = Column(DateTime, nullable=False)
+
+
+class AuditRequestModel(Base):
+    """Exclusive idempotency record for one public SEO audit identifier."""
+
+    __tablename__ = "audit_requests"
+
+    id = Column(Integer, primary_key=True, index=True)
+    audit_id = Column(String(255), nullable=False, unique=True, index=True)
+    idempotency_key = Column(String(255), nullable=False)
+    fingerprint = Column(String(128), nullable=False)
+    task_id = Column(Integer, nullable=False, index=True)
+    run_id = Column(String(64), nullable=True, index=True)
+    created_at = Column(DateTime, nullable=False)
 
 
 class RunEventModel(Base):

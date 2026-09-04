@@ -474,6 +474,31 @@ let currentTasks = [];
 let detailTaskId = null;
 let activeTab = 'details';
 
+function createIdempotencyKey() {
+    if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
+        return globalThis.crypto.randomUUID();
+    }
+    return 'kanban-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+}
+
+function createRunRequest(url, options = {}) {
+    const idempotencyKey = createIdempotencyKey();
+    const requestOptions = {
+        ...options,
+        headers: { ...(options.headers || {}), 'Idempotency-Key': idempotencyKey },
+    };
+    return { idempotencyKey, send: () => fetch(url, requestOptions) };
+}
+
+async function sendRunRequest(request) {
+    try {
+        return await request.send();
+    } catch (error) {
+        // A transport retry is the same user action, so keep its key.
+        return request.send();
+    }
+}
+
 async function fetchTasks() {
     try {
         const r = await fetch(API_BASE + '/tasks?limit=200');
@@ -545,7 +570,8 @@ async function runAudit() {
     btn.disabled = true;
     label.textContent = 'Running…';
     try {
-        const r = await fetch(API_BASE + '/runs/audit-' + Date.now() + '/seo-audit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ days: 28 }) });
+        const request = createRunRequest(API_BASE + '/runs/audit-' + Date.now() + '/seo-audit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ days: 28 }) });
+        const r = await sendRunRequest(request);
         const d = await r.json();
         if (!r.ok) throw new Error(d.detail || r.statusText);
         showToast('Audit complete', 'success');
@@ -658,7 +684,8 @@ async function executeTask(id) {
     renderTasks(currentTasks);
     if (detailTaskId === id) closeDetailModal();
     try {
-        const r = await fetch(API_BASE + '/tasks/' + id + '/execute', { method: 'POST' });
+        const request = createRunRequest(API_BASE + '/tasks/' + id + '/execute', { method: 'POST' });
+        const r = await sendRunRequest(request);
         const d = await r.json();
         if (!r.ok) throw new Error(d.detail || r.statusText);
         showToast('Task executed', 'success');
@@ -673,7 +700,8 @@ async function resumeTask(id) {
     renderTasks(currentTasks);
     if (detailTaskId === id) closeDetailModal();
     try {
-        const r = await fetch(API_BASE + '/tasks/' + id + '/execute?resume=true', { method: 'POST' });
+        const request = createRunRequest(API_BASE + '/tasks/' + id + '/execute?resume=true', { method: 'POST' });
+        const r = await sendRunRequest(request);
         const d = await r.json();
         if (!r.ok) throw new Error(d.detail || r.statusText);
         showToast('Campaign resumed', 'success');

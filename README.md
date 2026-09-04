@@ -43,6 +43,7 @@ A four-layer memory system feeds every prompt:
 - **Kanban UI** — visual task board at `http://localhost:8000/kanban`; create tasks, execute them, leave `@agent` comments for revisions
 - **Comment Autopilot** — background worker that picks up `@agent` comments and re-runs the agent automatically
 - **Run tracking** — every execution is recorded with status, session ID, validator result, and a result summary; child campaign runs link back to the orchestrator run via `parent_run_id`
+- **Duplicate-run protection** — database leases, fencing tokens, and idempotency keys prevent overlapping work across workers
 - **Session reuse** — the agent resumes the same Claude session for follow-up runs on a task, preserving context
 - **Webflow CMS** — create, update, and publish CMS items directly via the agent
 - **Google Docs** — save audit reports and blog drafts to Google Docs (read/write only — no delete)
@@ -150,6 +151,8 @@ Copy `.env.example` to `.env` and fill in the values you need.
 | `DATABASE_URL` | Explicit DB URL (overrides `APP_ENV`) | unset |
 | `COMMENT_AUTOPILOT_ENABLED` | Enable `@agent` comment background worker | `true` |
 | `COMMENT_AUTOPILOT_INTERVAL_SECONDS` | Poll interval for comment autopilot | `900` |
+| `COMMENT_ACTION_STALE_SECONDS` | Timeout before a crashed comment action can retry | `300` |
+| `RUN_LEASE_TIMEOUT_SECONDS` | Database run-lease timeout; active workers renew it | `300` |
 | `AGENT_EXECUTION_TIMEOUT_SECONDS` | Timeout per agent execution | `900` |
 | `ALLOWED_ORIGINS` | Comma-separated CORS origins for the local API | `http://localhost:8000,http://127.0.0.1:8000` |
 | `API_TOKEN` | Optional bearer token; when set every request needs `Authorization: Bearer <token>` | unset |

@@ -14,6 +14,9 @@ import json
 os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 os.environ["COMMENT_AUTOPILOT_ENABLED"] = "false"
 os.environ["AGENT_EXECUTION_TIMEOUT_SECONDS"] = "2"
+# Legacy tests predate the required public Idempotency-Key contract. Focused
+# request-contract tests disable this compatibility switch explicitly.
+os.environ["ALLOW_MISSING_IDEMPOTENCY_KEY"] = "true"
 # Keep cost-triggering endpoints effectively unlimited for the shared
 # TestClient limiter key; the rate-limit test lowers this per-test.
 os.environ["API_RATE_LIMIT_EXECUTE"] = "100000/minute"

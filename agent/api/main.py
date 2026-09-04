@@ -208,12 +208,15 @@ from agent.api.helpers import (  # noqa: E402,F401
 
 from agent.db import (  # noqa: E402,F401
     AgentRunModel,
+    AuditRequestModel,
     Base,
     CommentActionModel,
     CommentCreate,
     CommentModel,
     CommentResponse,
+    ExecuteRequestModel,
     OrchestrationStateModel,
+    RunLeaseModel,
     RunEventModel,
     RunResponse,
     SeoAuditRequest,
