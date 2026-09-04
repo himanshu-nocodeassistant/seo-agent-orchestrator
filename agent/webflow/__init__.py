@@ -13,6 +13,7 @@ from .config import WebflowConfig
 from .server import create_webflow_server, create_webflow_server_async
 from .tools import (
     WEBFLOW_TOOLS,
+    authorize_webflow_write,
     create_cms_item,
     get_cms_item,
     get_collection_info,
@@ -32,6 +33,7 @@ __all__ = [
     "create_webflow_server_async",
     # Tools
     "WEBFLOW_TOOLS",
+    "authorize_webflow_write",
     "list_cms_items",
     "get_cms_item",
     "create_cms_item",

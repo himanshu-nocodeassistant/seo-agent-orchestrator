@@ -378,6 +378,7 @@
                     <label class="field-label">Agent Result</label>
                     <div id="detail-notes" class="notes-block"></div>
                 </div>
+                <div id="detail-webflow-proposals" style="margin-bottom:14px;display:none;"></div>
                 <div id="detail-actions" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:4px;"></div>
             </div>
             <div id="tab-comments-panel" style="display:none;flex-direction:column;flex:1;overflow:hidden;min-height:0;">
@@ -570,6 +571,7 @@ async function openDetailModal(taskId) {
     document.getElementById('detail-execution_type').value = task.execution_type || 'manual';
     setDetailStatus(task.status);
     if (task.notes) { document.getElementById('detail-notes').textContent = task.notes; document.getElementById('detail-notes-section').style.display = ''; }
+    loadWebflowProposals(taskId);
     else { document.getElementById('detail-notes-section').style.display = 'none'; }
     const actionsDiv = document.getElementById('detail-actions');
     actionsDiv.innerHTML = '';
@@ -607,6 +609,61 @@ async function loadComments(taskId) {
         comments.forEach(c => { const div = document.createElement('div'); div.style.background = c.author === 'agent' ? '#0f172a' : '#eff6ff'; div.style.color = c.author === 'agent' ? '#94a3b8' : '#1e3a8a'; div.style.borderRadius = '10px'; div.style.padding = '11px 14px'; div.style.marginBottom = '8px'; div.innerHTML = '<div style="margin-bottom:5px;"><span style="font-size:11px;font-weight:600;text-transform:uppercase;">' + (c.author === 'agent' ? '🤖 Agent' : '👤 You') + '</span><span style="font-size:10.5px;margin-left:6px;color:' + (c.author === 'agent' ? '#475569' : '#93c5fd') + '">' + formatDateTime(c.created_at) + '</span></div><div style="white-space:pre-wrap;font-size:' + (c.author === 'agent' ? '12.5' : '13.5') + 'px;">' + escapeHtml(c.body) + '</div>'; list.appendChild(div); });
         list.scrollTop = list.scrollHeight;
     } catch(e) { console.error('loadComments error', e); }
+}
+
+async function loadWebflowProposals(taskId) {
+    const section = document.getElementById('detail-webflow-proposals');
+    section.style.display = 'none';
+    section.innerHTML = '';
+    try {
+        const r = await fetch(API_BASE + '/tasks/' + taskId + '/webflow-proposals');
+        if (!r.ok) return;
+        const proposals = await r.json();
+        if (!proposals.length) return;
+        section.style.display = '';
+        section.innerHTML = '<label class="field-label">Webflow proposal</label>';
+        proposals.forEach(p => {
+            const box = document.createElement('div');
+            box.style.cssText = 'border:1px solid #e5e7eb;border-radius:9px;padding:12px;margin-top:8px;background:#f9fafb;';
+            const heading = document.createElement('div');
+            heading.style.cssText = 'display:flex;justify-content:space-between;gap:8px;margin-bottom:8px;font-size:12px;font-weight:600;';
+            heading.innerHTML = '<span>' + escapeHtml(p.operation.toUpperCase()) + (p.resource_id ? ' · ' + escapeHtml(p.resource_id) : '') + '</span><span>' + escapeHtml(p.status) + '</span>';
+            box.appendChild(heading);
+            const before = document.createElement('pre');
+            before.style.cssText = 'white-space:pre-wrap;overflow-wrap:anywhere;max-height:240px;overflow:auto;background:#fff;border-radius:6px;padding:8px;font-size:11px;';
+            before.textContent = 'Before:\n' + JSON.stringify(p.snapshot, null, 2) + '\n\nAfter:\n' + JSON.stringify(p.payload, null, 2);
+            box.appendChild(before);
+            if (p.status === 'pending_approval') {
+                const buttons = document.createElement('div');
+                buttons.style.cssText = 'display:flex;gap:8px;margin-top:8px;';
+                buttons.innerHTML = '<button class="btn btn-sm btn-success" onclick="approveWebflowProposal(' + p.id + ')">Approve</button><button class="btn btn-sm btn-ghost" onclick="rejectWebflowProposal(' + p.id + ')">Reject</button>';
+                box.appendChild(buttons);
+            }
+            section.appendChild(box);
+        });
+    } catch(e) { showToast('Could not load Webflow proposal', 'error'); }
+}
+
+async function approveWebflowProposal(proposalId) {
+    if (!confirm('Apply this exact Webflow proposal?')) return;
+    try {
+        const r = await fetch(API_BASE + '/tasks/' + detailTaskId + '/webflow-proposals/' + proposalId + '/approve', { method: 'POST' });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || 'approval failed');
+        showToast('Webflow proposal applied', 'success');
+        await loadWebflowProposals(detailTaskId); fetchTasks();
+    } catch(e) { showToast('Error: ' + e.message, 'error'); }
+}
+
+async function rejectWebflowProposal(proposalId) {
+    const reason = prompt('Why reject this proposal?') || null;
+    try {
+        const r = await fetch(API_BASE + '/tasks/' + detailTaskId + '/webflow-proposals/' + proposalId + '/reject', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({reason}) });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || 'rejection failed');
+        showToast('Webflow proposal rejected', 'success');
+        await loadWebflowProposals(detailTaskId); fetchTasks();
+    } catch(e) { showToast('Error: ' + e.message, 'error'); }
 }
 
 async function postComment() {

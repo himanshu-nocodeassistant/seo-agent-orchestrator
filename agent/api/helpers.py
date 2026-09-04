@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Optional
 from uuid import uuid4
 
-from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
 
 from agent import db as db_module
@@ -106,7 +105,7 @@ def add_task_comment(
 
 def add_task_started_comment(db, task_id: int, task_title: str) -> CommentModel:
     """Add a comment when task execution starts."""
-    comment_body = f"🤖 Task started by agent"
+    comment_body = "🤖 Task started by agent"
     return add_task_comment(db, task_id, comment_body, "agent")
 
 
@@ -1755,7 +1754,8 @@ async def process_one_comment_action(request_id: Optional[str] = None) -> dict:
                         "attempts": action.attempts,
                         "max_attempts": action.max_attempts,
                     }
-                owns_task = _finalize_run_failure(db, run, task, str(e))
+                error_message = str(e)
+                owns_task = _finalize_run_failure(db, run, task, error_message)
                 if owns_task:
                     _run_post_finalize_side_effects(
                         db,
@@ -1766,7 +1766,7 @@ async def process_one_comment_action(request_id: Optional[str] = None) -> dict:
                             add_task_failed_comment(
                                 db,
                                 task.id,
-                                f"Comment #{comment.id}: {str(e)}",
+                                f"Comment #{comment.id}: {error_message}",
                                 commit=False,
                             ),
                         ),

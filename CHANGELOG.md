@@ -5,6 +5,7 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Webflow write approvals** — Execute stores the full proposal; approval checks for stale content before applying it. Campaign publisher proposals pause the campaign until resolved.
 - **Reliability and tracing hardening** — atomic task claims, request correlation through `X-Request-ID`, paginated run events, run leases, heartbeats, stale-run recovery, and ownership fencing for runs, campaigns, and comment actions.
 - **Safe campaign recovery** — resumable phase state, durable child-run claims, approval gates, and review-required states for uncertain or write-capable failures.
 - **DataForSEO recovery records** — collision-safe manifests preserve submitted IDs, partial results, and uncertain POST outcomes; the CLI reports recovery details instead of retrying paid work blindly.

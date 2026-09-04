@@ -347,9 +347,10 @@ async def _dispatch_phase(
     helpers: dict,
     phase_has_dependents: bool,
     ownership_check=None,
-) -> tuple[str, str, bool]:
+) -> tuple[str, str, bool, bool]:
     """
-    Run a single child agent phase and return (phase_name, result_text, degraded).
+    Run a single child agent phase and return (phase_name, result_text, degraded,
+    awaiting_webflow_approval).
 
     ``degraded`` is True when the phase had downstream dependents but its final
     output still lacked a ``## Summary for Next Phase`` block after one
@@ -364,8 +365,9 @@ async def _dispatch_phase(
     if ownership_check is not None and not ownership_check():
         raise LostRunOwnership("Campaign parent run ownership was lost before child dispatch")
 
-    from agent.db import SessionLocal, TaskModel
+    from agent.db import SessionLocal, TaskModel, WebflowProposalModel
     from agent.runtime_profiles import get_execution_profile
+    from agent.webflow.proposal_parser import extract_webflow_proposal
 
     phase_name = phase_spec["phase"]
     child_exec_type = phase_spec.get("execution_type", phase_name)
@@ -486,6 +488,13 @@ async def _dispatch_phase(
             raise RuntimeError(
                 f"Phase [{phase_name}] output failed validation: {child_validation.message}"
             )
+        proposal_data = None
+        if child_profile.requires_webflow_approval:
+            proposal_data = extract_webflow_proposal(result_text)
+            if proposal_data is None:
+                raise RuntimeError(
+                    f"Phase [{phase_name}] did not return a complete Webflow proposal."
+                )
         if ownership_check is not None and not ownership_check():
             raise LostRunOwnership("Campaign parent run ownership was lost before child finalization")
         owns_child = helpers["_finalize_run_success"](
@@ -499,18 +508,42 @@ async def _dispatch_phase(
                 f"Child phase [{phase_name}] lost ownership during finalization"
             )
         post_finalize = helpers.get("_run_post_finalize_side_effects", lambda *args, **kwargs: True)
+        def post_child_finalize():
+            helpers["_refresh_context_view"](phase_db, task_id=child_task.id)
+            if proposal_data is not None:
+                now = datetime.utcnow().isoformat()
+                phase_db.add(
+                    WebflowProposalModel(
+                        task_id=child_task.id,
+                        run_id=child_run.run_id,
+                        operation=proposal_data["operation"],
+                        resource_id=proposal_data.get("resource_id"),
+                        idempotency_key=child_run.run_id,
+                        snapshot_json=json.dumps(proposal_data["snapshot"], ensure_ascii=False),
+                        payload_json=json.dumps(proposal_data["payload"], ensure_ascii=False),
+                        status="pending_approval",
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                child_task.status = "blocked"
+                child_run.status = "awaiting_approval"
+                child_run.validator_status = "pending_approval"
+                child_task.updated_at = now
+
         if not post_finalize(
             phase_db,
             child_task.id,
             child_run.run_id,
-            lambda: helpers["_refresh_context_view"](phase_db, task_id=child_task.id),
+            post_child_finalize,
         ):
             raise LostRunOwnership(
                 f"Child phase [{phase_name}] lost ownership before post-finalization effects"
             )
 
+        awaiting_webflow_approval = proposal_data is not None
         degraded = phase_has_dependents and _extract_summary_block(result_text) is None
-        return phase_name, result_text, degraded
+        return phase_name, result_text, degraded, awaiting_webflow_approval
     finally:
         phase_db.close()
 
@@ -671,8 +704,9 @@ async def _run_campaign_orchestration(
             phase_outputs = json.loads(state.phase_outputs_json or "{}")
             child_run_ids = json.loads(state.child_run_ids_json or "[]")
         except (ValueError, json.JSONDecodeError) as e:
+            error_message = f"Resume failed: {e}"
             owns_parent = helpers_module._finalize_run_failure(
-                db, orchestrator_run, parent_task, f"Resume failed: {e}"
+                db, orchestrator_run, parent_task, error_message
             )
             if owns_parent:
                 helpers_module._run_post_finalize_side_effects(
@@ -680,7 +714,7 @@ async def _run_campaign_orchestration(
                     parent_task.id,
                     orchestrator_run.run_id,
                     lambda: helpers_module.add_task_failed_comment(
-                        db, parent_task.id, f"Resume failed: {e}", commit=False
+                        db, parent_task.id, error_message, commit=False
                     ),
                 )
             return
@@ -781,8 +815,9 @@ async def _run_campaign_orchestration(
                 )
             tiers = _resolve_execution_tiers(phases)
         except ValueError as e:
+            error_message = str(e)
             owns_parent = helpers_module._finalize_run_failure(
-                db, orchestrator_run, parent_task, str(e)
+                db, orchestrator_run, parent_task, error_message
             )
             if owns_parent:
                 helpers_module._run_post_finalize_side_effects(
@@ -790,7 +825,7 @@ async def _run_campaign_orchestration(
                     parent_task.id,
                     orchestrator_run.run_id,
                     lambda: helpers_module.add_task_failed_comment(
-                        db, parent_task.id, str(e), commit=False
+                        db, parent_task.id, error_message, commit=False
                     ),
                 )
             return
@@ -903,6 +938,7 @@ async def _run_campaign_orchestration(
         # Check for failures (fail-fast)
         failed_phase = None
         failed_error = None
+        awaiting_phase = None
         for phase_spec, result in zip(pending_in_tier, tier_results):
             if isinstance(result, BaseException):
                 if isinstance(result, LostRunOwnership):
@@ -938,7 +974,11 @@ async def _run_campaign_orchestration(
                         ),
                     )
             else:
-                phase_name, result_text, degraded = result
+                if len(result) == 3:
+                    phase_name, result_text, degraded = result
+                    awaiting_webflow_approval = False
+                else:
+                    phase_name, result_text, degraded, awaiting_webflow_approval = result
                 phase_outputs[phase_name] = result_text
                 child_run_ids.append(
                     _get_latest_run_id_for_task(
@@ -960,6 +1000,8 @@ async def _run_campaign_orchestration(
                         f"Phase [{phase_name}] produced no summary block — "
                         "the next agent will receive a truncated handoff.",
                     )
+                if awaiting_webflow_approval and awaiting_phase is None:
+                    awaiting_phase = phase_name
 
         ensure_ownership()
         state.phase_outputs_json = json.dumps(phase_outputs)
@@ -1005,6 +1047,23 @@ async def _run_campaign_orchestration(
                         commit=False,
                     ),
                 )
+            return
+
+        if awaiting_phase is not None:
+            state.status = "awaiting_approval"
+            state.current_phase = awaiting_phase
+            state.updated_at = datetime.utcnow().isoformat()
+            parent_task.status = "blocked"
+            parent_task.updated_at = state.updated_at
+            orchestrator_run.status = "awaiting_approval"
+            orchestrator_run.validator_status = "pending_approval"
+            db.commit()
+            helpers_module.add_task_comment(
+                db,
+                parent_task.id,
+                f"Campaign paused at phase [{awaiting_phase}] — Webflow proposal ready for approval.",
+                "agent",
+            )
             return
 
     # ── Finalize campaign ─────────────────────────────────────────────────────

@@ -7,6 +7,8 @@ Webflow CMS operations as MCP tools to the Claude Agent.
 
 import json
 import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Optional
 
 from claude_agent_sdk import tool
@@ -17,6 +19,24 @@ logger = logging.getLogger(__name__)
 
 # Global client instance (set when server is created)
 _webflow_client: Optional[WebflowAPIClient] = None
+_authorized_write_proposal: ContextVar[Optional[str]] = ContextVar(
+    "webflow_write_proposal", default=None
+)
+
+
+@contextmanager
+def authorize_webflow_write(proposal_id: str):
+    """Temporarily authorize writes while applying an approved proposal."""
+    token = _authorized_write_proposal.set(proposal_id)
+    try:
+        yield
+    finally:
+        _authorized_write_proposal.reset(token)
+
+
+def _require_write_authorization() -> None:
+    if not _authorized_write_proposal.get():
+        raise PermissionError("Webflow write requires approval for an approved proposal.")
 
 
 def set_client(client: WebflowAPIClient):
@@ -140,6 +160,7 @@ async def create_cms_item(args: dict[str, Any]) -> dict[str, Any]:
         JSON string with created item data
     """
     try:
+        _require_write_authorization()
         client = get_client()
         field_data = {
             "name": args["name"],
@@ -159,6 +180,8 @@ async def create_cms_item(args: dict[str, Any]) -> dict[str, Any]:
             ]
         }
     except WebflowAPIError as e:
+        return {"content": [{"type": "text", "text": f"Error: {str(e)}"}]}
+    except PermissionError as e:
         return {"content": [{"type": "text", "text": f"Error: {str(e)}"}]}
     except Exception as e:
         logger.exception("Failed to create CMS item")
@@ -189,6 +212,7 @@ async def update_cms_item(args: dict[str, Any]) -> dict[str, Any]:
         JSON string with updated item data
     """
     try:
+        _require_write_authorization()
         client = get_client()
         field_data = {}
         if "name" in args:
@@ -212,6 +236,8 @@ async def update_cms_item(args: dict[str, Any]) -> dict[str, Any]:
         }
     except WebflowAPIError as e:
         return {"content": [{"type": "text", "text": f"Error: {str(e)}"}]}
+    except PermissionError as e:
+        return {"content": [{"type": "text", "text": f"Error: {str(e)}"}]}
     except Exception as e:
         logger.exception("Failed to update CMS item")
         return {"content": [{"type": "text", "text": f"Unexpected error: {str(e)}"}]}
@@ -233,6 +259,7 @@ async def publish_cms_item(args: dict[str, Any]) -> dict[str, Any]:
         JSON string with publish result
     """
     try:
+        _require_write_authorization()
         client = get_client()
         result = await client.publish_item(args["item_id"])
         return {
@@ -244,6 +271,8 @@ async def publish_cms_item(args: dict[str, Any]) -> dict[str, Any]:
             ]
         }
     except WebflowAPIError as e:
+        return {"content": [{"type": "text", "text": f"Error: {str(e)}"}]}
+    except PermissionError as e:
         return {"content": [{"type": "text", "text": f"Error: {str(e)}"}]}
     except Exception as e:
         logger.exception("Failed to publish CMS item")

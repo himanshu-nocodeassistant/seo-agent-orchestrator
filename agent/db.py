@@ -13,7 +13,6 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import (
     Boolean,
     Column,
-    DateTime,
     Integer,
     String,
     Text,
@@ -176,6 +175,29 @@ class RunEventModel(Base):
     duration_ms = Column(Integer, nullable=True)
     outcome = Column(String(30), nullable=True)
     created_at = Column(String(20), default=lambda: _utcnow_iso())
+
+
+class WebflowProposalModel(Base):
+    """Stores the exact Webflow change shown to and approved by a user."""
+
+    __tablename__ = "webflow_proposals"
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, nullable=False, index=True)
+    run_id = Column(String(64), nullable=True, index=True)
+    operation = Column(String(20), nullable=False)
+    resource_id = Column(String(255), nullable=True)
+    idempotency_key = Column(String(128), nullable=True, index=True)
+    snapshot_json = Column(Text, nullable=False)
+    payload_json = Column(Text, nullable=False)
+    status = Column(String(30), nullable=False, default="pending_approval", index=True)
+    rejection_reason = Column(Text, nullable=True)
+    result_json = Column(Text, nullable=True)
+    approved_at = Column(String(30), nullable=True)
+    approved_by = Column(String(255), nullable=True)
+    applied_at = Column(String(30), nullable=True)
+    created_at = Column(String(30), default=lambda: _utcnow_iso())
+    updated_at = Column(String(30), default=lambda: _utcnow_iso())
 
 
 class TaskSessionModel(Base):
@@ -408,6 +430,40 @@ class SeoAuditRequest(BaseModel):
     """Body for POST /runs/{run_id}/seo-audit."""
 
     days: int = Field(default=28, ge=1, le=365)
+
+
+class WebflowProposalCreate(BaseModel):
+    """Request body for a complete Webflow mutation proposal."""
+
+    operation: str
+    resource_id: Optional[str] = None
+    snapshot: dict = Field(default_factory=dict)
+    payload: dict
+    run_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
+
+
+class WebflowProposalReject(BaseModel):
+    reason: Optional[str] = None
+
+
+class WebflowProposalResponse(BaseModel):
+    id: int
+    task_id: int
+    run_id: Optional[str]
+    operation: str
+    resource_id: Optional[str]
+    idempotency_key: Optional[str]
+    snapshot: dict
+    payload: dict
+    status: str
+    rejection_reason: Optional[str]
+    result: Optional[dict]
+    approved_at: Optional[str]
+    approved_by: Optional[str]
+    applied_at: Optional[str]
+    created_at: str
+    updated_at: str
 
 
 # ============================================================================

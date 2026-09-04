@@ -114,6 +114,13 @@ asyncio.run(main())
 - Uncertain writes, failed write validation, stale write runs, and lost ownership move to review. They aren't retried blindly.
 - CMS changes are stored with ranking data from Google Search Console when the feedback loop runs.
 
+### Webflow approvals
+
+Webflow write profiles create a full proposal. Execute makes no live write. Review it with
+`GET /tasks/{id}/webflow-proposals`, then approve or reject it with the matching endpoint.
+Approval checks the current Webflow snapshot before applying the stored payload. Configure
+`API_TOKEN` in production.
+
 ## Measured data, not guesses (DataForSEO)
 
 Keyword volumes, SERP positions, backlink counts, and AI-search visibility come from **measured DataForSEO API responses**, never from the agent guessing at numbers. A batch extraction pipeline pulls the data, rollups are compiled under `dataforseo/compiled/`, and the newest results per pipeline are injected into the agent's context as a "Measured Data" section for research, campaign-research, and impact-review tasks.

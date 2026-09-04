@@ -92,7 +92,7 @@ Trigger: create a Kanban task with `execution_type = "orchestrate_seo_campaign"`
 
 **Plan validation:** every phase's `execution_type` is validated against the profile registry right after parsing — a bad plan fails fast with a clear error before any child task is created.
 
-**Approval gate:** `campaign_publisher` has `requires_approval=True`. The orchestrator halts before that tier and sets `state.status='awaiting_approval'`. Set `approved_at` on the parent task via the Kanban UI (PATCH) to resume.
+**Approval gate:** Webflow write profiles have `requires_webflow_approval=True`. Execute stores the full proposal and makes no live write. Approve or reject it through `/tasks/{id}/webflow-proposals/{proposal_id}`. Approval checks the current Webflow snapshot before applying the stored payload. `campaign_publisher` also pauses the campaign until its proposal is resolved.
 
 **Grounding requirement:** `research` and `campaign_researcher` profiles carry the `grounding-required` procedural tag. The injected system prompt requires every factual claim to cite a source URL; the validator also checks for at least one `https://` URL in the output.
 
