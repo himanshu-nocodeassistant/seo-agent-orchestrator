@@ -559,6 +559,7 @@ def test_write_capable_failure_requires_review_and_blocks_retry(client):
         assert task.active_run_id is None
         latest = db.query(AgentRunModel).filter_by(task_id=task.id).one()
         assert latest.status == "review_required"
+        assert latest.recovery_state == "review_required"
         retry = _create_run(db, task, "manual_execute", "webflow_publish")
         assert retry.run_id == latest.run_id
         assert retry._claim_created is False
