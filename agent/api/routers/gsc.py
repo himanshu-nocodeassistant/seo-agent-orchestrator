@@ -8,7 +8,13 @@ router = APIRouter(prefix="/gsc", tags=["gsc"])
 
 
 def _gsc_client() -> GscAPIClient:
-    config = GscConfig.from_env()
+    try:
+        config = GscConfig.from_env()
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="GSC is not configured. Check GSC_SITE_URL and GSC_CREDENTIALS_PATH.",
+        ) from exc
     if config is None:
         raise HTTPException(
             status_code=503,

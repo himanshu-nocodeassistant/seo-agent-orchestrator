@@ -70,3 +70,19 @@ def test_gsc_endpoint_returns_503_when_unconfigured(client, monkeypatch):
     )
 
     assert response.status_code == 503
+
+
+def test_gsc_endpoint_returns_503_when_credentials_path_is_invalid(client, monkeypatch):
+    from agent.api.routers import gsc
+
+    def invalid_config(cls):
+        raise FileNotFoundError("missing credentials")
+
+    monkeypatch.setattr(gsc.GscConfig, "from_env", classmethod(invalid_config))
+    response = client.get(
+        "/gsc/page-metrics",
+        params={"url": "https://example.com", "change_date": "2026-02-01"},
+    )
+
+    assert response.status_code == 503
+    assert "Check GSC_SITE_URL" in response.json()["detail"]
