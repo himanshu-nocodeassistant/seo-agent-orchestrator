@@ -651,7 +651,7 @@ def _claim_campaign_resume(
             and task.approved_at
             and active_child is None
         )
-    allowed_statuses = ["queued", "running", "failed", "recoverable"]
+    allowed_statuses = ["queued", "running", "paused", "awaiting_approval", "failed", "recoverable"]
     if safe_review_resume:
         allowed_statuses.append("review_required")
     claim_values = {
@@ -1512,6 +1512,30 @@ def _acquire_next_comment_action(db) -> Optional[CommentActionModel]:
     db.commit()
     db.refresh(action)
     return action
+
+
+def _mark_claimed_action(
+    db, action_id: int, attempt: int, *, status: str, last_error: str
+) -> bool:
+    """Finish a comment action only when its claim attempt still matches."""
+    updated = (
+        db.query(CommentActionModel)
+        .filter(
+            CommentActionModel.id == action_id,
+            CommentActionModel.status == "running",
+            CommentActionModel.attempts == attempt,
+        )
+        .update(
+            {
+                CommentActionModel.status: status,
+                CommentActionModel.last_error: last_error,
+                CommentActionModel.updated_at: _utcnow_iso(),
+            },
+            synchronize_session=False,
+        )
+    )
+    db.commit()
+    return updated == 1
 
 
 async def process_one_comment_action(request_id: Optional[str] = None) -> dict:

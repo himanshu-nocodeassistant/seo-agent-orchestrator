@@ -183,6 +183,58 @@ class TestKanbanHTML:
         assert "tailwind" in text.lower()
 
 
+class TestKanbanRunIdempotency:
+    """The Kanban run actions must identify and safely retry one user action."""
+
+    @pytest.fixture
+    def kanban_script(self, client):
+        html = client.get("/kanban").text
+        start = html.rindex("<script>") + len("<script>")
+        end = html.index("</script>", start)
+        return html[start:end]
+
+    def test_run_actions_use_idempotent_request_helper(self, kanban_script):
+        """Execute, resume, and audit all send an Idempotency-Key header."""
+        for action in ("runAudit", "executeTask", "resumeTask"):
+            start = kanban_script.index(f"async function {action}")
+            next_function = kanban_script.find("\nasync function ", start + 1)
+            body = kanban_script[start:next_function if next_function != -1 else None]
+            assert "sendRunRequest" in body
+            assert "createRunRequest" in body
+
+        assert "'Idempotency-Key'" in kanban_script
+
+    def test_same_action_retry_reuses_key_and_new_action_gets_new_key(self, kanban_script, tmp_path):
+        """A request object can be sent again with its original key."""
+        # Run only the small, DOM-free request helper in Node. This verifies
+        # behavior, rather than only checking that a string exists in HTML.
+        helper_start = kanban_script.index("function createIdempotencyKey")
+        helper_end = kanban_script.index("async function fetchTasks", helper_start)
+        helper = kanban_script[helper_start:helper_end]
+        script = f"""
+{helper}
+let calls = [];
+let attempts = 0;
+globalThis.fetch = async (_url, options) => {{
+  calls.push(options);
+  if (attempts++ === 0) throw new Error('temporary network failure');
+  return {{ ok: true }};
+}};
+(async () => {{
+  const first = createRunRequest('/runs/1');
+  await sendRunRequest(first);
+  const second = createRunRequest('/runs/1');
+  await sendRunRequest(second);
+  if (calls[0].headers['Idempotency-Key'] !== calls[1].headers['Idempotency-Key']) process.exit(1);
+  if (calls[0].headers['Idempotency-Key'] === calls[2].headers['Idempotency-Key']) process.exit(2);
+}})().catch(() => process.exit(3));
+"""
+        script_path = tmp_path / "kanban-idempotency-test.js"
+        script_path.write_text(script)
+        result = __import__("subprocess").run(["node", str(script_path)], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+
+
 # ============================================================================
 # TEST: SEO AUDIT
 # ============================================================================

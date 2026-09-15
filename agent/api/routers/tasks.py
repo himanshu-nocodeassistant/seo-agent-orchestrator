@@ -5,6 +5,8 @@ Extracted from the former agent/api/main.py monolith (see git history).
 
 import json
 import os
+from datetime import datetime, timezone
+from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
@@ -33,7 +35,9 @@ from agent.api.rate_limit import _rate_limit_value, limiter
 from agent.db import (
     AgentRunModel,
     CommentModel,
+    ExecuteRequestModel,
     OrchestrationStateModel,
+    RunLeaseModel,
     RunResponse,
     TaskCreate,
     TaskListResponse,
@@ -55,6 +59,33 @@ from agent.webflow.proposal_parser import extract_webflow_proposal
 from agent.webflow.tools import get_client
 
 router = APIRouter()
+
+
+def _idempotency_key(request: Request) -> str:
+    key = request.headers.get("Idempotency-Key", "").strip()
+    if key:
+        return key
+    if os.environ.get("ALLOW_MISSING_IDEMPOTENCY_KEY", "false").lower() in {"1", "true", "yes", "on"}:
+        return f"compat-{uuid4()}"
+    raise HTTPException(status_code=422, detail="Idempotency-Key header is required")
+
+
+def _request_fingerprint(task_id: int, resume: bool) -> str:
+    return f"task:{task_id}:resume:{resume}"
+
+
+def _record_execute_request(db, task_id: int, run_id: str, key: str, fingerprint: str) -> None:
+    db.add(
+        ExecuteRequestModel(
+            request_scope=f"task:{task_id}",
+            idempotency_key=key,
+            fingerprint=fingerprint,
+            task_id=task_id,
+            run_id=run_id,
+            created_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        )
+    )
+    db.commit()
 
 
 def _webflow_proposal_response(proposal: WebflowProposalModel) -> dict:
@@ -544,6 +575,23 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
         task = db.query(TaskModel).filter(TaskModel.id == task_id).first()
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
+        supplied_key = request.headers.get("Idempotency-Key", "").strip()
+        key = _idempotency_key(request)
+        fingerprint = _request_fingerprint(task.id, resume)
+        prior_request = db.query(ExecuteRequestModel).filter_by(
+            request_scope=f"task:{task.id}", idempotency_key=key
+        ).one_or_none()
+        if prior_request is not None:
+            prior_run = db.query(AgentRunModel).filter_by(run_id=prior_request.run_id).one()
+            if prior_request.fingerprint != fingerprint:
+                raise HTTPException(status_code=409, detail="Idempotency key was reused for another request")
+            return _run_response(prior_run)
+        if task.active_run_id and not resume:
+            active = db.query(AgentRunModel).filter_by(run_id=task.active_run_id).first()
+            if active is not None:
+                if supplied_key:
+                    raise HTTPException(status_code=409, detail={"message": "Task already running", "active_run_id": active.run_id, "status": active.status})
+                return _run_response(active)
         latest_task_run = (
             db.query(AgentRunModel)
             .filter(AgentRunModel.task_id == task.id)
@@ -636,11 +684,15 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
                         status_code=400,
                         detail="Campaign has a Webflow proposal awaiting approval.",
                     )
-                if (
-                    task.active_run_id == run.run_id
-                    and run.status in {"running", "resuming"}
-                ):
+                lease = db.query(RunLeaseModel).filter_by(
+                    task_id=task.id, run_id=run.run_id
+                ).one_or_none()
+                if (lease is None or lease.status == "active") and run.status in {"running", "resuming"}:
                     return _run_response(run)
+                if db.query(ExecuteRequestModel).filter_by(
+                    request_scope=f"task:{task.id}", idempotency_key=key
+                ).one_or_none() is None:
+                    _record_execute_request(db, task.id, run.run_id, key, fingerprint)
                 if not _claim_campaign_resume(
                     db, run.run_id, request_id=getattr(request.state, "request_id", None)
                 ):
@@ -808,6 +860,7 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
             )
             if not getattr(run, "_claim_created", True):
                 return _run_response(run)
+            _record_execute_request(db, task.id, run.run_id, key, fingerprint)
             if not helpers_module._add_owned_task_comment(
                 db, task_id, run.run_id, "🤖 Task started by agent"
             ):
@@ -867,6 +920,7 @@ async def execute_task(request: Request, task_id: int, resume: bool = False):
         )
         if not getattr(run, "_claim_created", True):
             return _run_response(run)
+        _record_execute_request(db, task.id, run.run_id, key, fingerprint)
         if not helpers_module._add_owned_task_comment(
             db, task_id, run.run_id, "🤖 Task started by agent"
         ):

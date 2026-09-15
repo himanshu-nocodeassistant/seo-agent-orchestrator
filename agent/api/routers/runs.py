@@ -4,8 +4,12 @@ Extracted from the former agent/api/main.py monolith (see git history).
 """
 
 import json
+import os
+from datetime import datetime, timezone
+from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from sqlalchemy.exc import IntegrityError
 
 from agent.api import helpers as helpers_module
 from agent.api.helpers import (
@@ -25,6 +29,7 @@ from agent.api.helpers import (
 )
 from agent.db import (
     AgentRunModel,
+    AuditRequestModel,
     OrchestrationStateModel,
     RunEventModel,
     RunResponse,
@@ -145,8 +150,23 @@ async def run_seo_audit(
     profile machinery as every other task (timeouts, validator, audit log).
     No Bash tool, no agent-driven localhost task creation.
     """
+    idempotency_key = request.headers.get("Idempotency-Key", "").strip()
+    if not idempotency_key:
+        if os.environ.get("ALLOW_MISSING_IDEMPOTENCY_KEY", "false").lower() in {"1", "true", "yes", "on"}:
+            idempotency_key = f"compat-{uuid4()}"
+        else:
+            raise HTTPException(status_code=400, detail="Idempotency-Key header is required")
+    fingerprint = f"seo_audit:days={payload.days}"
     db = get_db_session()
     try:
+        existing_request = db.query(AuditRequestModel).filter_by(audit_id=run_id).one_or_none()
+        if existing_request is not None:
+            if existing_request.idempotency_key != idempotency_key or existing_request.fingerprint != fingerprint:
+                raise HTTPException(status_code=409, detail={"message": "Audit identifier is already bound to another request", "run_id": existing_request.run_id})
+            existing_run = db.query(AgentRunModel).filter_by(run_id=existing_request.run_id).one_or_none()
+            if existing_run is None:
+                raise HTTPException(status_code=409, detail="Audit request is being claimed")
+            return {"message": "Audit complete", "task_id": existing_request.task_id, "run_id": existing_run.run_id}
         now = _utcnow_iso()
         task = TaskModel(
             title=f"SEO Audit - {run_id}",
@@ -154,11 +174,28 @@ async def run_seo_audit(
             status="in_progress",
             priority=0,
             execution_type="seo_audit",
-            created_at=now,
+            created_at=datetime.now(timezone.utc).replace(tzinfo=None),
             updated_at=now,
         )
         db.add(task)
         db.commit()
+        audit_request = AuditRequestModel(
+            audit_id=run_id,
+            idempotency_key=idempotency_key,
+            fingerprint=fingerprint,
+            task_id=task.id,
+            created_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        )
+        db.add(audit_request)
+        try:
+            db.commit()
+        except IntegrityError as error:
+            db.rollback()
+            winner = db.query(AuditRequestModel).filter_by(audit_id=run_id).one()
+            winner_run = db.query(AgentRunModel).filter_by(run_id=winner.run_id).one_or_none()
+            if winner_run is not None:
+                return {"message": "Audit complete", "task_id": winner.task_id, "run_id": winner_run.run_id}
+            raise HTTPException(status_code=409, detail="Audit request is being claimed") from error
         run = _create_run(
             db,
             task,
@@ -166,6 +203,8 @@ async def run_seo_audit(
             "seo_audit",
             request_id=getattr(request.state, "request_id", None),
         )
+        audit_request.run_id = run.run_id
+        db.commit()
         task.status = "in_progress"
         task.updated_at = _utcnow_iso()
         db.commit()
