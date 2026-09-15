@@ -42,6 +42,29 @@ For ranking signals fall back to WebSearch and WebFetch as described in the phas
 """
 
 
+def _keyword_registry_instruction(execution_type: str) -> str:
+    """Return the conflict check required for content-producing workflows."""
+    if execution_type == "blog_write":
+        return """
+KEYWORD REGISTRY CHECK — complete this before keyword research:
+Read memory/keyword-registry.md. Choose the intended primary keyword, then check
+for the same or a very close keyword owned by another page. Same root intent,
+audience, and SERP is a conflict. If there is a conflict, STOP and report the
+existing URL and recommend a different angle or a merge/redirect. If there is no
+conflict, continue the workflow and add the draft to the In Progress table before
+finishing.
+"""
+    if execution_type == "rewrite_blog_content":
+        return """
+KEYWORD REGISTRY CHECK — complete this after auditing the current page and before
+keyword research. Read memory/keyword-registry.md. Check the current and proposed
+keyword against other URLs. If another page owns the same or a very close keyword,
+STOP and recommend a merge/redirect or a different angle. If there is no conflict,
+continue and update this page's registry entry when the target changes.
+"""
+    return ""
+
+
 def _webflow_approval_note() -> str:
     """Keep Webflow-dependent runs in proposal mode until a user approves."""
     return """
@@ -273,7 +296,7 @@ Step 7 — Report:
         return _append_user_notes(_prompt, comments)
 
     elif etype == "blog_write":
-        _prompt = base + f"""
+        _prompt = base + _keyword_registry_instruction(etype) + f"""
 You are executing an SEO task: research and write a new blog post.
 
 Primary goal: produce a publish-ready blog draft first.
@@ -336,7 +359,7 @@ Step 7 — Report:
         return _append_user_notes(_prompt, comments)
 
     elif etype == "rewrite_blog_content":
-        _prompt = base + f"""
+        _prompt = base + _keyword_registry_instruction(etype) + f"""
 You are executing an SEO task: rewrite existing blog content for better SEO.
 
 Primary goal: produce a revised final draft first.

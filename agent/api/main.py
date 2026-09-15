@@ -31,7 +31,7 @@ from agent.api.helpers import (
     recover_stale_runs,
 )
 from agent.api.rate_limit import _rate_limit_value, limiter  # noqa: F401 - compatibility export
-from agent.api.routers import automation, comments, runs, tasks
+from agent.api.routers import automation, comments, gsc, runs, tasks
 from agent.db import _ensure_orchestration_handoff_column
 
 logger = logging.getLogger(__name__)
@@ -219,6 +219,7 @@ app.include_router(tasks.router)
 app.include_router(comments.router)
 app.include_router(runs.router)
 app.include_router(automation.router)
+app.include_router(gsc.router)
 
 
 # ============================================================================
