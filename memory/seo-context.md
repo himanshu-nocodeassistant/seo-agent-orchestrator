@@ -2,11 +2,11 @@
 
 ## Recent Runs
 
-### 2026-09-15T11:28:45 - Write post
-- Run ID: `8024fb5e-a80e-4224-91ed-3391527d5ec9`
-- Status: failed
-- Trigger: orchestrator
-- Execution Type: campaign_draft_writer
+### 2026-09-15T11:59:36 - Update Webflow title
+- Run ID: `7dcfc81a-56bb-4584-9e64-fef6486f3950`
+- Status: review_required
+- Trigger: manual_execute
+- Execution Type: rewrite_title
 - Session ID: n/a
 - Validator Status: failed
-- Summary: name 'write_capable' is not defined
+- Summary: Draft only

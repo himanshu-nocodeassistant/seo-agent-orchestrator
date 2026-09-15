@@ -3,10 +3,9 @@
 Extracted from the former agent/api/main.py monolith (see git history).
 """
 
-import hashlib
 import json
-import logging
 import os
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -16,8 +15,9 @@ from agent.api.helpers import (
     add_task_comment,
     add_task_completed_comment,
     add_task_failed_comment,
-    add_task_started_comment,
     _build_runtime_config,
+    _claim_campaign_resume,
+    _create_run,
     _execute_campaign_with_timeout,
     _finalize_run_failure,
     _finalize_run_success,
@@ -37,6 +37,7 @@ from agent.db import (
     CommentModel,
     ExecuteRequestModel,
     OrchestrationStateModel,
+    RunLeaseModel,
     RunResponse,
     TaskCreate,
     TaskListResponse,
@@ -52,140 +53,39 @@ from agent.db import (
 )
 from agent.feedback_loop import CMS_CHANGE_FIELD_MAP, _write_change_log_entry
 from agent.prompts import build_execution_prompt
-from agent.run_claims import (
-    IdempotencyConflict,
-    LeaseLost,
-    NeedsReview,
-    RunClaimConflict,
-    RunClaimService,
-    lease_heartbeat,
-)
-from agent.runtime_profiles import WEBFLOW_TOOLS, get_execution_profile
+from agent.runtime_profiles import ValidationResult, get_execution_profile
 from agent.webflow.approvals import Operation, compare_snapshot, requires_approval
 from agent.webflow.proposal_parser import extract_webflow_proposal
 from agent.webflow.tools import get_client
 
 router = APIRouter()
-logger = logging.getLogger(__name__)
 
 
-def _request_idempotency_key(request: Request) -> str:
-    """Read the public request key, with an explicit test-only escape hatch."""
+def _idempotency_key(request: Request) -> str:
     key = request.headers.get("Idempotency-Key", "").strip()
     if key:
         return key
-    # Existing local callers can opt into the old behaviour while migrating.
-    # Production remains strict: a missing key is a client error by default.
-    if os.environ.get("ALLOW_MISSING_IDEMPOTENCY_KEY", "false").lower() in {
-        "1", "true", "yes", "on"
-    }:
+    if os.environ.get("ALLOW_MISSING_IDEMPOTENCY_KEY", "false").lower() in {"1", "true", "yes", "on"}:
         return f"compat-{uuid4()}"
     raise HTTPException(status_code=422, detail="Idempotency-Key header is required")
 
 
-def _request_fingerprint(*, task_id: int, execution_type: str | None, resume: bool,
-                         acknowledge_stale: bool) -> str:
-    payload = {
-        "task_id": task_id,
-        "execution_type": execution_type or "manual",
-        "resume": resume,
-        "acknowledge_stale": acknowledge_stale,
-    }
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+def _request_fingerprint(task_id: int, resume: bool) -> str:
+    return f"task:{task_id}:resume:{resume}"
 
 
-def _is_write_capable(profile) -> bool:
-    """Conservatively identify runs whose stale result may have side effects."""
-    return bool(profile and set(profile.allowed_tools) & (set(WEBFLOW_TOOLS) | {"Write", "Edit"}))
-
-
-def _claim_http_error(error: Exception) -> HTTPException:
-    if isinstance(error, IdempotencyConflict):
-        return HTTPException(
-            status_code=409,
-            detail={"code": "idempotency_conflict", "message": str(error)},
-        )
-    if isinstance(error, NeedsReview):
-        return HTTPException(
-            status_code=409,
-            detail={
-                "code": "needs_review",
-                "active_run_id": error.active_run_id,
-                "status": error.status,
-                "message": str(error),
-            },
-        )
-    if isinstance(error, RunClaimConflict):
-        return HTTPException(
-            status_code=409,
-            detail={
-                "code": "run_in_progress",
-                "active_run_id": error.active_run_id,
-                "status": error.status,
-                "message": str(error),
-            },
-        )
-    return HTTPException(status_code=400, detail=str(error))
-
-
-def _claim_task_run(
-    db,
-    task,
-    *,
-    request: Request,
-    resume: bool,
-    acknowledge_stale: bool,
-):
-    """Claim a task before producing comments, runs, or agent work."""
-    key = _request_idempotency_key(request)
-    try:
-        profile = get_execution_profile(task.execution_type)
-    except ValueError:
-        # Preserve the existing API behaviour: an unknown type gets a failed
-        # run record, rather than failing before a run can be audited.
-        profile = None
-    fingerprint = _request_fingerprint(
-        task_id=task.id,
-        execution_type=task.execution_type,
-        resume=resume,
-        acknowledge_stale=acknowledge_stale,
-    )
-    service = RunClaimService(db)
-    try:
-        claim = service.acquire(
-            task.id,
+def _record_execute_request(db, task_id: int, run_id: str, key: str, fingerprint: str) -> None:
+    db.add(
+        ExecuteRequestModel(
+            request_scope=f"task:{task_id}",
             idempotency_key=key,
             fingerprint=fingerprint,
-            execution_type=task.execution_type or "manual",
-            trigger_source="manual_execute",
-            write_capable=_is_write_capable(profile),
-            acknowledge_stale=acknowledge_stale,
+            task_id=task_id,
+            run_id=run_id,
+            created_at=datetime.now(timezone.utc).replace(tzinfo=None),
         )
-    except (IdempotencyConflict, NeedsReview, RunClaimConflict, ValueError) as error:
-        raise _claim_http_error(error) from error
-    run = db.query(AgentRunModel).filter(AgentRunModel.run_id == claim.run_id).one()
-    run.request_id = getattr(request.state, "request_id", None)
+    )
     db.commit()
-    return service, claim, run, profile
-
-
-def _campaign_ownership_guard(claim):
-    """Build a guard that checks the parent lease with an isolated session."""
-    def _guard():
-        guard_db = get_db_session()
-        try:
-            RunClaimService(guard_db).assert_ownership(
-                claim.task_id,
-                claim.run_id,
-                claim.owner_token,
-                claim.fence_version,
-            )
-        finally:
-            guard_db.close()
-
-    return _guard
 
 
 def _webflow_proposal_response(proposal: WebflowProposalModel) -> dict:
@@ -668,18 +568,30 @@ async def approve_webflow_proposal(request: Request, task_id: int, proposal_id: 
 
 @router.post("/tasks/{task_id}/execute", response_model=RunResponse)
 @limiter.limit(lambda: _rate_limit_value())
-async def execute_task(
-    request: Request,
-    task_id: int,
-    resume: bool = False,
-    acknowledge_stale: bool = False,
-):
+async def execute_task(request: Request, task_id: int, resume: bool = False):
     """Execute a task via SEOAgent and return the run record."""
     db = get_db_session()
     try:
         task = db.query(TaskModel).filter(TaskModel.id == task_id).first()
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
+        supplied_key = request.headers.get("Idempotency-Key", "").strip()
+        key = _idempotency_key(request)
+        fingerprint = _request_fingerprint(task.id, resume)
+        prior_request = db.query(ExecuteRequestModel).filter_by(
+            request_scope=f"task:{task.id}", idempotency_key=key
+        ).one_or_none()
+        if prior_request is not None:
+            prior_run = db.query(AgentRunModel).filter_by(run_id=prior_request.run_id).one()
+            if prior_request.fingerprint != fingerprint:
+                raise HTTPException(status_code=409, detail="Idempotency key was reused for another request")
+            return _run_response(prior_run)
+        if task.active_run_id and not resume:
+            active = db.query(AgentRunModel).filter_by(run_id=task.active_run_id).first()
+            if active is not None:
+                if supplied_key:
+                    raise HTTPException(status_code=409, detail={"message": "Task already running", "active_run_id": active.run_id, "status": active.status})
+                return _run_response(active)
         latest_task_run = (
             db.query(AgentRunModel)
             .filter(AgentRunModel.task_id == task.id)
@@ -743,46 +655,47 @@ async def execute_task(
                         status_code=400,
                         detail="No existing campaign run to resume.",
                     )
-                key = _request_idempotency_key(request)
-                fingerprint = _request_fingerprint(
-                    task_id=task.id,
-                    execution_type=task.execution_type,
-                    resume=True,
-                    acknowledge_stale=acknowledge_stale,
-                )
-                claim_service = RunClaimService(db)
-                # A retry must replay even after the campaign has finished.
-                # Check the durable request first, before validating the
-                # current approval state.
-                prior_request = db.query(ExecuteRequestModel).filter_by(
-                    request_scope=f"task:{task.id}", idempotency_key=key
-                ).one_or_none()
-                if prior_request is None:
-                    state = db.query(OrchestrationStateModel).filter(
-                        OrchestrationStateModel.orchestrator_run_id == run.run_id
-                    ).first()
-                    if state is None or state.status != "awaiting_approval":
-                        raise HTTPException(
-                            status_code=400,
-                            detail="Campaign is not paused awaiting approval.",
-                        )
-                    if not task.approved_at:
-                        raise HTTPException(
-                            status_code=400,
-                            detail="Task not approved yet — set approved_at first.",
-                        )
-                try:
-                    claim = claim_service.acquire_resume(
-                        task.id,
-                        run.run_id,
-                        idempotency_key=key,
-                        fingerprint=fingerprint,
+                state = db.query(OrchestrationStateModel).filter(
+                    OrchestrationStateModel.orchestrator_run_id == run.run_id
+                ).first()
+                if state is None or state.status not in {"awaiting_approval", "error", "running"}:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Campaign has no safely recoverable saved state.",
                     )
-                except (IdempotencyConflict, NeedsReview, RunClaimConflict, ValueError) as error:
-                    raise _claim_http_error(error) from error
-
-                run = db.query(AgentRunModel).filter(AgentRunModel.run_id == claim.run_id).one()
-                if claim.replayed:
+                if state.status == "awaiting_approval" and not task.approved_at:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Task not approved yet — set approved_at first.",
+                    )
+                pending_proposal = (
+                    db.query(WebflowProposalModel)
+                    .join(TaskModel, WebflowProposalModel.task_id == TaskModel.id)
+                    .filter(
+                        TaskModel.parent_task_id == task.id,
+                        WebflowProposalModel.status.in_(
+                            {"pending_approval", "partial_failed"}
+                        ),
+                    )
+                    .first()
+                )
+                if pending_proposal is not None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Campaign has a Webflow proposal awaiting approval.",
+                    )
+                lease = db.query(RunLeaseModel).filter_by(
+                    task_id=task.id, run_id=run.run_id
+                ).one_or_none()
+                if (lease is None or lease.status == "active") and run.status in {"running", "resuming"}:
+                    return _run_response(run)
+                if db.query(ExecuteRequestModel).filter_by(
+                    request_scope=f"task:{task.id}", idempotency_key=key
+                ).one_or_none() is None:
+                    _record_execute_request(db, task.id, run.run_id, key, fingerprint)
+                if not _claim_campaign_resume(
+                    db, run.run_id, request_id=getattr(request.state, "request_id", None)
+                ):
                     db.refresh(run)
                     return _run_response(run)
                 task.status = "in_progress"
@@ -799,116 +712,220 @@ async def execute_task(
                     db.refresh(run)
                     return _run_response(run)
                 try:
-                    async with lease_heartbeat(claim):
-                        await _execute_campaign_with_timeout(
-                            db,
-                            task,
-                            run,
-                            resume=True,
-                            ownership_guard=_campaign_ownership_guard(claim),
-                            run_claim=claim,
-                        )
+                    await _execute_campaign_with_timeout(db, task, run, resume=True)
                 except Exception as e:
-                    try:
-                        claim_service.assert_ownership(
-                            claim.task_id, claim.run_id,
-                            claim.owner_token, claim.fence_version,
-                        )
-                        _finalize_run_failure(db, run, task, str(e), claim=claim)
-                        _refresh_context_view(db, task_id=task.id)
-                        add_task_failed_comment(db, task_id, str(e))
-                    except LeaseLost:
-                        logger.warning("Resume worker lost lease for run %s", run.run_id)
-                else:
-                    state = db.query(OrchestrationStateModel).filter(
-                        OrchestrationStateModel.orchestrator_run_id == run.run_id
-                    ).first()
-                    try:
-                        if state is not None and state.status == "awaiting_approval":
-                            claim_service.pause(
-                                claim.task_id, claim.run_id,
-                                claim.owner_token, claim.fence_version,
-                            )
-                        else:
-                            claim_service.release(
-                                claim.task_id, claim.run_id,
-                                claim.owner_token, claim.fence_version,
-                            )
-                    except LeaseLost:
-                        logger.warning("Resume worker lost lease while closing run %s", run.run_id)
+                    error_message = str(e)
+                    owns_task = _finalize_run_failure(db, run, task, error_message)
+                    if not owns_task:
+                        db.refresh(run)
+                        return _run_response(run)
+                    if helpers_module._run_post_finalize_side_effects(
+                        db,
+                        task.id,
+                        run.run_id,
+                        lambda: (
+                            _refresh_context_view(db, task_id=task.id),
+                            add_task_failed_comment(db, task_id, error_message, commit=False),
+                        ),
+                    ) is False:
+                        db.refresh(run)
+                        return _run_response(run)
                 db.refresh(run)
                 return _run_response(run)
 
-            claim_service, claim, run, _ = _claim_task_run(
-                db,
-                task,
-                request=request,
-                resume=False,
-                acknowledge_stale=acknowledge_stale,
+            retry_run = (
+                db.query(AgentRunModel)
+                .filter(
+                    AgentRunModel.task_id == task.id,
+                    AgentRunModel.execution_type == "orchestrate_seo_campaign",
+                )
+                .order_by(AgentRunModel.id.desc())
+                .first()
             )
-            if claim.replayed:
-                db.refresh(run)
-                return _run_response(run)
-            task.status = "in_progress"
-            task.updated_at = _utcnow_iso()
-            db.commit()
-            add_task_started_comment(db, task_id, task.title)
-
-            try:
-                async with lease_heartbeat(claim):
-                    await _execute_campaign_with_timeout(
+            retry_state = None
+            if retry_run is not None:
+                retry_state = db.query(OrchestrationStateModel).filter(
+                    OrchestrationStateModel.orchestrator_run_id == retry_run.run_id
+                ).first()
+            if (
+                retry_run is not None
+                and retry_run.status == "failed"
+                and retry_state is not None
+                and retry_state.status == "error"
+            ):
+                if helpers_module._campaign_has_blocking_publisher_child(
+                    db, task, retry_run.run_id
+                ):
+                    blocked = helpers_module._mark_campaign_retry_review_required(
                         db,
                         task,
-                        run,
-                        ownership_guard=_campaign_ownership_guard(claim),
-                        run_claim=claim,
+                        retry_run,
+                        retry_state,
+                        "Campaign retry blocked: a write-capable child has an uncertain write.",
                     )
+                    if not blocked:
+                        db.refresh(retry_run)
+                    return _run_response(retry_run)
+                if not _claim_campaign_resume(
+                    db,
+                    retry_run.run_id,
+                    request_id=getattr(request.state, "request_id", None),
+                ):
+                    db.refresh(retry_run)
+                    return _run_response(retry_run)
+                if not helpers_module._add_owned_task_comment(
+                    db,
+                    task_id,
+                    retry_run.run_id,
+                    "🤖 Campaign retry resuming saved phases",
+                ):
+                    db.refresh(retry_run)
+                    return _run_response(retry_run)
+                try:
+                    await _execute_campaign_with_timeout(
+                        db, task, retry_run, resume=True
+                    )
+                except Exception as e:
+                    error_message = str(e)
+                    owns_task = _finalize_run_failure(db, retry_run, task, error_message)
+                    if not owns_task:
+                        db.refresh(retry_run)
+                        return _run_response(retry_run)
+                    if helpers_module._run_post_finalize_side_effects(
+                        db,
+                        task.id,
+                        retry_run.run_id,
+                        lambda: (
+                            _refresh_context_view(db, task_id=task.id),
+                            add_task_failed_comment(db, task_id, error_message, commit=False),
+                        ),
+                    ) is False:
+                        db.refresh(retry_run)
+                        return _run_response(retry_run)
+                db.refresh(retry_run)
+                return _run_response(retry_run)
+
+            if (
+                retry_run is not None
+                and retry_run.status == "recoverable"
+                and retry_state is not None
+                and retry_state.status in {"running", "error"}
+                and not retry_run.write_capable
+            ):
+                if not _claim_campaign_resume(
+                    db,
+                    retry_run.run_id,
+                    request_id=getattr(request.state, "request_id", None),
+                ):
+                    db.refresh(retry_run)
+                    return _run_response(retry_run)
+                if not helpers_module._add_owned_task_comment(
+                    db,
+                    task_id,
+                    retry_run.run_id,
+                    "🤖 Campaign recovering saved read-only phases",
+                ):
+                    db.refresh(retry_run)
+                    return _run_response(retry_run)
+                try:
+                    await _execute_campaign_with_timeout(
+                        db, task, retry_run, resume=True
+                    )
+                except Exception as e:
+                    error_message = str(e)
+                    owns_task = _finalize_run_failure(db, retry_run, task, error_message)
+                    if not owns_task:
+                        db.refresh(retry_run)
+                        return _run_response(retry_run)
+                    if helpers_module._run_post_finalize_side_effects(
+                        db,
+                        task.id,
+                        retry_run.run_id,
+                        lambda: (
+                            _refresh_context_view(db, task_id=task.id),
+                            add_task_failed_comment(db, task_id, error_message, commit=False),
+                        ),
+                    ) is False:
+                        db.refresh(retry_run)
+                        return _run_response(retry_run)
+                db.refresh(retry_run)
+                return _run_response(retry_run)
+
+            run = _create_run(
+                db,
+                task,
+                "manual_execute",
+                task.execution_type or "manual",
+                request_id=getattr(request.state, "request_id", None),
+            )
+            if not getattr(run, "_claim_created", True):
+                return _run_response(run)
+            _record_execute_request(db, task.id, run.run_id, key, fingerprint)
+            if not helpers_module._add_owned_task_comment(
+                db, task_id, run.run_id, "🤖 Task started by agent"
+            ):
+                db.refresh(run)
+                return _run_response(run)
+
+            try:
+                await _execute_campaign_with_timeout(db, task, run)
             except Exception as e:
-                try:
-                    claim_service.assert_ownership(
-                        claim.task_id, claim.run_id,
-                        claim.owner_token, claim.fence_version,
-                    )
-                    _finalize_run_failure(db, run, task, str(e), claim=claim)
-                    _refresh_context_view(db, task_id=task.id)
-                    add_task_failed_comment(db, task_id, str(e))
-                except LeaseLost:
-                    logger.warning("Campaign worker lost lease for run %s", run.run_id)
-            else:
-                state = db.query(OrchestrationStateModel).filter(
-                    OrchestrationStateModel.orchestrator_run_id == run.run_id
-                ).first()
-                try:
-                    if state is not None and state.status == "awaiting_approval":
-                        claim_service.pause(
-                            claim.task_id, claim.run_id,
-                            claim.owner_token, claim.fence_version,
-                        )
-                    else:
-                        claim_service.release(
-                            claim.task_id, claim.run_id,
-                            claim.owner_token, claim.fence_version,
-                        )
-                except LeaseLost:
-                    logger.warning("Campaign worker lost lease while closing run %s", run.run_id)
+                error_message = str(e)
+                owns_task = _finalize_run_failure(db, run, task, error_message)
+                if not owns_task:
+                    db.refresh(run)
+                    return _run_response(run)
+                if helpers_module._run_post_finalize_side_effects(
+                    db,
+                    task.id,
+                    run.run_id,
+                    lambda: (
+                        _refresh_context_view(db, task_id=task.id),
+                        add_task_failed_comment(db, task_id, error_message, commit=False),
+                    ),
+                ) is False:
+                    db.refresh(run)
+                    return _run_response(run)
             db.refresh(run)
             return _run_response(run)
         # ── End orchestration branch ──────────────────────────────────────────
 
-        claim_service, claim, run, profile = _claim_task_run(
+        # A blocked or review-gated task can only run again after an explicit
+        # review resolution. Changing the task card back to ``pending`` must
+        # not bypass the durable run-level safety gate.
+        if not resume and (
+            task.status in {"blocked", "review_required"}
+            or helpers_module._task_has_review_gate(db, task)
+        ):
+            if latest_task_run is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Task is blocked pending explicit review resolution.",
+                )
+            return _run_response(latest_task_run)
+
+        profile = get_execution_profile(task.execution_type)
+        if profile.requires_approval and not task.approved_at:
+            raise HTTPException(
+                status_code=400,
+                detail="Task requires approval before execution.",
+            )
+
+        run = _create_run(
             db,
             task,
-            request=request,
-            resume=False,
-            acknowledge_stale=acknowledge_stale,
+            "manual_execute",
+            task.execution_type or "manual",
+            request_id=getattr(request.state, "request_id", None),
         )
-        if claim.replayed:
+        if not getattr(run, "_claim_created", True):
+            return _run_response(run)
+        _record_execute_request(db, task.id, run.run_id, key, fingerprint)
+        if not helpers_module._add_owned_task_comment(
+            db, task_id, run.run_id, "🤖 Task started by agent"
+        ):
             db.refresh(run)
             return _run_response(run)
-        task.status = "in_progress"
-        task.updated_at = _utcnow_iso()
-        db.commit()
-        add_task_started_comment(db, task_id, task.title)
 
         try:
             task_comments = db.query(CommentModel).filter(CommentModel.task_id == task_id).order_by(CommentModel.created_at).all()
@@ -920,43 +937,21 @@ async def execute_task(
             config = _build_runtime_config(
                 profile, resume_session_id, db=db, run_id=run.run_id
             )
-            async with lease_heartbeat(claim):
-                execution = _normalize_execution_result(
-                    await helpers_module._run_agent_prompt(
-                        workflow_prompt, config, prompt_context
-                    )
+            execution = _normalize_execution_result(
+                await helpers_module._run_agent_prompt(
+                    workflow_prompt, config, prompt_context
                 )
+            )
             validation = profile.validator(execution.result_text)
-            claim_service.assert_ownership(
-                claim.task_id, claim.run_id,
-                claim.owner_token, claim.fence_version,
+            stored_webflow_proposal = None
+            webflow_access_missing = (
+                profile.requires_webflow_approval
+                and not os.environ.get("WEBFLOW_ACCESS_TOKEN")
             )
-            _finalize_run_success(
-                db,
-                run,
-                task,
-                execution.result_text,
-                execution.session_id,
-                validation,
-                claim=claim,
-            )
-            _refresh_context_view(db, task_id=task.id)
-
-            # Deterministic application-layer change logging (guaranteed, not prompt-dependent)
-            if task.execution_type in CMS_CHANGE_FIELD_MAP:
-                try:
-                    _write_change_log_entry(task, execution.result_text, task_comments)
-                except Exception as log_err:
-                    add_task_comment(db, task_id, f"⚠️ Change log write failed: {log_err}", "agent")
-
-            if validation.status == "passed":
-                add_task_completed_comment(db, task_id, execution.result_text)
-            else:
-                add_task_comment(
-                    db,
-                    task_id,
-                    f"⚠️ Run completed but failed validation: {validation.message}",
-                    "agent",
+            if webflow_access_missing:
+                validation = ValidationResult(
+                    status="failed",
+                    message="Webflow access is required for this approval-controlled task.",
                 )
             if profile.requires_webflow_approval and os.environ.get("WEBFLOW_ACCESS_TOKEN"):
                 proposal_data = extract_webflow_proposal(execution.result_text)
@@ -1042,16 +1037,21 @@ async def execute_task(
             # for a run that may now belong to another worker.
             db.refresh(run)
         except Exception as e:
-            try:
-                claim_service.assert_ownership(
-                    claim.task_id, claim.run_id,
-                    claim.owner_token, claim.fence_version,
-                )
-                _finalize_run_failure(db, run, task, str(e), claim=claim)
+            error_message = str(e)
+            owns_task = _finalize_run_failure(db, run, task, error_message)
+            if not owns_task:
+                db.refresh(run)
+                return _run_response(run)
+            def post_failure_side_effects():
                 _refresh_context_view(db, task_id=task.id)
-                add_task_failed_comment(db, task_id, str(e))
-            except LeaseLost:
-                logger.warning("Worker lost lease for run %s", run.run_id)
+                add_task_failed_comment(db, task_id, error_message, commit=False)
+
+            if not helpers_module._run_post_finalize_side_effects(
+                db, task.id, run.run_id, post_failure_side_effects
+            ):
+                db.refresh(run)
+                return _run_response(run)
+
         db.refresh(run)
         return _run_response(run)
     finally:

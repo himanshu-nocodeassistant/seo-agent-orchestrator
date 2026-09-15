@@ -346,9 +346,8 @@ async def _dispatch_phase(
     campaign_goal: str,
     helpers: dict,
     phase_has_dependents: bool,
-    ownership_guard=None,
     ownership_check=None,
-) -> tuple[str, str, bool]:
+) -> tuple[str, str, bool, bool]:
     """
     Run a single child agent phase and return (phase_name, result_text, degraded,
     awaiting_webflow_approval).
@@ -363,7 +362,6 @@ async def _dispatch_phase(
     phases never share/interleave a SQLAlchemy session (the PostToolUse hook
     and run/task writes all go through the phase-local session).
     """
-    ownership_guard = ownership_guard or ownership_check
     if ownership_check is not None and not ownership_check():
         raise LostRunOwnership("Campaign parent run ownership was lost before child dispatch")
 
@@ -374,11 +372,9 @@ async def _dispatch_phase(
     phase_name = phase_spec["phase"]
     child_exec_type = phase_spec.get("execution_type", phase_name)
     child_profile = get_execution_profile(child_exec_type)
-    guard = ownership_guard or (lambda: None)
 
     phase_db = SessionLocal()
     try:
-        guard()
         child_task = phase_db.query(TaskModel).filter(TaskModel.id == child_task_id).first()
         if child_task is None:
             raise RuntimeError(f"Child task {child_task_id} not found for phase [{phase_name}]")
@@ -407,19 +403,36 @@ async def _dispatch_phase(
             child_profile, None, db=phase_db, run_id=child_run.run_id
         )
 
-        guard()
-        child_execution = helpers["_normalize_execution_result"](
-            await _run_with_retry(
-                helpers["_run_agent_prompt"],
-                child_prompt,
-                child_config,
-                child_prompt_context,
-                max_retries=2,
-                base_delay=1.0,
-                max_total_seconds=child_profile.timeout_seconds,
+        write_capable = helpers.get("_is_write_capable", lambda value: False)(child_exec_type)
+        try:
+            child_execution = helpers["_normalize_execution_result"](
+                await _await_with_ownership(
+                    _run_with_retry(
+                        helpers["_run_agent_prompt"],
+                        child_prompt,
+                        child_config,
+                        child_prompt_context,
+                        max_retries=1 if write_capable else 2,
+                        base_delay=1.0,
+                        max_total_seconds=child_profile.timeout_seconds,
+                        trace_db=phase_db,
+                        trace_run_id=child_run.run_id,
+                    ),
+                    ownership_check,
+                )
             )
-        )
-        guard()
+        except LostRunOwnership:
+            raise
+        except BaseException as exc:
+            if write_capable:
+                helpers["_finalize_run_failure"](
+                    phase_db,
+                    child_run,
+                    child_task,
+                    f"Write result is uncertain: {exc}",
+                    status="review_required",
+                )
+            raise
         result_text = child_execution.result_text or ""
         session_id = child_execution.session_id
 
@@ -427,7 +440,12 @@ async def _dispatch_phase(
         # '## Summary for Next Phase' block. If missing, run ONE correction
         # retry asking only for the block — no extra cost for final phases.
         if phase_has_dependents and _extract_summary_block(result_text) is None:
-            guard()
+            if write_capable:
+                error = "Write result is uncertain: handoff correction would repeat a write-capable phase."
+                helpers["_finalize_run_failure"](
+                    phase_db, child_run, child_task, error, status="review_required"
+                )
+                raise RuntimeError(error)
             retry_prompt = (
                 f"{child_prompt}\n\nIMPORTANT: Your previous output did not include "
                 "a structured handoff for the next phase. Keep everything you "
@@ -457,7 +475,6 @@ async def _dispatch_phase(
                 result_text = retry_execution.result_text
                 session_id = retry_execution.session_id or session_id
 
-        guard()
         child_validation = child_profile.validator(result_text)
         if child_validation.status == "failed":
             if write_capable:
@@ -532,12 +549,7 @@ async def _dispatch_phase(
 
 
 async def run_campaign_orchestration(
-    db,
-    parent_task,
-    orchestrator_run,
-    resume: bool = False,
-    ownership_guard=None,
-    run_claim=None,
+    db, parent_task, orchestrator_run, resume: bool = False
 ) -> None:
     """Run a campaign while keeping its parent run lease alive."""
     from agent.api import helpers as helpers_module
@@ -572,8 +584,6 @@ async def run_campaign_orchestration(
             _run_campaign_orchestration(
                 db, parent_task, orchestrator_run, resume=resume,
                 ownership_lost=ownership_lost,
-                ownership_guard=ownership_guard,
-                run_claim=run_claim,
             ),
             lambda: not ownership_lost.is_set() and _campaign_run_owns_task(
                 db, parent_task.id, orchestrator_run.run_id
@@ -591,8 +601,6 @@ async def run_campaign_orchestration(
 async def _run_campaign_orchestration(
     db, parent_task, orchestrator_run, resume: bool = False,
     ownership_lost: Optional[asyncio.Event] = None,
-    ownership_guard=None,
-    run_claim=None,
 ) -> None:
     """
     Drive a full multi-agent SEO campaign from a single orchestrator run.
@@ -673,14 +681,14 @@ async def _run_campaign_orchestration(
         "_run_agent_prompt": helpers_module._run_agent_prompt,
         "_is_write_capable": helpers_module._is_write_capable,
     }
-    guard = ownership_guard or ensure_ownership
 
     campaign_goal = parent_task.description or parent_task.title
-    guard()
 
     # ── Resume path: reuse the saved plan/state from the paused run ───────────
     if resume:
-        guard()
+        if not getattr(orchestrator_run, "_resume_claimed", False):
+            if not helpers_module._claim_campaign_resume(db, orchestrator_run.run_id):
+                return
         state = db.query(OrchestrationStateModel).filter(
             OrchestrationStateModel.orchestrator_run_id == orchestrator_run.run_id
         ).first()
@@ -696,15 +704,9 @@ async def _run_campaign_orchestration(
             phase_outputs = json.loads(state.phase_outputs_json or "{}")
             child_run_ids = json.loads(state.child_run_ids_json or "[]")
         except (ValueError, json.JSONDecodeError) as e:
-            helpers_module._finalize_run_failure(
-                db,
-                orchestrator_run,
-                parent_task,
-                f"Resume failed: {e}",
-                claim=run_claim,
-            )
-            helpers_module.add_task_failed_comment(
-                db, parent_task.id, f"Resume failed: {e}"
+            error_message = f"Resume failed: {e}"
+            owns_parent = helpers_module._finalize_run_failure(
+                db, orchestrator_run, parent_task, error_message
             )
             if owns_parent:
                 helpers_module._run_post_finalize_side_effects(
@@ -724,8 +726,22 @@ async def _run_campaign_orchestration(
         ensure_ownership()
         state.status = "running"
         state.updated_at = datetime.utcnow().isoformat()
-        db.commit()
-        guard()
+        commit_owned()
+
+        if _campaign_has_blocking_publisher_child(
+            db, parent_task.id, orchestrator_run.run_id
+        ) or helpers_module._campaign_has_unrecorded_publisher_write(
+            db, parent_task, orchestrator_run.run_id
+        ):
+            state.status = "review_required"
+            state.error = "A write-capable child is in review and cannot be retried automatically."
+            state.updated_at = datetime.utcnow().isoformat()
+            commit_owned()
+            helpers_module._finalize_run_failure(
+                db, orchestrator_run, parent_task, state.error,
+                status="review_required",
+            )
+            return
 
         # Reload existing child tasks (matched by the deterministic title scheme
         # used in _create_child_task) and drop tiers that are fully completed.
@@ -753,7 +769,7 @@ async def _run_campaign_orchestration(
             summary = "Campaign already completed."
             owns_parent = helpers_module._finalize_run_success(
                 db, orchestrator_run, parent_task, summary, None,
-                ValidationResult(status="passed"), claim=run_claim,
+                ValidationResult(status="passed"),
             )
             if owns_parent:
                 helpers_module.add_task_completed_comment(db, parent_task.id, summary)
@@ -761,7 +777,6 @@ async def _run_campaign_orchestration(
 
     # ── Fresh run: orchestrator produces plan ────────────────────────────────
     else:
-        guard()
         orch_profile = get_execution_profile("orchestrate_seo_campaign")
         orch_config = helpers_module._build_runtime_config(
             orch_profile, None, db=db, run_id=orchestrator_run.run_id
@@ -788,7 +803,6 @@ async def _run_campaign_orchestration(
                 trace_run_id=orchestrator_run.run_id,
             )
         )
-        guard()
         plan_text = raw_execution.result_text or ""
 
         try:
@@ -801,10 +815,19 @@ async def _run_campaign_orchestration(
                 )
             tiers = _resolve_execution_tiers(phases)
         except ValueError as e:
-            helpers_module._finalize_run_failure(
-                db, orchestrator_run, parent_task, str(e), claim=run_claim
+            error_message = str(e)
+            owns_parent = helpers_module._finalize_run_failure(
+                db, orchestrator_run, parent_task, error_message
             )
-            helpers_module.add_task_failed_comment(db, parent_task.id, str(e))
+            if owns_parent:
+                helpers_module._run_post_finalize_side_effects(
+                    db,
+                    parent_task.id,
+                    orchestrator_run.run_id,
+                    lambda: helpers_module.add_task_failed_comment(
+                        db, parent_task.id, error_message, commit=False
+                    ),
+                )
             return
 
         # ── Persist orchestration state ──────────────────────────────────────
@@ -823,7 +846,6 @@ async def _run_campaign_orchestration(
         db.add(state)
         commit_owned()
         db.refresh(state)
-        guard()
 
         # ── Create child tasks ───────────────────────────────────────────────
         child_tasks = {}
@@ -850,7 +872,7 @@ async def _run_campaign_orchestration(
 
     # ── Tier-by-tier dispatch (parallel within tier) ─────────────────────────
     for tier in tiers:
-        guard()
+        ensure_ownership()
         pending_in_tier = [p for p in tier if p["phase"] not in phase_outputs]
         if not pending_in_tier:
             continue
@@ -875,7 +897,6 @@ async def _run_campaign_orchestration(
             child_exec_type = phase_spec.get("execution_type", phase_spec["phase"])
             child_profile = get_execution_profile(child_exec_type)
             if child_profile.requires_approval and not parent_task.approved_at:
-                guard()
                 state.status = "awaiting_approval"
                 state.current_phase = phase_spec["phase"]
                 state.updated_at = datetime.utcnow().isoformat()
@@ -902,18 +923,21 @@ async def _run_campaign_orchestration(
                 db, phase_spec, child_tasks[phase_spec["phase"]].id,
                 orchestrator_run.run_id, phase_outputs, campaign_goal, helpers,
                 phase_spec["phase"] in dependents,
-                ownership_guard=guard,
+                ownership_check=lambda: (
+                    ownership_lost is None or not ownership_lost.is_set()
+                ) and _campaign_run_owns_task(
+                    db, parent_task.id, orchestrator_run.run_id
+                ),
             )
             for phase_spec in pending_in_tier
         ]
 
         tier_results = await asyncio.gather(*tasks_coros, return_exceptions=True)
-        guard()
+        ensure_ownership()
 
         # Check for failures (fail-fast)
         failed_phase = None
         failed_error = None
-        parent_review_required = False
         awaiting_phase = None
         for phase_spec, result in zip(pending_in_tier, tier_results):
             if isinstance(result, BaseException):
@@ -921,7 +945,6 @@ async def _run_campaign_orchestration(
                     raise result
                 failed_phase = phase_spec["phase"]
                 failed_error = result
-                parent_review_required = True
                 # Mark failed child task
                 child_task = child_tasks[failed_phase]
                 failed_child_run = _get_latest_run_for_task(
@@ -932,6 +955,9 @@ async def _run_campaign_orchestration(
                     failed_child_run,
                     child_task,
                     str(failed_error),
+                    write_at_risk=bool(
+                        failed_child_run and failed_child_run.status == "review_required"
+                    ),
                 )
                 if child_owns_task:
                     helpers_module._run_post_finalize_side_effects(
@@ -990,10 +1016,13 @@ async def _run_campaign_orchestration(
             state.updated_at = datetime.utcnow().isoformat()
             commit_owned()
 
-            helpers_module._finalize_run_failure(
-                db, orchestrator_run, parent_task,
-                f"Campaign stopped at phase [{failed_phase}]: {failed_error}",
-                claim=run_claim,
+            failed_child_run = _get_latest_run_for_task(
+                db, AgentRunModel, child_tasks[failed_phase].id
+            ) if failed_phase else None
+            parent_review_required = bool(
+                failed_child_run
+                and failed_child_run.status == "review_required"
+                and _is_external_write_phase(pending_in_tier, failed_phase)
             )
             if parent_review_required:
                 state.status = "review_required"
@@ -1038,7 +1067,7 @@ async def _run_campaign_orchestration(
             return
 
     # ── Finalize campaign ─────────────────────────────────────────────────────
-    guard()
+    ensure_ownership()
     state.status = "completed"
     state.current_phase = None
     state.updated_at = datetime.utcnow().isoformat()
@@ -1056,7 +1085,6 @@ async def _run_campaign_orchestration(
         summary,
         raw_execution.session_id if not resume else None,
         ValidationResult(status="passed"),
-        claim=run_claim,
     )
     if owns_parent:
         helpers_module._run_post_finalize_side_effects(

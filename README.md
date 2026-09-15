@@ -14,17 +14,27 @@ A four-layer memory system feeds every prompt:
 
 ## Features
 
-- **Multi-agent campaign orchestration** — one campaign task (researcher → writer → publisher → analyst) with DAG-based parallelism, structured handoffs, retry on transient failures, and an approval gate before publishing
-- **15 SEO Skills** — SEO Audit, Content Strategy, Copywriting, Copy Editing, Brand Voice, Competitor Alternatives, Programmatic SEO, Schema Markup, Analytics Tracking, Page CRO, Marketing Psychology, Webflow CMS, Google Docs, SEO Feedback Loop, Task Breakdown
-- **Kanban UI** — visual task board at `http://localhost:8000/kanban`; create tasks, execute them, leave `@agent` comments for revisions
-- **Comment Autopilot** — background worker that picks up `@agent` comments and re-runs the agent automatically
-- **Run tracking** — every execution is recorded with status, session ID, validator result, and a result summary; child campaign runs link back to the orchestrator run via `parent_run_id`
-- **Duplicate-run protection** — database leases, fencing tokens, and idempotency keys prevent overlapping work across workers
-- **Session reuse** — the agent resumes the same Claude session for follow-up runs on a task, preserving context
-- **Webflow CMS** — create, update, and publish CMS items directly via the agent
-- **Google Docs** — save audit reports and blog drafts to Google Docs (read/write only — no delete)
-- **Google Search Console** — query live clicks, impressions, CTR, and position; inspect URL indexing status; list sitemaps (read-only)
-- **SEO Feedback Loop** — log CMS changes, review ranking impact using GSC data, extract learnings, propagate winning patterns
+- **Campaign orchestration:** researcher, writer, publisher, and analyst phases with dependencies, retries, handoffs, and approval before publishing
+- **SEO skills:** SEO Audit, Content Strategy, Copywriting, Copy Editing, Brand Voice, Competitor Alternatives, Programmatic SEO, Schema Markup, Analytics Tracking, Page CRO, Marketing Psychology, Webflow CMS, Google Docs, SEO Feedback Loop, Task Breakdown
+- **Kanban UI:** create tasks, execute them, and add `@agent` comments for revisions
+- **Comment Autopilot:** claims comments, runs revisions, and sends unsafe work for review
+- **Run tracing:** records run status, session ID, validator result, request ID, and tool events
+- **Recovery controls:** task claims, leases, heartbeats, stale-run recovery, ownership checks, and review states
+- **Session reuse:** follow-up runs can continue the same Claude session
+- **Integrations:** Webflow CMS, Google Docs, Google Search Console, and DataForSEO
+- **Measured ranking data:** DataForSEO provides keyword volumes, SERP positions, backlinks, and AI-search visibility for research and impact reviews
+- **SEO Feedback Loop:** records CMS changes and reviews ranking data
+
+## Reliability and recovery
+
+The API is designed for a small self-hosted deployment with SQLite and one process:
+
+- Execute requests atomically claim a task. A duplicate request returns the active run instead of starting another paid run.
+- Every run accepts or generates an `X-Request-ID`. The ID is returned in the response and stored on run and event records.
+- Runs use a 15-minute lease with heartbeats. Stale read-only work can recover; write-capable or uncertain work moves to `review_required` and does not retry automatically.
+- Comment actions and campaign children use database claims and ownership checks. A stale worker cannot finish a newer run or add post-run side effects.
+- DataForSEO preserves task IDs, manifests, partial results, and unknown submission outcomes. An uncertain paid POST is not sent again automatically.
+- Query trace events with `GET /runs/{run_id}/events?page=1&limit=50`. The server caps `limit` at 200.
 
 ## Requirements
 
@@ -144,9 +154,7 @@ Copy `.env.example` to `.env` and fill in the values you need.
 | `APP_ENV` | Kanban DB selection (`production` or `staging`) | `production` |
 | `DATABASE_URL` | Explicit DB URL (overrides `APP_ENV`) | unset |
 | `COMMENT_AUTOPILOT_ENABLED` | Enable `@agent` comment background worker | `true` |
-| `COMMENT_AUTOPILOT_INTERVAL_SECONDS` | Poll interval for comment autopilot | `900` |
-| `COMMENT_ACTION_STALE_SECONDS` | Timeout before a crashed comment action can retry | `300` |
-| `RUN_LEASE_TIMEOUT_SECONDS` | Database run-lease timeout; active workers renew it | `300` |
+| `COMMENT_AUTOPILOT_INTERVAL_SECONDS` | Poll interval for comment autopilot | `300` |
 | `AGENT_EXECUTION_TIMEOUT_SECONDS` | Timeout per agent execution | `900` |
 | `CAMPAIGN_TIMEOUT_SECONDS` | Maximum wall-clock time for one campaign | `5400` |
 | `ALLOWED_ORIGINS` | Comma-separated CORS origins for the local API | `http://localhost:8000,http://127.0.0.1:8000` |
