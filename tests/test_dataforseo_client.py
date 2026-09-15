@@ -11,6 +11,7 @@ import agent.dataforseo.logger as logger_module
 from agent.dataforseo.client import (
     DataForSEOClient,
     DataForSEOError,
+    DataForSEORecoveryError,
     TaskNotReadyError,
     _jittered_backoff,
     _TokenBucket,
@@ -174,10 +175,11 @@ class TestTaskPostAndPoll:
              ), \
              patch("agent.dataforseo.client.time.sleep"), \
              patch("agent.dataforseo.client.time.monotonic", side_effect=[0.0, 1000.0]):
-            results = client._task_post_and_poll(
-                "p", "g", [{"keyword": "x"}], poll_interval=1, max_wait=10
-            )
-        assert results == []
+            with pytest.raises(DataForSEORecoveryError) as exc_info:
+                client._task_post_and_poll(
+                    "p", "g", [{"keyword": "x"}], poll_interval=1, max_wait=10
+                )
+        assert exc_info.value.task_ids == ["slow"]
 
 
 class TestBackoff:

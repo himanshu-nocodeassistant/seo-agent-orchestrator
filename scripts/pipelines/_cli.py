@@ -23,6 +23,8 @@ import json
 from datetime import date
 from pathlib import Path
 
+from agent.dataforseo.client import DataForSEORecoveryError
+
 # Fields DataForSEO's llm_responses/* endpoints (ChatGPT/Claude/Gemini/
 # Perplexity) attach to each result item. Absent on every other endpoint.
 TOKEN_FIELDS = ("input_tokens", "output_tokens", "money_spent")
@@ -145,7 +147,27 @@ def run_pipeline(client_cls: type, pipeline_name: str) -> None:
 
     client = client_cls()
     method = getattr(client, args.method)
-    result = method(**kwargs)
+    recovery = None
+    try:
+        result = method(**kwargs)
+    except DataForSEORecoveryError as exc:
+        recovery = exc
+        result = exc.results
+        print(
+            f"Recovery required: {len(exc.task_ids)} submitted task(s) remain "
+            f"pending or uncertain. "
+            f"Manifest: {exc.manifest_path or 'unavailable'}"
+        )
+        print(
+            "Submitted task IDs: "
+            + (", ".join(exc.task_ids) if exc.task_ids else "none")
+        )
+        print(f"Partial results: {len(exc.results)}")
+        for error in exc.errors:
+            print(
+                f"Task {error.get('task_id', 'unknown')} failed: "
+                f"{error.get('error', 'unknown error')}"
+            )
 
     output_path = (
         Path(args.output) if args.output
@@ -157,3 +179,5 @@ def run_pipeline(client_cls: type, pipeline_name: str) -> None:
     count = len(result) if isinstance(result, list) else 1
     print(f"Wrote {count} result(s) to {output_path}")
     _print_cost_summary(client, result)
+    if recovery is not None:
+        print("Partial results were written; recover the pending task IDs from the manifest.")

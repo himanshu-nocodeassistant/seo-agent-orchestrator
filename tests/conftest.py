@@ -12,6 +12,7 @@ import json
 
 # Must be set before agent.api.main is imported
 os.environ["DATABASE_URL"] = "sqlite:///:memory:"
+os.environ["APP_ENV"] = "test"
 os.environ["COMMENT_AUTOPILOT_ENABLED"] = "false"
 os.environ["AGENT_EXECUTION_TIMEOUT_SECONDS"] = "2"
 # Legacy tests predate the required public Idempotency-Key contract. Focused

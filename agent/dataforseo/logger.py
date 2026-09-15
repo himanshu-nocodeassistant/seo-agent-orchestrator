@@ -3,6 +3,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from uuid import uuid4
 
 # DataForSEO status codes for tasks that aren't ready yet.
 # Mirrors TASK_NOT_READY_STATUSES in client.py — kept separate to avoid a
@@ -85,7 +86,9 @@ def _write_grouped(
 ) -> Path:
     log_dir = LOGS_DIR / _slugify(tag) / _slugify(keyword) / str(location_code)
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / f"{now.strftime('%Y-%m-%d_%H-%M-%S')}_{call_kind}.json"
+    log_file = log_dir / (
+        f"{now.strftime('%Y-%m-%d_%H-%M-%S-%f')}_{uuid4().hex[:12]}_{call_kind}.json"
+    )
     entry = {"timestamp": now.isoformat(), **task}
     log_file.write_text(json.dumps(entry, indent=2, ensure_ascii=False))
     return log_file
@@ -98,7 +101,9 @@ def _write_legacy(now: datetime, endpoint: str, payload: list, result: dict) -> 
 
     keyword = _extract_keyword(payload)
     keyword_slug = _slugify(keyword) if keyword else "no-keyword"
-    log_file = log_dir / f"{now.strftime('%H-%M-%S')}_{keyword_slug}.json"
+    log_file = log_dir / (
+        f"{now.strftime('%H-%M-%S-%f')}_{uuid4().hex[:12]}_{keyword_slug}.json"
+    )
 
     entry = {
         "timestamp": now.isoformat(),

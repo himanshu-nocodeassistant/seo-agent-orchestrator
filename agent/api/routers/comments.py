@@ -49,7 +49,7 @@ def create_comment(task_id: int, comment: CommentCreate):
         now = _utcnow_iso()
         db_comment = CommentModel(
             task_id=task_id,
-            author=comment.author,
+            author="user",
             body=comment.body,
             created_at=now,
         )
@@ -70,5 +70,4 @@ def create_comment(task_id: int, comment: CommentCreate):
         }
     finally:
         db.close()
-
 

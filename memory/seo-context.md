@@ -1,7 +1,12 @@
 # SEO Context View
 
-_This file is auto-updated after each agent run. Do not edit manually._
-
 ## Recent Runs
 
-_No runs yet. Execute a task from the Kanban board to populate this file._
+### 2026-09-15T11:28:45 - Write post
+- Run ID: `8024fb5e-a80e-4224-91ed-3391527d5ec9`
+- Status: failed
+- Trigger: orchestrator
+- Execution Type: campaign_draft_writer
+- Session ID: n/a
+- Validator Status: failed
+- Summary: name 'write_capable' is not defined

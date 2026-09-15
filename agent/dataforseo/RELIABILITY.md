@@ -21,23 +21,35 @@ three separate failures back to back:
    `task_get` call crashed the entire recovery run, even though ~70% of
    tasks had already resolved successfully in that same loop.
 
-None of these lost data permanently — task IDs were still recoverable
-from the request/response logs `log_result` writes on every call — but
-recovery required manually digging through JSON log files to reconstruct
-which task IDs belonged to which keyword/location/tag, and re-running the
-whole batch was tempting (and would have re-billed already-paid tasks).
+The client now preserves task IDs, request payloads, partial results, and
+unknown submission outcomes in recovery manifests. It never blindly repeats
+an uncertain paid `POST`, because the remote service may have accepted the
+task before the response was lost. Recovery uses the manifest and free
+`task_get` calls instead of resubmitting the batch.
 
 ## Fixes in `client.py`
 
-### 1. Retry transient errors instead of crashing (`_request_with_retry`)
+### 0. Treat uncertain paid submissions as recovery states
 
-`_post` and `_get` now route every HTTP call through
-`_request_with_retry`, which retries with exponential backoff (2s, 4s,
-8s, 16s, 32s — `MAX_RETRIES = 5`) on:
+Task creation `POST` requests are not automatically retried. A timeout,
+transient HTTP failure, malformed response, or missing task data creates a
+manifest entry with `status: "unknown"` and raises `DataForSEORecoveryError`.
+Callers must inspect the manifest before taking manual action. This prevents
+duplicate paid tasks.
+
+### 1. Retry transient read errors instead of crashing (`_request_with_retry`)
+
+`_get` and other read calls route through `_request_with_retry`, which
+retries with exponential backoff (2s, 4s, 8s, 16s, 32s — `MAX_RETRIES = 5`)
+on:
 
 - Rate limits and transient server errors: HTTP `429`, `502`, `503`, `504`
 - Dropped connections / timeouts: `requests.exceptions.ConnectionError`,
   `requests.exceptions.Timeout`
+
+Paid task-creation `POST` calls use one attempt. If the outcome is uncertain,
+the client writes a recovery manifest and raises `DataForSEORecoveryError`
+instead of sending the same paid request again.
 
 Anything else (auth failures, malformed requests, other 4xx) raises
 immediately — these aren't retryable and retrying would just waste time
