@@ -106,3 +106,25 @@ class TestWebflowPromptFallbackOrder:
 
         assert "Step 4 — Finalize draft for manual publishing" in prompt
         assert "Step 5 — Optional Webflow create" in prompt
+
+
+class TestKeywordRegistryPrompt:
+    def test_blog_write_checks_registry_before_research(self):
+        prompt = build_execution_prompt(_task("blog_write"))
+        assert "KEYWORD REGISTRY CHECK" in prompt
+        assert "memory/keyword-registry.md" in prompt
+        assert prompt.index("KEYWORD REGISTRY CHECK") < prompt.index("Step 1 — Keyword research")
+
+    def test_blog_write_stops_on_keyword_conflict(self):
+        prompt = build_execution_prompt(_task("blog_write"))
+        assert "STOP" in prompt
+        assert "merge/redirect" in prompt
+
+    def test_rewrite_blog_content_checks_registry(self):
+        prompt = build_execution_prompt(_task("rewrite_blog_content"))
+        assert "KEYWORD REGISTRY CHECK" in prompt
+        assert "update this page's registry entry" in prompt
+
+    def test_other_prompt_types_do_not_add_registry_check(self):
+        for execution_type in ("rewrite_title", "rewrite_meta_desc", "research", "alt_text"):
+            assert "KEYWORD REGISTRY CHECK" not in build_execution_prompt(_task(execution_type))

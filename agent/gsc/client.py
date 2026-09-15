@@ -61,6 +61,92 @@ class GscAPIClient:
     async def close(self):
         self._service = None
 
+    async def get_page_metrics(
+        self,
+        url: str,
+        start_date: str,
+        end_date: str,
+    ) -> dict[str, Any]:
+        """Return aggregate Search Console metrics for one page and period."""
+        response = await self.query_search_analytics(
+            start_date=start_date,
+            end_date=end_date,
+            dimensions=["page"],
+            row_limit=1,
+            dimension_filter_groups=[
+                {
+                    "groupType": "and",
+                    "filters": [
+                        {
+                            "dimension": "page",
+                            "operator": "equals",
+                            "expression": url,
+                        }
+                    ],
+                }
+            ],
+        )
+        rows = response.get("rows", [])
+        if not rows:
+            return {"clicks": 0, "impressions": 0, "ctr": 0.0, "position": 0.0}
+        row = rows[0]
+        return {
+            "clicks": int(row.get("clicks", 0)),
+            "impressions": int(row.get("impressions", 0)),
+            "ctr": float(row.get("ctr", 0.0)),
+            "position": float(row.get("position", 0.0)),
+        }
+
+    async def get_page_metrics_range(
+        self,
+        url: str,
+        change_date: str,
+        days: int = 28,
+    ) -> dict[str, Any]:
+        """Compare equal before/after periods around an SEO change."""
+        if days < 1 or days > 90:
+            raise ValueError("days must be between 1 and 90")
+        change = date.fromisoformat(change_date)
+        data_cutoff = date.today() - timedelta(days=3)
+        before_end = change - timedelta(days=1)
+        before_start = before_end - timedelta(days=days - 1)
+        after_start = change
+        after_end = min(change + timedelta(days=days - 1), data_cutoff)
+        periods = {
+            "before_period": {"start": str(before_start), "end": str(before_end)},
+            "after_period": {"start": str(after_start), "end": str(after_end)},
+        }
+        empty = {"clicks": 0, "impressions": 0, "ctr": 0.0, "position": 0.0}
+        if after_start > after_end:
+            return {
+                "url": url,
+                "before": empty,
+                "after": empty,
+                "delta": {
+                    "clicks_delta": 0,
+                    "impressions_delta": 0,
+                    "ctr_delta": 0.0,
+                    "position_delta": 0.0,
+                },
+                **periods,
+                "data_available": False,
+            }
+        before = await self.get_page_metrics(url, str(before_start), str(before_end))
+        after = await self.get_page_metrics(url, str(after_start), str(after_end))
+        return {
+            "url": url,
+            "before": before,
+            "after": after,
+            "delta": {
+                "clicks_delta": after["clicks"] - before["clicks"],
+                "impressions_delta": after["impressions"] - before["impressions"],
+                "ctr_delta": round(after["ctr"] - before["ctr"], 8),
+                "position_delta": round(after["position"] - before["position"], 8),
+            },
+            **periods,
+            "data_available": True,
+        }
+
     # -------------------------------------------------------------------------
     # Search Analytics
     # -------------------------------------------------------------------------
