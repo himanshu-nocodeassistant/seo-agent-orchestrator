@@ -1246,6 +1246,9 @@ def _finalize_run_failure(
         .update(
             {
                 AgentRunModel.status: status,
+                AgentRunModel.recovery_state: (
+                    "review_required" if status == "review_required" else "none"
+                ),
                 AgentRunModel.error: error_message,
                 AgentRunModel.finished_at: now,
                 AgentRunModel.validator_status: "failed",
